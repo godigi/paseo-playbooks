@@ -3,8 +3,9 @@
  * applies the returned effects (cancel agents, wake the manager).
  */
 import { descendantsOf } from "../shared/graph";
-import { gateChoices, LOOP_LIMIT_CHOICES, outcomeTransition } from "../shared/gates";
-import type { Attempt, Gate, Playbook, Run, RunStep, Step, VarValue } from "../shared/types";
+import { blockEntrySteps, blockStepIds, holdsBlock } from "../shared/slots";
+import { ASK_CHOICES, gateChoices, LOOP_LIMIT_CHOICES, outcomeTransition } from "../shared/gates";
+import type { Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
 import { isTerminal } from "../shared/types";
 import { coerceValue, formatValue, renderTemplate, resolveValue } from "../shared/vars";
 
@@ -99,7 +100,7 @@ export function newRun(input: NewRunInput): Run {
     steps: Object.fromEntries(
       input.playbook.steps.map((step) => [
         step.id,
-        { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, completedSeq: null },
+        { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, completedSeq: null, queuedAt: null },
       ]),
     ),
     loops: {},
@@ -110,23 +111,58 @@ export function newRun(input: NewRunInput): Run {
     seq: 0,
   };
   log(run, input.now, "run_started", null, `playbook ${input.playbook.id}`);
-  refreshReady(run);
+  refreshReady(run, input.now);
   return run;
 }
 
-/** Pending steps whose needs are all completed become ready. Returns the newly ready ids. */
-export function refreshReady(run: Run): string[] {
-  if (isTerminal(run.status)) return [];
+/**
+ * Pending steps whose needs are all completed become ready, except the first steps of a
+ * block with `concurrency` while it is not held: those are queued until the runtime admits
+ * them (see planAdmissions). Returns the newly ready and the newly queued ids.
+ */
+export function refreshReady(run: Run, now: string): { ready: string[]; queued: string[] } {
   const ready: string[] = [];
+  const queued: string[] = [];
+  if (isTerminal(run.status)) return { ready, queued };
+  const limited = Object.entries(run.playbook.blocks).filter(([, block]) => block.concurrency !== undefined);
   for (const step of run.playbook.steps) {
     const state = run.steps[step.id]!;
     if (state.status !== "pending") continue;
-    if (step.needs.every((need) => run.steps[need]?.status === "completed")) {
+    if (!step.needs.every((need) => run.steps[need]?.status === "completed")) continue;
+    const gating = limited.some(([prefix]) => blockEntrySteps(run.playbook, prefix).includes(step.id) && !holdsBlock(run, prefix));
+    if (gating) {
+      state.status = "queued";
+      state.queuedAt = now;
+      queued.push(step.id);
+      log(run, now, "step_queued", step.id, "waiting for a free concurrency slot");
+    } else {
       state.status = "ready";
       ready.push(step.id);
     }
   }
-  return ready;
+  return { ready, queued };
+}
+
+/** Steps waiting for a free `concurrency` slot of their block. */
+export function queuedSteps(run: Run): string[] {
+  return run.playbook.steps.filter((step) => run.steps[step.id]!.status === "queued").map((step) => step.id);
+}
+
+/** Lets a queued block start: its queued steps become ready. Returns them. */
+export function admitBlock(run: Run, prefix: string, now: string): string[] {
+  if (isTerminal(run.status)) return [];
+  const admitted = blockStepIds(run.playbook, prefix).filter((id) => run.steps[id]!.status === "queued");
+  for (const id of admitted) {
+    run.steps[id]!.status = "ready";
+    run.steps[id]!.queuedAt = null;
+    log(run, now, "step_admitted", id, "got a concurrency slot");
+  }
+  return admitted;
+}
+
+function queueNote(run: Run, queued: string[]): string {
+  const playbooks = [...new Set(Object.entries(run.playbook.blocks).filter(([prefix]) => queued.some((id) => id.startsWith(`${prefix}.`))).map(([, block]) => block.playbook))];
+  return `Queued: ${queued.join(", ")}, waiting for a free "${playbooks.join('", "')}" slot held by other runs. You are woken when they are ready; do not start them before.`;
 }
 
 export function readySteps(run: Run): string[] {
@@ -265,7 +301,8 @@ export function recordReport(
     throw new EngineError(`outcome "${report.outcome}" is not allowed; use one of: ${step.outcomes.join(", ")}`);
   }
   let outputs: Record<string, VarValue> = {};
-  if (report.outcome !== "failure") {
+  // A failure, or a question for a human (`ask`), is not a result: no outputs expected.
+  if (report.outcome !== "failure" && defaultTransition(step, report.outcome).kind !== "ask") {
     const checked = validateOutputs(step, report.outputs);
     if (!checked.ok) throw new EngineError(`report refused: ${checked.errors.join("; ")}. Fix these and call report_step_result again.`);
     outputs = checked.outputs;
@@ -357,8 +394,9 @@ function markCompleted(run: Run, stepId: string, now: string, fx: Effects): void
     completeRun(run, now, fx);
     return;
   }
-  const ready = refreshReady(run);
+  const { ready, queued } = refreshReady(run, now);
   if (ready.length > 0) fx.notes.push(`Ready: ${ready.join(", ")}.`);
+  if (queued.length > 0) fx.notes.push(queueNote(run, queued));
 }
 
 function performGoto(run: Run, source: string, target: string, feedback: string, now: string, fx: Effects): void {
@@ -388,8 +426,9 @@ function performGoto(run: Run, source: string, target: string, feedback: string,
   }
   run.steps[target]!.feedback = feedback || null;
   log(run, now, "goto", source, `${key} (loop ${run.loops[key]})`);
-  const ready = refreshReady(run);
+  const { ready, queued } = refreshReady(run, now);
   fx.notes.push(`Looping back to "${target}" (loop ${run.loops[key]}). Ready: ${ready.join(", ") || "none"}.`);
+  if (queued.length > 0) fx.notes.push(queueNote(run, queued));
 }
 
 function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | undefined, feedback: string, now: string, fx: Effects): void {
@@ -418,6 +457,30 @@ function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | un
   run.gates.push(gate);
   log(run, now, "gate_opened", step.id, gate.id);
   fx.notes.push(`Loop limit reached for ${key}: a human gate (${gate.id}) is open. Tell the human; wait for the decision.`);
+}
+
+/** An `ask` transition: the step waits while a human answers, then goes back to the target with the answer. */
+function openAskGate(run: Run, step: Step, transition: Extract<Transition, { kind: "ask" }>, summary: string, now: string, fx: Effects): void {
+  run.steps[step.id]!.status = "waiting";
+  const asked = run.gates.filter((gate) => gate.kind === "ask" && gate.stepId === step.id).length;
+  const gate: Gate = {
+    id: `ask-${step.id}-${asked + 1}`,
+    kind: "ask",
+    stepId: step.id,
+    gotoTarget: transition.target,
+    status: "pending",
+    message: [transition.ask, summary].filter(Boolean).join("\n\n"),
+    summary: transition.ask,
+    details: summary,
+    requestedAt: now,
+    comment: null,
+    decidedBy: null,
+    decidedVia: null,
+    decidedAt: null,
+  };
+  run.gates.push(gate);
+  log(run, now, "gate_opened", step.id, gate.id);
+  fx.notes.push(`"${step.id}" needs input: a human gate (${gate.id}) is open in the panel. Tell the human; wait for the answer.`);
 }
 
 /** The manager's verdict on a reported (or running) agent step. */
@@ -483,6 +546,9 @@ export function completeStep(
     case "goto":
       gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, input.now, fx);
       break;
+    case "ask":
+      openAskGate(run, step, transition, summary, input.now, fx);
+      break;
   }
   updateStatus(run);
   return fx;
@@ -541,7 +607,7 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   const fx = effects();
   if (gate.status !== "pending") return { gate, alreadyDecided: true, effects: fx };
   assertActive(run);
-  const choices = gate.kind === "loop_limit" ? LOOP_LIMIT_CHOICES : gateChoices(stepDef(run, gate.stepId));
+  const choices = gate.kind === "loop_limit" ? LOOP_LIMIT_CHOICES : gate.kind === "ask" ? ASK_CHOICES : gateChoices(stepDef(run, gate.stepId));
   const choice = choices.find((candidate) => candidate.id === decision.decision);
   if (!choice) throw new EngineError(`"${decision.decision}" is not a choice of gate "${gate.stepId}" (${choices.map((c) => c.id).join(", ")})`);
   if (choice.comment === "required" && !decision.comment?.trim()) throw new EngineError(`"${choice.label}" needs a comment`);
@@ -552,6 +618,12 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   gate.decidedAt = decision.now;
   log(run, decision.now, "gate_decided", gate.stepId, `${gate.id}: ${decision.decision} via ${decision.via}`);
   const step = stepDef(run, gate.stepId);
+  if (gate.kind === "ask") {
+    const ask = Object.values(step.on).find((transition) => transition.kind === "ask" && transition.target === gate.gotoTarget);
+    gotoOrLimit(run, step, gate.gotoTarget!, ask?.kind === "ask" ? ask.maxLoops : undefined, decision.comment ?? "", decision.now, fx);
+    updateStatus(run);
+    return { gate, alreadyDecided: false, effects: fx };
+  }
   if (gate.kind === "loop_limit") {
     if (decision.decision === "approved") {
       const key = `${gate.stepId}->${gate.gotoTarget}`;

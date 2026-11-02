@@ -73,7 +73,7 @@ the index and HEAD unchanged; build output in ignored files is fine.
 title: Pull request
 description: Investigate, implement, open a PR and babysit it until it is green.
 agent: { model: claude-opus-5-5 }          # optional playbook-wide settings
-concurrency: 1                             # optional: max active runs in the project
+concurrency: 1                             # optional: max active runs (or held blocks) in the project
 
 inputs:                                    # the Start form; the manager fills them from chat
   request: { type: string, required: true, description: What to change }
@@ -137,7 +137,7 @@ steps:
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
 | `outcomes` | Default `[success, failure]`. The first one completes the step by default. |
-| `on` | Per outcome: `complete`, `end`, `fail`, or `{ goto: <earlier step>, max_loops: N }`. Every outcome other than the first and `failure` needs an entry. |
+| `on` | Per outcome: `complete`, `end`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N }` (agent steps; see Loops). Every outcome other than the first and `failure` needs an entry. |
 | `retries` | Extra attempts after `failure`. |
 | `timeout` | `30m`, `2h`… Expiry counts as a failure. |
 | `agent` | Step-level agent settings. |
@@ -179,8 +179,15 @@ steps:
   first step (the sub-playbook must have exactly one).
 - `prompt`, `outputs`, `outcomes`, `timeout`, `agent`, `choices` and `on` do not apply to
   a playbook step. A playbook that includes itself (directly or not) is an error.
-- The sub-playbook's `next`, `concurrency` and manager settings are ignored; its gates
-  stay gates of the run.
+- The sub-playbook's `next` and manager settings are ignored; its gates stay gates of the
+  run.
+- The sub-playbook's `concurrency` applies to the block. Its slots are shared by every run
+  in the project (also top-level runs of that playbook). A run takes a slot when the block's
+  first steps become ready and keeps it until all the block's steps complete (also while a
+  gate inside waits), or the run ends. Until a slot is free those steps are `queued`
+  instead of `ready`: do not start them; the plugin wakes you when they are ready. Use it
+  to serialise a part of a playbook (for example `release`) across runs that do the rest in
+  parallel. A `goto` that restarts the block's first steps gives the slot back and queues again.
 
 ### Variables
 
@@ -196,6 +203,21 @@ output that name, validation fails: map it explicitly. Nothing is chosen silentl
 `goto` must point to an earlier step that this one needs (or itself). It re-runs the
 target and every step after it. The step or gate that looped hands its summary or comment
 to the target as "Feedback to address". Reaching `max_loops` opens a "loop limit" gate.
+
+To let an agent step ask a human a question, give it an outcome that routes to `ask`:
+
+```yaml
+- id: investigate
+  role: investigator
+  outcomes: [success, needs_input]   # the agent reports needs_input with its question as summary
+  on:
+    needs_input: { ask: "The investigation needs your input.", max_loops: 3 }
+```
+
+`complete_step` with that outcome opens a gate (the step shows as waiting); the human types
+the answer in the panel (required). The step then runs again, with the answer as feedback.
+`goto` (default: the step itself) may name an earlier step instead. The report needs no
+outputs. `ask` is not available on gate steps.
 
 ### Rules the validator enforces
 
