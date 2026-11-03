@@ -46,7 +46,9 @@ export function PlaybooksPanel(props: PluginWorkspacePanelProps) {
   const cards = useMemo<Card[]>(() => {
     const entries = playbooks.data?.entries ?? [];
     const allRuns = runs.data?.runs ?? [];
-    const ids = [...new Set([...entries.map((entry) => entry.id), ...allRuns.map((run) => run.playbook.id)])];
+    // Hidden playbooks (sub-playbooks or after-tasks only) get a card only once they have a run.
+    const listed = entries.filter((entry) => !entry.hidden);
+    const ids = [...new Set([...listed.map((entry) => entry.id), ...allRuns.map((run) => run.playbook.id)])];
     return ids.map((id) => ({
       id,
       entry: entries.find((entry) => entry.id === id) ?? null,

@@ -54,6 +54,14 @@ describe("loadPlaybooks", () => {
     expect(pr.playbook!.steps.find((step) => step.id === "implement")!.agent.mode).toBe("bypassPermissions");
   });
 
+  it("reads hidden, false by default", async () => {
+    const step = "steps:\n  - id: a\n    role: investigator\n    prompt: go\n";
+    const dir = await workspace({ "retro.yaml": `hidden: true\n${step}`, "pr.yaml": step });
+    const { entries } = await loadPlaybooks(dir);
+    expect(entries.find((entry) => entry.id === "retro")).toMatchObject({ hidden: true, errors: [] });
+    expect(entries.find((entry) => entry.id === "pr")).toMatchObject({ hidden: false, errors: [] });
+  });
+
   it("reports when no folder exists", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "playbooks-"));
     temps.push(dir);
