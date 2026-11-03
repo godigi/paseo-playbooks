@@ -90,6 +90,8 @@ const RawAfterSchema = RawStepSchema.extend({
 const RawPlaybookSchema = z.object({
     title: z.string().optional(),
     description: z.string().optional(),
+    /** Left out of the panel's list: for playbooks only meant as sub-playbooks or after-tasks. */
+    hidden: z.boolean().default(false),
     agent: AgentSettingsSchema.optional(),
     inputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
     outputs: z.record(z.string(), RawOutputSchema.nullable()).optional(),
@@ -311,7 +313,7 @@ type Loaded = { entry: PlaybookEntry };
 
 async function loadPlaybook(folder: Folder, name: string, file: string, id: string, stack: string[]): Promise<Loaded> {
   const { root, defaults, role } = folder;
-  const entry: PlaybookEntry = { id, file, title: id, errors: [], playbook: null };
+  const entry: PlaybookEntry = { id, file, title: id, hidden: false, errors: [], playbook: null };
   const fail = (errors: string[]) => {
     entry.errors.push(...errors);
     return { entry };
@@ -323,6 +325,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   if (!parsed.success) return fail(formatZodError(file, parsed.error));
   const pb = parsed.data;
   entry.title = pb.title ?? id;
+  entry.hidden = pb.hidden;
   const errors: string[] = [];
   const err = (message: string) => errors.push(`${file}: ${message}`);
   if (pb.next !== undefined) err("`next` was removed; include the other playbook as a sub-playbook step (`playbook: <id>`) instead");

@@ -74,6 +74,7 @@ title: Pull request
 description: Investigate, implement, open a PR and babysit it until it is green.
 agent: { model: claude-opus-5-5 }          # optional playbook-wide settings
 concurrency: 1                             # optional: max active runs (or held blocks) in the project
+hidden: false                              # optional: true leaves it out of the panel's list (sub-playbook / after-task only)
 
 inputs:                                    # the Start form; the manager fills them from chat
   request: { type: string, required: true, description: What to change }

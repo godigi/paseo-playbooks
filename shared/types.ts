@@ -135,6 +135,8 @@ export const PlaybookEntrySchema = z.object({
   id: z.string(),
   file: z.string(),
   title: z.string(),
+  /** `hidden: true` in the YAML: left out of the panel's list (still startable, still usable as a sub-playbook). */
+  hidden: z.boolean().default(false),
   errors: z.array(z.string()),
   playbook: PlaybookSchema.nullable(),
 });

@@ -88,6 +88,7 @@ function describeEntry(entry: PlaybookEntry) {
     valid: true,
     title: pb.title,
     description: pb.description,
+    hidden: entry.hidden,
     inputs: pb.inputs,
     outputs: Object.fromEntries(Object.entries(pb.outputs).map(([name, def]) => [name, { type: def.type, from: def.label }])),
     concurrency: pb.concurrency ?? null,
