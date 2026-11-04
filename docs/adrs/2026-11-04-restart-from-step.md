@@ -1,6 +1,6 @@
 # Restart a finished run from a step
 
-Status: Accepted
+Status: Superseded by 2026-11-04-agent-restart-and-manager-takeover.md
 
 ## Context
 

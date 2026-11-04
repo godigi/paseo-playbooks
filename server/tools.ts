@@ -2,7 +2,7 @@ import { defineAgentTool, type AgentToolDefinition, type AgentToolResult } from 
 import { GATE_SUMMARY_MAX } from "../shared/gates";
 import { z } from "zod";
 import type { PlaybookEntry, Run } from "../shared/types";
-import { isActive, isPaused, isTerminal, runningAfterTasks, VarValueSchema } from "../shared/types";
+import { isActive, isPaused, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
 import * as engine from "./engine";
 import { loadPlaybooks } from "./loader";
 import { MANAGER_PROTOCOL } from "./prompts";
@@ -275,6 +275,9 @@ export function runListing(run: Run) {
     managerAgentId: run.managerAgentId,
     createdAt: run.createdAt,
     runningSteps: Object.entries(run.steps).filter(([, state]) => state.status === "running").map(([id]) => id),
+    archived: run.archivedAt !== null,
+    /** Steps restart_run accepts (empty while the run is active). */
+    restartableFrom: isTerminal(run.status) ? run.playbook.steps.filter((step) => restartBlocker(run, step.id) === null).map((step) => step.id) : [],
   };
 }
 
@@ -293,17 +296,24 @@ export function defaultRunToCancel(runs: Run[], agentId: string, workspaceId: st
   );
 }
 
-/** Tools for every agent except step agents: find runs and cancel them, e.g. when the human asks in any chat. */
+/** Tools for every agent except step agents: find runs, cancel and restart them, e.g. when the human asks in any chat. */
 export function runTools(runtime: Runtime): AgentToolDefinition[] {
   return [
     defineAgentTool({
       name: "list_runs",
-      description: "List playbook runs on this Paseo daemon (by default only active ones): id, playbook, status, workspace, branch, manager, running steps.",
-      input: z.object({ all: z.boolean().default(false).describe("Include finished runs that are not archived") }),
-      execute: ({ all }) =>
+      description:
+        "List playbook runs on this Paseo daemon (by default only active ones): id, playbook, status, workspace, branch, manager, running steps, and where a finished run can be restarted from.",
+      input: z.object({
+        all: z.boolean().default(false).describe("Include finished runs that are not archived"),
+        archived: z.boolean().default(false).describe("Also include archived runs (archiving a manager archives its runs)"),
+      }),
+      execute: ({ all, archived }) =>
         guard(async () => {
-          const runs = runtime.allRuns().filter((run) => !run.archivedAt && (all || isActive(run))).map(runListing);
-          return ok(runs.length === 0 ? (all ? "No runs." : "No active run.") : JSON.stringify(runs, null, 2), { runs });
+          const runs = runtime
+            .allRuns()
+            .filter((run) => (archived || !run.archivedAt) && (all || archived || isActive(run)))
+            .map(runListing);
+          return ok(runs.length === 0 ? (all || archived ? "No runs." : "No active run.") : JSON.stringify(runs, null, 2), { runs });
         }),
     }),
     defineAgentTool({
@@ -321,6 +331,27 @@ export function runTools(runtime: Runtime): AgentToolDefinition[] {
             isTerminal(run.status) && run.status !== "canceled" ? `After-tasks of run ${run.id} canceled; the run stays ${run.status}.` : `Run ${run.id} canceled.`,
             isManager ? runSummary(run) : runListing(run),
           );
+        }),
+    }),
+    defineAgentTool({
+      name: "restart_run",
+      description:
+        "Reopen a finished (completed, failed or canceled) or archived run from a step of its main graph whose needs completed: that step and everything after it run again, completed steps before it keep their outputs. If the run's manager was archived, a new Playbook Manager is created in the run's workspace and takes over. See list_runs (archived: true) for runs and restartableFrom.",
+      input: z.object({
+        runId: IdArg,
+        stepId: z.string().describe("Step to restart from (see restartableFrom in list_runs)"),
+        note: z.string().optional().describe("Feedback for the restarted step's next attempt, e.g. what changed since it stopped"),
+      }),
+      execute: ({ runId, stepId, note }, { agent }) =>
+        guard(async () => {
+          const { run, newManager } = await runtime.restartRun(runId, stepId, note?.trim() || null, agent.id, "agent");
+          const isManager = run.managerAgentId === agent.id;
+          const next = isManager
+            ? `You manage it: start the ready steps (${engine.readySteps(run).join(", ") || "none"}) with start_step.`
+            : newManager
+              ? `Its previous manager was archived: a new Playbook Manager (agent ${run.managerAgentId}) took it over and starts the ready steps.`
+              : `Its manager (agent ${run.managerAgentId}) was woken and starts the ready steps.`;
+          return ok(`Run ${run.id} restarted from "${stepId}". ${next}`, isManager ? runSummary(run) : runListing(run));
         }),
     }),
   ];

@@ -27,6 +27,7 @@ export const MANAGER_TOOL_NAMES = [
   "get_run",
   "list_runs",
   "cancel_run",
+  "restart_run",
   "validate_playbooks",
 ];
 export const STEP_TOOL_NAMES = ["report_step_result"];
@@ -473,17 +474,17 @@ export class Runtime {
   }
 
   /**
-   * A human reopens a finished run from a step, from the panel. Same manager, same
-   * workspace; refused when the workspace has another active run or a concurrency slot the
-   * restarted run would hold is taken.
+   * Reopens a finished (or archived) run from a step, from the panel or the restart_run tool.
+   * Same workspace and branch; the manager stays when it still exists, otherwise a new
+   * Playbook Manager is created in the run's workspace and takes the run over. Refused when
+   * the workspace has another active run or a concurrency slot the restarted run would hold
+   * is taken.
    */
-  async restartRun(runId: string, stepId: string, comment: string | null, by: string | null): Promise<Run> {
+  async restartRun(runId: string, stepId: string, comment: string | null, by: string | null, via: "panel" | "agent" = "panel"): Promise<{ run: Run; newManager: boolean }> {
     const run = this.store.get(runId);
     if (!run) throw new UserError(`unknown run "${runId}"`);
     const blocker = restartBlocker(run, stepId);
     if (blocker) throw new UserError(blocker);
-    const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
-    if (!manager || manager.agent.archivedAt) throw new UserError("this run's Playbook Manager no longer exists; start a new run");
     const busy = this.store.list().find((other) => other.id !== run.id && other.workspaceId === run.workspaceId && isActive(other));
     if (busy) throw new UserError(`this workspace has another active run (${busy.id}); one active run per workspace`);
     // Dry run: the restarted run must fit in the concurrency slots it would hold.
@@ -501,16 +502,43 @@ export class Runtime {
         throw new UserError(`"${playbookId}" allows ${limit} active run(s) in this project; held by: ${holders.filter((id) => !id.startsWith(run.id)).join(", ")}. Try again once one ends.`);
       }
     }
-    const effects = await this.store.mutate(runId, (current) => engine.restartRun(current, stepId, { comment, by, now: nowIso() }));
+    const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
+    const managerGone = !manager || Boolean(manager.agent.archivedAt);
+    // The original manager was archived (which also archives its runs): a new one takes over.
+    // It is created without a prompt, so it cannot look for the run before the run is its own.
+    const replacement = managerGone
+      ? await this.api()
+          .workspaces.ref(run.workspaceId)
+          .agents.create({
+            config: this.managerConfig(run.playbook),
+            title: `Playbook Manager · ${run.playbook.title}`,
+            labels: { [MANAGER_LABEL]: "true" },
+          })
+          .catch((error: unknown) => {
+            throw new UserError(`could not create a new Playbook Manager in the run's workspace: ${errorText(error)}`);
+          })
+      : null;
+    const effects = await this.store.mutate(runId, (current) => {
+      const fx = engine.restartRun(current, stepId, { comment, by, now: nowIso() });
+      if (replacement) current.managerAgentId = replacement.id;
+      return fx;
+    });
     await this.admitQueued(runId);
     const ready = engine.readySteps(this.store.get(runId)!);
-    await this.enqueue(runId, [
-      `A human${by ? ` (${by})` : ""} restarted the run from "${stepId}" via the panel${comment ? `: "${comment}"` : ""}.`,
+    const who = via === "panel" ? `A human${by ? ` (${by})` : ""} restarted the run from "${stepId}" via the panel` : `Agent ${by ?? "(unknown)"} restarted the run from "${stepId}"`;
+    const lines = [
+      `${who}${comment ? `: "${comment}"` : ""}.`,
       ...effects.notes,
       `Completed steps before it keep their outputs (get_run shows them). Carry on as usual: start ${ready.length === 1 ? "the ready step" : "the ready steps"} with start_step (or request_gate for a gate).`,
-    ]);
-    await this.deliver(runId);
-    return this.store.get(runId)!;
+    ];
+    if (replacement) {
+      const current = this.store.get(runId)!;
+      await replacement.send(`${managerTakeover(current, ready, "restarted after its previous manager was archived")}\n\n[playbooks] ${lines.join(" ")}`);
+    } else {
+      await this.enqueue(runId, lines);
+      await this.deliver(runId);
+    }
+    return { run: this.store.get(runId)!, newManager: replacement !== null };
   }
 
   async askManagerToRetry(runId: string, stepId: string): Promise<void> {

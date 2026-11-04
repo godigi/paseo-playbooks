@@ -852,6 +852,7 @@ export function cancelRun(run: Run, reason: string, now: string): Effects {
  * finished (a parallel branch cut short by the cancel); completed steps elsewhere keep their
  * outputs. The run is running again, with no result, and its after-tasks are pending again
  * (they run once more when it ends). Loop counts are kept, so loop limits still apply.
+ * An archived run is unarchived.
  */
 export function restartRun(run: Run, stepId: string, input: { comment: string | null; by: string | null; now: string }): Effects {
   const blocker = restartBlocker(run, stepId);
@@ -877,6 +878,7 @@ export function restartRun(run: Run, stepId: string, input: { comment: string | 
   run.failure = null;
   run.outputs = null;
   run.pausedAt = null;
+  run.archivedAt = null;
   log(run, now, "run_restarted", stepId, `was ${previous}${input.by ? `, by ${input.by}` : ""}${input.comment?.trim() ? `: ${input.comment.trim()}` : ""}`);
   const { ready, queued } = refreshReady(run, now);
   fx.notes.push(`The run (was ${previous}) restarted from "${stepId}". Ready: ${ready.join(", ") || "none"}.`);
