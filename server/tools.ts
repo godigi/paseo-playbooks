@@ -1,5 +1,5 @@
 import { defineAgentTool, type AgentToolDefinition, type AgentToolResult } from "@getpaseo/plugin/server";
-import { GATE_SUMMARY_MAX } from "../shared/gates";
+import { askHumanText, choicesOfGate, GATE_SUMMARY_MAX } from "../shared/gates";
 import { z } from "zod";
 import type { PlaybookEntry, Run } from "../shared/types";
 import { isActive, isPaused, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
@@ -193,7 +193,7 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
     defineAgentTool({
       name: "request_gate",
       description:
-        "Open a ready gate step for a human: a one-sentence summary shown on the gate, and details (what was done, links, risks) shown collapsed under it. Then end your turn.",
+        "Open a ready gate step for a human: a one-sentence summary shown on the gate, and details (what was done, links, risks) shown collapsed under it. Then ask the human in chat (the result says how).",
       input: z.object({
         runId: IdArg,
         stepId: z.string(),
@@ -206,7 +206,8 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
       execute: ({ runId, stepId, summary, details }, { agent }) =>
         guard(async () => {
           const gate = await runtime.requestGate(agent.id, runId, stepId, summary, details);
-          return ok(`Gate ${gate.id} is open in the Paseo panel. Tell the human, then end your turn.`, gate);
+          const step = runtime.ownedRun(agent.id, runId).playbook.steps.find((candidate) => candidate.id === gate.stepId);
+          return ok(`Gate ${gate.id} is open in the Paseo panel. ${askHumanText(gate, choicesOfGate(gate, step))}`, gate);
         }),
     }),
     defineAgentTool({

@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import { Pressable, Text, View } from "react-native";
 import { decideGateRpc, nudgeStepRpc, restartRunRpc, retryStepRpc } from "../shared/contracts";
-import { ASK_CHOICES, destinationOf, gateChoices, gateText, linkify, LOOP_LIMIT_CHOICES } from "../shared/gates";
+import { choicesOfGate, destinationOf, gateText, linkify } from "../shared/gates";
 import { isPaused, isStepLive, restartBlocker, type Gate, type GateChoice, type Playbook, type Run } from "../shared/types";
 import { stepLabel, type Theme } from "./theme";
 
@@ -96,7 +96,7 @@ export function GateActions(props: { theme: Theme; run: Run; gate: Gate; hostLab
   const [busy, setBusy] = useState(false);
   const text = gateText(gate);
   const step = run.playbook.steps.find((candidate) => candidate.id === gate.stepId);
-  const choices = gate.kind === "loop_limit" ? LOOP_LIMIT_CHOICES : gate.kind === "ask" ? ASK_CHOICES : step ? gateChoices(step) : [];
+  const choices = choicesOfGate(gate, step);
   const submit = async (choice: GateChoice, withComment: string) => {
     setBusy(true);
     try {

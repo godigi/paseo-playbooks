@@ -4,7 +4,7 @@
  */
 import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
-import { ASK_CHOICES, gateChoices, LOOP_LIMIT_CHOICES, outcomeTransition } from "../shared/gates";
+import { askHumanText, choicesOfGate, outcomeTransition } from "../shared/gates";
 import type { AfterTask, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
 import { isActive, isPaused, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, renderTemplate, resolveValue } from "../shared/vars";
@@ -628,7 +628,7 @@ function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | un
   };
   run.gates.push(gate);
   log(run, now, "gate_opened", step.id, gate.id);
-  fx.notes.push(`Loop limit reached for ${key}: a human gate (${gate.id}) is open. Tell the human; wait for the decision.`);
+  fx.notes.push(`Loop limit reached for ${key}: a human gate (${gate.id}) is open in the panel. ${askHumanText(gate, choicesOfGate(gate, step))}`);
 }
 
 /** An `ask` transition: the step waits while a human answers, then goes back to the target with the answer. */
@@ -652,7 +652,7 @@ function openAskGate(run: Run, step: Step, transition: Extract<Transition, { kin
   };
   run.gates.push(gate);
   log(run, now, "gate_opened", step.id, gate.id);
-  fx.notes.push(`"${step.id}" needs input: a human gate (${gate.id}) is open in the panel. Tell the human; wait for the answer.`);
+  fx.notes.push(`"${step.id}" needs input: a human gate (${gate.id}) is open in the panel. ${askHumanText(gate, choicesOfGate(gate, step))}`);
 }
 
 /** The manager's verdict on a reported (or running) agent step. */
@@ -778,7 +778,7 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   const fx = effects();
   if (gate.status !== "pending") return { gate, alreadyDecided: true, effects: fx };
   assertLive(run, gate.stepId);
-  const choices = gate.kind === "loop_limit" ? LOOP_LIMIT_CHOICES : gate.kind === "ask" ? ASK_CHOICES : gateChoices(stepDef(run, gate.stepId));
+  const choices = choicesOfGate(gate, stepDef(run, gate.stepId));
   const choice = choices.find((candidate) => candidate.id === decision.decision);
   if (!choice) throw new EngineError(`"${decision.decision}" is not a choice of gate "${gate.stepId}" (${choices.map((c) => c.id).join(", ")})`);
   if (choice.comment === "required" && !decision.comment?.trim()) throw new EngineError(`"${choice.label}" needs a comment`);

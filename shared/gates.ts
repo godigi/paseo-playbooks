@@ -20,6 +20,24 @@ export function gateChoices(step: Step): GateChoice[] {
 /** The single choice of an `ask` gate: the answer, required, becomes the feedback of the step it goes back to. */
 export const ASK_CHOICES: GateChoice[] = [{ id: "answered", label: "Send answer", comment: "required" }];
 
+/** The choices of an open gate: its step's, or the fixed ones of loop-limit and ask gates. */
+export function choicesOfGate(gate: Gate, step: Step | undefined): GateChoice[] {
+  if (gate.kind === "loop_limit") return LOOP_LIMIT_CHOICES;
+  if (gate.kind === "ask") return ASK_CHOICES;
+  return step ? gateChoices(step) : [];
+}
+
+/**
+ * Tells the manager to ask the human in chat too: a question from the agent puts the workspace
+ * in "needs input" (the yellow dot and a push), which an agent that just ends its turn does not.
+ */
+export function askHumanText(gate: Gate, choices: GateChoice[]): string {
+  const options = choices
+    .map((choice) => `"${choice.id}" (${choice.label}${choice.comment === "required" ? ", needs a comment" : ""})`)
+    .join(", ");
+  return `Ask the human now with your tool for asking the user a question (AskUserQuestion, request_user_input or the like): the gate summary as the question, one option per choice: ${options}. Then call resume for gate ${gate.id} with the chosen id and their words as comment. If you have no such tool, tell the human and end your turn.`;
+}
+
 /**
  * Where a gate outcome leads: "next", "end" (the run), "end_block" (an `end` inside a
  * sub-playbook block ends only that block; targets holds its prefix), "fail" or "goto".

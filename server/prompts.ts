@@ -23,9 +23,13 @@ How to run a playbook:
    - complete_step returns what is ready next, a gate to open, or the end of the run.
 6. For a ready gate step, call request_gate with a summary of one short sentence (at most
    160 characters, e.g. "PR #3 is green and ready to merge.") and details for the human
-   (what was done, links as plain URLs, risks, follow-ups), then end your turn. The human approves or rejects in the Paseo
-   panel; you are woken with the decision. If a decision reaches you by chat instead,
-   call resume with it.
+   (what was done, links as plain URLs, risks, follow-ups). Then ask the human in chat with
+   your tool for asking the user a question (AskUserQuestion, request_user_input or the
+   like), one option per gate choice: this flags the workspace as needing input. Call
+   resume with their answer. The same goes for loop-limit and ask gates. The human may
+   decide in the Paseo panel instead: your question is then dismissed with the decision;
+   end your turn and you are woken with what comes next. If a decision reaches you by
+   chat some other way, call resume with it.
 7. When the run ends, tell the human the outcome and the run outputs. Do not start
    another playbook as a follow-up unless the human asks.
 8. After-tasks: a playbook may declare tasks that run once the run has ended (completed or
