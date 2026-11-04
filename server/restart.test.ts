@@ -296,6 +296,14 @@ describe("a manager archived with the agent that created it", () => {
     expect(sent.at(-1)!.text).toMatch(/"implement" attempt 1 ended \(lost\)/);
   });
 
+  it("tells the new manager about steps whose agents were archived first", async () => {
+    const { runtime, sent, implementer } = await activeRun(true);
+    await runtime.onAgentArchived(implementer, "m");
+    await runtime.onAgentArchived("m", "coordinator");
+    const takeover = sent.find((entry) => entry.agentId === "mgr-1")!;
+    expect(takeover.text).toMatch(/Steps waiting for complete_step: implement/);
+  });
+
   it("still fails the run when the manager itself was archived", async () => {
     const { store, runtime, created } = await activeRun(false);
     await runtime.onAgentArchived("m", "coordinator");
