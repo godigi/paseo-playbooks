@@ -3,7 +3,7 @@
  * run holds one from the moment its block is admitted until all the block's steps complete.
  */
 import type { Playbook, Run } from "./types";
-import { isStepDone, isTerminal } from "./types";
+import { isPaused, isStepDone, isTerminal } from "./types";
 
 /** Ids of the steps inside a block (nested blocks included). */
 export function blockStepIds(playbook: Playbook, prefix: string): string[] {
@@ -55,7 +55,8 @@ export interface Admission {
 export function planAdmissions(runs: Run[]): Admission[] {
   const waiting: Array<Admission & { projectId: string; playbookId: string; limit: number; since: string }> = [];
   for (const run of runs) {
-    if (isTerminal(run.status)) continue;
+    // A paused run waits its turn: it would hold a slot it cannot use.
+    if (isTerminal(run.status) || isPaused(run)) continue;
     for (const [prefix, block] of Object.entries(run.playbook.blocks)) {
       if (block.concurrency === undefined) continue;
       const queued = blockStepIds(run.playbook, prefix).map((id) => run.steps[id]!).filter((state) => state.status === "queued");

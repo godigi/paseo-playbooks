@@ -6,7 +6,7 @@ import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
 import { ASK_CHOICES, gateChoices, LOOP_LIMIT_CHOICES, outcomeTransition } from "../shared/gates";
 import type { AfterTask, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
-import { isStepDone, isStepLive, isTerminal, runningAfterTasks } from "../shared/types";
+import { isActive, isPaused, isStepDone, isStepLive, isTerminal, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, renderTemplate, resolveValue } from "../shared/vars";
 
 export class EngineError extends Error {}
@@ -110,6 +110,7 @@ export function newRun(input: NewRunInput): Run {
     createdAt: input.now,
     updatedAt: input.now,
     archivedAt: null,
+    pausedAt: null,
     steps: Object.fromEntries(
       input.playbook.steps.map((step) => [
         step.id,
@@ -237,6 +238,9 @@ export function startAttempt(
   const step = stepDef(run, stepId);
   const state = runStep(run, stepId);
   if (step.kind !== "agent") throw new EngineError(`step "${stepId}" is a gate; call request_gate`);
+  if (isPaused(run)) {
+    throw new EngineError(`run ${run.id} is paused by a human: no step starts until it is resumed. End your turn; you are woken on resume.`);
+  }
   if (state.status !== "ready") {
     throw new EngineError(`step "${stepId}" is ${state.status}, not ready (ready now: ${readySteps(run).join(", ") || "none"})`);
   }
@@ -497,6 +501,8 @@ export function startAfterTask(run: Run, taskId: string, now: string): Effects {
   if (task.trigger !== "manual") throw new EngineError(`after-task "${taskId}" starts on its own (trigger: auto)`);
   const status = run.after[taskId]?.status ?? "pending";
   if (status !== "pending") throw new EngineError(`after-task "${taskId}" is ${status}; it runs once`);
+  // A pause left on the ended run must not hold the task a human starts now.
+  run.pausedAt = null;
   const fx = effects();
   const ready = launchTask(run, taskId, now);
   fx.notes.push(afterNote(run, [taskId], ready));
@@ -828,6 +834,7 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
  */
 export function cancelRun(run: Run, reason: string, now: string): Effects {
   const fx = effects();
+  run.pausedAt = null;
   if (!isTerminal(run.status)) {
     finish(run, "canceled", reason, now, fx);
     skipAutoTasks(run, "the run was canceled", now);
@@ -842,12 +849,37 @@ export function cancelRun(run: Run, reason: string, now: string): Effects {
 /** Stops the run for good (e.g. the manager was lost): fails it, or cancels its running after-tasks. No after-task starts. */
 export function failRun(run: Run, reason: string, now: string): Effects {
   const fx = effects();
+  run.pausedAt = null;
   if (!isTerminal(run.status)) {
     finish(run, "failed", reason, now, fx);
     skipAutoTasks(run, reason, now);
   }
   for (const taskId of runningAfterTasks(run)) finishTask(run, taskId, "canceled", reason, now, fx);
   return fx;
+}
+
+/**
+ * Pauses the run (drain): no step starts and the manager is not woken until resume. Steps
+ * already running finish their turn; their reports wait in the inbox. Returns false if it
+ * was already paused.
+ */
+export function pauseRun(run: Run, now: string): boolean {
+  if (!isActive(run)) throw new EngineError(`run ${run.id} is ${run.status}; only an active run can be paused`);
+  if (isPaused(run)) return false;
+  run.pausedAt = now;
+  log(run, now, "run_paused", null, "paused by a human");
+  return true;
+}
+
+/** Lifts a pause. Returns false if the run was not paused. */
+export function resumeRun(run: Run, now: string): boolean {
+  if (!isPaused(run)) {
+    run.pausedAt = null;
+    return false;
+  }
+  run.pausedAt = null;
+  log(run, now, "run_resumed", null, "resumed by a human");
+  return true;
 }
 
 /** Marks a failed or timed-out readonly check on the current attempt. */

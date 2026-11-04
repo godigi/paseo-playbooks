@@ -6,6 +6,8 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   archiveRunRpc,
   cancelRunRpc,
+  pauseRunRpc,
+  resumeRunRpc,
   decideGateRpc,
   headerStateRpc,
   listPlaybooks,
@@ -125,8 +127,10 @@ export default function contribute(server: PluginServerContext) {
     await runtime.askManagerToRetry(runId, stepId);
     return { queued: true };
   });
+  handle(pauseRunRpc, async ({ runId }) => ({ pausedAt: (await runtime.pauseRun(runId)).pausedAt }));
+  handle(resumeRunRpc, async ({ runId }) => ({ pausedAt: (await runtime.resumeRun(runId)).pausedAt }));
   handle(nudgeStepRpc, async ({ runId, stepId, message }) => {
-    await runtime.nudgeStep(runId, stepId, message);
+    await runtime.nudgeStep(runId, stepId, message, true);
     return { sent: true };
   });
 

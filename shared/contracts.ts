@@ -81,6 +81,20 @@ export const cancelRunRpc = defineRpc({
   output: z.object({ status: z.string() }),
 });
 
+/** Pauses an active run (drain): no step starts and its manager is not woken until resume. */
+export const pauseRunRpc = defineRpc({
+  name: "runs.pause",
+  input: z.object({ runId: z.string() }),
+  output: z.object({ pausedAt: z.string().nullable() }),
+});
+
+/** Resumes a paused run: its manager is woken with what happened meanwhile. */
+export const resumeRunRpc = defineRpc({
+  name: "runs.resume",
+  input: z.object({ runId: z.string() }),
+  output: z.object({ pausedAt: z.string().nullable() }),
+});
+
 /** Hides a finished run from the panel. Its saved state and its agents (manager and steps) are kept. */
 export const archiveRunRpc = defineRpc({
   name: "runs.archive",
