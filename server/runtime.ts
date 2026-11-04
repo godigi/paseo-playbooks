@@ -348,6 +348,7 @@ export class Runtime {
     await this.admitQueued(runId);
     if (!result.alreadyDecided && decision.via === "panel") {
       const run = this.store.get(runId)!;
+      await this.dismissQuestions(run.managerAgentId, `The human decided gate ${result.gate.id} in the Playbooks panel instead: ${decision.decision}. Do not call resume. End your turn; you are woken with what comes next.`);
       const comment = decision.comment ? `: "${decision.comment}"` : "";
       await this.enqueue(runId, [
         `Gate ${result.gate.stepId} ${decision.decision} by ${decision.by ?? "a human"} via panel${comment}.`,
@@ -357,6 +358,21 @@ export class Runtime {
       await this.deliver(runId);
     }
     return { alreadyDecided: result.alreadyDecided, gate: result.gate };
+  }
+
+  /**
+   * Answers the manager's open questions (asked in chat for a gate) once the panel made them
+   * moot: its turn is blocked on them, so the queued wake-up could not reach it otherwise.
+   */
+  private async dismissQuestions(managerId: string, message: string): Promise<void> {
+    const manager = this.api().agents.ref(managerId);
+    const current = await manager.refresh().catch(() => null);
+    for (const request of current?.agent.pendingPermissions ?? []) {
+      if (request.kind !== "question") continue;
+      await manager
+        .respondToPermission({ requestId: request.id, response: { behavior: "deny", message } })
+        .catch((error) => console.error(`[playbooks] could not dismiss the question of manager ${managerId}:`, errorText(error)));
+    }
   }
 
   /** Hides a finished run from the panel; nothing else changes (no agent is archived or stopped). */
@@ -376,6 +392,7 @@ export class Runtime {
     await this.admitQueued(runId);
     if (by) {
       const status = this.store.get(runId)!.status;
+      await this.dismissQuestions(this.store.get(runId)!.managerAgentId, `The run was canceled ${by}. End your turn.`);
       await this.enqueue(runId, [
         status === "canceled"
           ? `The run was canceled ${by}: ${reason}. Tell the human and stop.`
