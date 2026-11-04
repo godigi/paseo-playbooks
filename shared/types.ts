@@ -187,6 +187,8 @@ export const AttemptSchema = z.object({
   turnEnd: TurnEndSchema.nullable(),
   /** Git state captured before a readonly step, compared at the end. */
   readonlySnapshot: z.string().nullable(),
+  /** True once the plugin asked the agent to report after a turn ended without a report. */
+  reminded: z.boolean().default(false),
 });
 export type Attempt = z.infer<typeof AttemptSchema>;
 
