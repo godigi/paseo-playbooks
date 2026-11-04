@@ -258,6 +258,7 @@ export function startAttempt(
     outcome: null,
     turnEnd: null,
     readonlySnapshot: input.readonlySnapshot,
+    reminded: false,
   };
   const context = {
     inputs: Object.fromEntries(Object.entries(values).map(([name, entry]) => [name, entry.value])),

@@ -9,7 +9,7 @@ import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
 import { checkoutSnapshot, currentRef, snapshotDiff } from "./git";
 import { loadPlaybooks } from "./loader";
-import { managerKickoff, managerTakeover, stepSystemPrompt } from "./prompts";
+import { managerKickoff, managerTakeover, reportReminder, stepSystemPrompt } from "./prompts";
 import type { RunStore } from "./store";
 import { holdsBlock, planAdmissions, slotHolders } from "../shared/slots";
 
@@ -584,6 +584,7 @@ export class Runtime {
     if (!found.attempt.report) {
       const page = await this.api().agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 30 }).catch(() => null);
       lastMessage = page ? lastAssistantText(page.entries as never) : null;
+      if (turnEnd === "completed" && !found.attempt.reminded && !isPaused(run) && (await this.remindToReport(runId, found.stepId, agentId))) return;
     }
     const violation =
       found.attempt.readonlySnapshot !== null ? snapshotDiff(found.attempt.readonlySnapshot, await checkoutSnapshot(run.workspaceDir)) : null;
@@ -597,7 +598,9 @@ export class Runtime {
     const head = `step "${ended.stepId}" attempt ${ended.attempt.n}`;
     const line = report
       ? `${head} reported ${report.outcome}: ${report.summary}${Object.keys(report.outputs).length ? ` Outputs: ${JSON.stringify(report.outputs)}.` : ""}`
-      : `${head} ended (${turnEnd}) without reporting.${lastMessage ? ` Last message: ${lastMessage.slice(0, 1500)}` : ""} Use nudge_step to ask it to report, or complete_step.`;
+      : ended.attempt.reminded
+        ? `${head} ended (${turnEnd}) without reporting, even after the plugin asked it to.${lastMessage ? ` Last message: ${lastMessage.slice(0, 1500)}` : ""} If it is still waiting on something, nudge_step it later. If it could not report (e.g. report_step_result "not found"), check the outputs it gave in its conversation and call complete_step with them.`
+        : `${head} ended (${turnEnd}) without reporting.${lastMessage ? ` Last message: ${lastMessage.slice(0, 1500)}` : ""} Use nudge_step to ask it to report, or complete_step.`;
     const others = Object.entries(this.store.get(runId)!.steps)
       .filter(([, state]) => state.status === "running")
       .map(([id]) => id);
@@ -608,6 +611,26 @@ export class Runtime {
       others.length > 0 ? `Still running: ${others.join(", ")}.` : "",
     ].filter(Boolean));
     await this.deliver(runId);
+  }
+
+  /**
+   * A step's turn completed without a report: ask the agent once, in the same conversation, before
+   * waking the manager. Paseo binds plugin tools to the plugin instance a session opened with, so a
+   * plugin reload during a long turn makes report_step_result "not found" until the agent's next
+   * prompt reopens the session; this prompt is that reopening. Returns false if it could not be sent.
+   */
+  private async remindToReport(runId: string, stepId: string, agentId: string): Promise<boolean> {
+    await this.store.mutate(runId, (current) => {
+      current.steps[stepId]!.attempts.at(-1)!.reminded = true;
+    });
+    try {
+      await this.api().agents.ref(agentId).send(reportReminder(stepId));
+    } catch (error) {
+      console.error(`[playbooks] could not remind step "${stepId}" of ${runId} to report:`, errorText(error));
+      return false;
+    }
+    this.armTimeout(this.store.get(runId)!, stepId);
+    return true;
   }
 
   /** Lifecycle hook: any agent's turn ended. */

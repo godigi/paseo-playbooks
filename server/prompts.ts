@@ -19,7 +19,10 @@ How to run a playbook:
    complete_step. You may correct reported outputs. Check the result is real (for example
    that a reported PR URL exists) before accepting it.
    - If a step ended without reporting, or needs a correction, use nudge_step to send it
-     a follow-up in the same conversation instead of starting a new attempt.
+     a follow-up in the same conversation instead of starting a new attempt. The plugin
+     already asks a step once to report before waking you. If a step could not report
+     (report_step_result "not found"), check the outputs it gave in its conversation and
+     call complete_step with its outcome and those outputs.
    - complete_step returns what is ready next, a gate to open, or the end of the run.
 6. For a ready gate step, call request_gate with a summary of one short sentence (at most
    160 characters, e.g. "PR #3 is green and ready to merge.") and details for the human
@@ -88,5 +91,13 @@ When you are done, call the report_step_result tool exactly once, as your last a
 - outcome: one of ${step.outcomes.map((outcome) => `"${outcome}"`).join(", ")}${step.outcomes.includes("failure") ? ' (use "failure" if you could not do the work)' : ""}
 - summary: what you did and found, for the manager and the next steps
 - outputs: ${describeOutputs(step)}
-If the tool refuses your report, fix what it says and call it again. Do not create other agents.`;
+If the tool refuses your report, fix what it says and call it again. If the tool is missing or
+"not found", do not work around it: write the outcome, summary and outputs in your last message and
+end your turn; the plugin then asks you to report again, with the tool available. Do not create
+other agents.`;
+}
+
+/** Sent to a step agent whose turn ended without a report; the new prompt also restores its plugin tools. */
+export function reportReminder(stepId: string): string {
+  return `[playbooks] Your turn ended without a report for step "${stepId}". If your work is done, call report_step_result now; it is available again even if it was "not found" before. If you are still waiting for something, say what and end your turn.`;
 }
