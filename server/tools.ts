@@ -268,6 +268,7 @@ export function runListing(run: Run) {
     title: run.playbook.title,
     status: run.status,
     active: isActive(run),
+    paused: isPaused(run),
     workspaceId: run.workspaceId,
     workspaceDir: run.workspaceDir,
     branch: run.branch,
