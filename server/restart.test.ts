@@ -4,9 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Playbook, Run } from "../shared/types";
 import { restartBlocker } from "../shared/types";
-import { cancelRun, completeStep, endTurn, newRun, readySteps, recordReport, restartRun, startAttempt } from "./engine";
+import { cancelRun, completeStep, endTurn, failRun, newRun, readySteps, recordReport, restartRun, startAttempt } from "./engine";
 import { loadPlaybooks } from "./loader";
 import { Runtime } from "./runtime";
+import { runListing } from "./tools";
 import { RunStore } from "./store";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
@@ -160,7 +161,7 @@ describe("restart a finished run from a step", () => {
 });
 
 /** Just enough of the daemon API for Runtime.restartRun. */
-function fakePaseo(agents: Record<string, { archivedAt: string | null }>) {
+function fakePaseo(agents: Record<string, { archivedAt: string | null; status?: string }>) {
   const sent: Array<{ agentId: string; text: string }> = [];
   const created: Array<{ workspaceId: string; labels: Record<string, string> }> = [];
   const ref = (agentId: string) => ({
@@ -168,11 +169,14 @@ function fakePaseo(agents: Record<string, { archivedAt: string | null }>) {
     send: async (text: string) => {
       sent.push({ agentId, text });
     },
+    reload: async () => null,
+    timeline: { refetch: async () => ({ entries: [] }) },
   });
   const paseo = {
     agents: { ref },
     workspaces: {
       ref: (workspaceId: string) => ({
+        refresh: async () => ({ id: workspaceId, projectId: "p", workspaceDirectory: tmpdir() }),
         agents: {
           create: async (input: { labels: Record<string, string> }) => {
             const id = `mgr-${created.length + 1}`;
@@ -188,7 +192,7 @@ function fakePaseo(agents: Record<string, { archivedAt: string | null }>) {
 }
 
 describe("Runtime.restartRun", () => {
-  async function stored(archivedManager: boolean) {
+  async function stored(archivedManager: boolean, failure?: string) {
     const dir = await mkdtemp(path.join(tmpdir(), "restart-store-"));
     temps.push(dir);
     const store = new RunStore(dir);
@@ -196,7 +200,8 @@ describe("Runtime.restartRun", () => {
     const run = start(await playbook());
     step(run, "investigate", "success", { plan: "p" });
     begin(run, "implement");
-    cancelRun(run, "stop", now());
+    if (failure) failRun(run, failure, now());
+    else cancelRun(run, "stop", now());
     if (archivedManager) run.archivedAt = now();
     await store.create(run);
     const fake = fakePaseo({ m: { archivedAt: archivedManager ? now() : null } });
@@ -227,5 +232,82 @@ describe("Runtime.restartRun", () => {
     expect(store.get("run_r")!.managerAgentId).toBe("m");
     expect(sent.map((entry) => entry.agentId)).toEqual(["m"]);
     expect(sent[0]!.text).toMatch(/A human \(laptop\) restarted the run from "implement" via the panel/);
+  });
+
+  it("lets another agent of the workspace take over a run that failed with \"manager lost\", without repeating finished steps", async () => {
+    const { store, runtime, sent, created } = await stored(true, "manager lost (archived)");
+    expect(runListing(store.get("run_r")!)).toMatchObject({ failure: "manager lost (archived)", restartableFrom: ["investigate", "implement", "docs"] });
+    const result = await runtime.restartRun("run_r", "implement", null, "agent-y", "agent", { id: "agent-y", workspaceId: "ws" });
+    expect(result.newManager).toBe(true);
+    expect(created).toEqual([]);
+    expect(sent).toEqual([]);
+    const run = store.get("run_r")!;
+    expect(run).toMatchObject({ status: "running", managerAgentId: "agent-y", archivedAt: null, failure: null });
+    expect(run.steps.investigate).toMatchObject({ status: "completed", outputs: { plan: "p" } });
+    expect(readySteps(run).sort()).toEqual(["docs", "implement"]);
+    expect(runtime.ownedRun("agent-y", "run_r").id).toBe("run_r");
+  });
+
+  it("refuses a takeover from an agent of another workspace", async () => {
+    const { store, runtime } = await stored(false);
+    await expect(runtime.restartRun("run_r", "implement", null, "agent-z", "agent", { id: "agent-z", workspaceId: "other" })).rejects.toThrow(/only an agent of that workspace/);
+    expect(store.get("run_r")).toMatchObject({ status: "canceled", managerAgentId: "m" });
+  });
+});
+
+describe("a manager archived with the agent that created it", () => {
+  async function activeRun(parentArchived: boolean) {
+    const dir = await mkdtemp(path.join(tmpdir(), "restart-store-"));
+    temps.push(dir);
+    const store = new RunStore(dir);
+    await store.init();
+    const run = start(await playbook());
+    step(run, "investigate", "success", { plan: "p" });
+    const implementer = begin(run, "implement");
+    await store.create(run);
+    const agents = { m: { archivedAt: null as string | null }, coordinator: { archivedAt: null as string | null }, [implementer]: { archivedAt: null as string | null, status: "running" } };
+    const fake = fakePaseo(agents);
+    const runtime = new Runtime(store);
+    await runtime.attach(fake.paseo as never);
+    // Archived after the plugin started: by Paseo's cascade from the coordinator, or on its own.
+    if (parentArchived) agents.coordinator.archivedAt = now();
+    agents.m.archivedAt = now();
+    agents[implementer]!.archivedAt = now();
+    return { store, runtime, implementer, ...fake };
+  }
+
+  it("hands the active run to a new Playbook Manager instead of failing it; finished steps are kept", async () => {
+    const { store, runtime, sent, created, implementer } = await activeRun(true);
+    await runtime.onAgentArchived("m", "coordinator");
+    let run = store.get("run_r")!;
+    expect(created).toEqual([{ workspaceId: "ws", labels: { "playbooks/manager": "true" } }]);
+    expect(run).toMatchObject({ status: "running", managerAgentId: "mgr-1", archivedAt: null, failure: null });
+    expect(run.steps.investigate).toMatchObject({ status: "completed", outputs: { plan: "p" } });
+    expect(run.history.at(-1)).toMatchObject({ type: "manager_replaced" });
+    expect(sent[0]!.agentId).toBe("mgr-1");
+    expect(sent[0]!.text).toMatch(/You are now the Playbook Manager of run run_r/);
+    expect(sent[0]!.text).toMatch(/archived too: implement/);
+
+    // The step agent went with it (Paseo's cascade): the new manager hears it ended lost.
+    await runtime.onAgentArchived(implementer, "m");
+    run = store.get("run_r")!;
+    expect(run.steps.implement!.status).toBe("reported");
+    expect(sent.at(-1)).toMatchObject({ agentId: "mgr-1" });
+    expect(sent.at(-1)!.text).toMatch(/"implement" attempt 1 ended \(lost\)/);
+  });
+
+  it("tells the new manager about steps whose agents were archived first", async () => {
+    const { runtime, sent, implementer } = await activeRun(true);
+    await runtime.onAgentArchived(implementer, "m");
+    await runtime.onAgentArchived("m", "coordinator");
+    const takeover = sent.find((entry) => entry.agentId === "mgr-1")!;
+    expect(takeover.text).toMatch(/Steps waiting for complete_step: implement/);
+  });
+
+  it("still fails the run when the manager itself was archived", async () => {
+    const { store, runtime, created } = await activeRun(false);
+    await runtime.onAgentArchived("m", "coordinator");
+    expect(created).toEqual([]);
+    expect(store.get("run_r")).toMatchObject({ status: "failed", failure: "manager lost (archived)" });
   });
 });

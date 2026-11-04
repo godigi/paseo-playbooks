@@ -10,6 +10,8 @@ Playbooks 面板位于工作区右侧边栏，把每个 playbook 显示为一张
 
 智能体模式：playbook 可以使用任何模式，包括 `bypassPermissions`，这样运行 shell 命令的步骤可以无人值守地执行。只运行来自可信仓库的 playbook。
 
-插件为智能体提供工具：除步骤智能体外，所有智能体都有 `validate_playbooks`、`list_runs`、`cancel_run` 和 `restart_run`（可以在任何对话中停止运行，或从某个步骤重新开始已结束的运行）；包含 playbook 的工作区中的智能体获得 manager 工具；步骤智能体获得 `report_step_result`。仓库还附带一个智能体技能 `skills/paseo-playbooks/SKILL.md`，用于教智能体编写 playbook。
+插件为智能体提供工具：除步骤智能体外，所有智能体都有 `validate_playbooks`、`list_runs`、`cancel_run` 和 `restart_run`（可以在任何对话中停止运行，或从运行到达的步骤恢复已结束、失败或已取消的运行，使用 `takeOver` 可由自己接管）；包含 playbook 的工作区中的智能体获得 manager 工具；步骤智能体获得 `report_step_result`。仓库还附带一个智能体技能 `skills/paseo-playbooks/SKILL.md`，用于教智能体编写 playbook。
+
+如果进行中运行的 manager 随创建它的智能体（例如协调者）一起被归档，会由新的 Playbook Manager 接管该运行，而不是让它失败。
 
 需要 Paseo 0.14 或更高版本。运行状态保存在 `$PASEO_HOME/plugin-data/paseo-playbooks/runs/`，在运行所在的 worktree 被归档时删除。服务端代码会在工作区目录中运行 `git`。

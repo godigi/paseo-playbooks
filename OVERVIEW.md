@@ -36,12 +36,16 @@ Agent modes: playbooks may use any mode, `bypassPermissions` included, so steps 
 shell commands work unattended. Only start playbooks from repositories you trust.
 
 Agents get tools from the plugin: every agent except step agents gets `validate_playbooks`,
-`list_runs`, `cancel_run` and `restart_run` (so you can stop a run, or restart a finished one
-from a step, from any chat);
+`list_runs`, `cancel_run` and `restart_run` (so you can stop a run, or recover a finished,
+failed or canceled one from the step it reached, from any chat, with `takeOver` to manage it
+yourself);
 agents in a workspace with playbooks get the manager tools; step agents get
 `report_step_result`. The
 repository also ships an agent skill, `skills/paseo-playbooks/SKILL.md`, that teaches
 agents to write playbooks.
+
+If the manager of an active run is archived along with the agent that created it (a
+coordinator, for example), a new Playbook Manager takes the run over instead of it failing.
 
 Requires Paseo 0.14 or later. Run state is stored in `$PASEO_HOME/plugin-data/paseo-playbooks/runs/` and
 deleted when the run's worktree is archived. Server code runs `git` in workspace folders.

@@ -306,3 +306,29 @@ outputs:
 4. Add gates where a human must decide, and `goto` loops with `max_loops`.
 5. Run `validate_playbooks`; fix everything; commit the files (Start in a new workspace
    branches a worktree from the current commit; Start and Start on a new agent run in this checkout).
+
+## Recover a run
+
+A run that was canceled partway, failed (including "manager lost" when its manager was
+archived) or was archived can be resumed from the step it reached, without repeating the
+steps that completed:
+
+1. `list_runs` with `archived: true` shows each run's `status`, `failure` and
+   `restartableFrom`: the steps you can restart from (main-graph steps whose `needs`
+   completed).
+2. Pick the first step that did not complete, usually the one that was running.
+3. `restart_run` with `runId`, `stepId` and a `note` saying what changed since it stopped.
+   That step and everything after it run again; earlier steps keep their outputs.
+   - `takeOver: true` makes you the run's manager (you must be an agent of the run's
+     workspace). Then run it as a manager: `get_run`, then `start_step` the ready steps.
+   - Without it, the run's manager is woken, or a new Playbook Manager is created in the
+     run's workspace if the old one was archived.
+
+`restart_run` refuses an active run (cancel it first), a step whose needs did not complete,
+and a workspace that already has another active run. A new run cannot start mid-way: to
+skip work that a lost run did, restart that run rather than starting a new one.
+
+Paseo archives an agent's children with it. If a coordinator that created the manager is
+archived, the run does not fail: a new Playbook Manager takes it over and restarts the
+steps whose agents were archived too. Archiving the manager itself still fails its active
+run; recover it as above.

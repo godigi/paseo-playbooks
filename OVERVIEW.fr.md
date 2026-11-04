@@ -45,10 +45,14 @@ lancez que des playbooks de dépôts en lesquels vous avez confiance.
 
 Les agents reçoivent des outils du plugin : tous les agents sauf ceux des étapes reçoivent
 `validate_playbooks`, `list_runs`, `cancel_run` et `restart_run` (pour arrêter une exécution,
-ou relancer une exécution terminée depuis une étape, depuis n'importe quelle conversation) ;
+ou reprendre une exécution terminée, échouée ou annulée depuis l'étape atteinte, depuis
+n'importe quelle conversation, avec `takeOver` pour la piloter soi-même) ;
 les agents d'un workspace qui contient des playbooks reçoivent les outils du manager ; les
 agents des étapes reçoivent `report_step_result`. Le dépôt fournit aussi un skill pour
 agents, `skills/paseo-playbooks/SKILL.md`, qui leur apprend à écrire des playbooks.
+
+Si le manager d'une exécution en cours est archivé avec l'agent qui l'a créé (un
+coordinateur, par exemple), un nouveau Playbook Manager reprend l'exécution au lieu qu'elle échoue.
 
 Nécessite Paseo 0.14 ou plus récent. L'état des exécutions est stocké dans
 `$PASEO_HOME/plugin-data/paseo-playbooks/runs/` et supprimé quand le worktree de l'exécution

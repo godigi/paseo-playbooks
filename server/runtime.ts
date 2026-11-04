@@ -492,16 +492,27 @@ export class Runtime {
 
   /**
    * Reopens a finished (or archived) run from a step, from the panel or the restart_run tool.
-   * Same workspace and branch; the manager stays when it still exists, otherwise a new
-   * Playbook Manager is created in the run's workspace and takes the run over. Refused when
-   * the workspace has another active run or a concurrency slot the restarted run would hold
-   * is taken.
+   * Same workspace and branch. With `takeOver`, that agent (the restart_run caller, in the
+   * run's workspace) becomes the manager. Otherwise the manager stays when it still exists,
+   * and a new Playbook Manager is created in the run's workspace when it does not. Refused
+   * when the workspace has another active run or a concurrency slot the restarted run would
+   * hold is taken.
    */
-  async restartRun(runId: string, stepId: string, comment: string | null, by: string | null, via: "panel" | "agent" = "panel"): Promise<{ run: Run; newManager: boolean }> {
+  async restartRun(
+    runId: string,
+    stepId: string,
+    comment: string | null,
+    by: string | null,
+    via: "panel" | "agent" = "panel",
+    takeOver?: { id: string; workspaceId: string | null },
+  ): Promise<{ run: Run; newManager: boolean }> {
     const run = this.store.get(runId);
     if (!run) throw new UserError(`unknown run "${runId}"`);
     const blocker = restartBlocker(run, stepId);
     if (blocker) throw new UserError(blocker);
+    if (takeOver && takeOver.workspaceId !== run.workspaceId) {
+      throw new UserError(`run ${run.id} is in another workspace (${run.workspaceId}, ${run.workspaceDir}): only an agent of that workspace can take it over; omit takeOver and a manager is found for it`);
+    }
     const busy = this.store.list().find((other) => other.id !== run.id && other.workspaceId === run.workspaceId && isActive(other));
     if (busy) throw new UserError(`this workspace has another active run (${busy.id}); one active run per workspace`);
     // Dry run: the restarted run must fit in the concurrency slots it would hold.
@@ -519,25 +530,15 @@ export class Runtime {
         throw new UserError(`"${playbookId}" allows ${limit} active run(s) in this project; held by: ${holders.filter((id) => !id.startsWith(run.id)).join(", ")}. Try again once one ends.`);
       }
     }
-    const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
-    const managerGone = !manager || Boolean(manager.agent.archivedAt);
+    const manager = takeOver ? null : await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
+    const managerGone = !takeOver && (!manager || Boolean(manager.agent.archivedAt));
     // The original manager was archived (which also archives its runs): a new one takes over.
     // It is created without a prompt, so it cannot look for the run before the run is its own.
-    const replacement = managerGone
-      ? await this.api()
-          .workspaces.ref(run.workspaceId)
-          .agents.create({
-            config: this.managerConfig(run.playbook),
-            title: `Playbook Manager · ${run.playbook.title}`,
-            labels: { [MANAGER_LABEL]: "true" },
-          })
-          .catch((error: unknown) => {
-            throw new UserError(`could not create a new Playbook Manager in the run's workspace: ${errorText(error)}`);
-          })
-      : null;
+    const replacement = managerGone ? await this.createReplacementManager(run) : null;
     const effects = await this.store.mutate(runId, (current) => {
       const fx = engine.restartRun(current, stepId, { comment, by, now: nowIso() });
       if (replacement) current.managerAgentId = replacement.id;
+      if (takeOver) current.managerAgentId = takeOver.id;
       return fx;
     });
     await this.admitQueued(runId);
@@ -548,14 +549,68 @@ export class Runtime {
       ...effects.notes,
       `Completed steps before it keep their outputs (get_run shows them). Carry on as usual: start ${ready.length === 1 ? "the ready step" : "the ready steps"} with start_step (or request_gate for a gate).`,
     ];
-    if (replacement) {
+    if (takeOver) {
+      // The caller reads the ready steps in the tool result; nothing to wake.
+    } else if (replacement) {
       const current = this.store.get(runId)!;
       await replacement.send(`${managerTakeover(current, ready, "restarted after its previous manager was archived")}\n\n[playbooks] ${lines.join(" ")}`);
     } else {
       await this.enqueue(runId, lines);
       await this.deliver(runId);
     }
-    return { run: this.store.get(runId)!, newManager: replacement !== null };
+    return { run: this.store.get(runId)!, newManager: replacement !== null || (takeOver !== undefined && takeOver.id !== run.managerAgentId) };
+  }
+
+  /** A new Playbook Manager in the run's workspace, created without a prompt so it cannot look for the run before the run is its own. */
+  private async createReplacementManager(run: Run) {
+    return this.api()
+      .workspaces.ref(run.workspaceId)
+      .agents.create({
+        config: this.managerConfig(run.playbook),
+        title: `Playbook Manager · ${run.playbook.title}`,
+        labels: { [MANAGER_LABEL]: "true" },
+      })
+      .catch((error: unknown) => {
+        throw new UserError(`could not create a new Playbook Manager in the run's workspace: ${errorText(error)}`);
+      });
+  }
+
+  /**
+   * Paseo archives an agent's children with it, so archiving a Coordinator that created the
+   * manager (create_agent) also archives the manager and its step agents. That was not a
+   * decision about the run: a new Playbook Manager takes the active run over instead of it
+   * failing. Steps whose agents went with it end as lost; the new manager retries them.
+   */
+  private async adoptOrphanedRun(runId: string, parentId: string): Promise<boolean> {
+    const run = this.store.get(runId)!;
+    const replacement = await this.createReplacementManager(run).catch((error: unknown) => {
+      console.error(`[playbooks] could not hand run ${runId} to a new manager:`, errorText(error));
+      return null;
+    });
+    if (!replacement) return false;
+    const previous = run.managerAgentId;
+    await this.store.mutate(runId, (working) =>
+      engine.replaceManager(working, replacement.id, `archived with its parent ${parentId}`, nowIso()),
+    );
+    const current = this.store.get(runId)!;
+    this.busyManagers.delete(previous);
+    const withStatus = (status: string) => Object.entries(current.steps).filter(([, state]) => state.status === status).map(([id]) => id);
+    const running = withStatus("running");
+    // Steps archived before their manager already ended; their wake-up may have gone to the old manager.
+    const reported = withStatus("reported");
+    const note = [
+      `[playbooks] ${current.id} · The previous manager (agent ${previous}) was archived because the agent that created it (${parentId}) was archived. You take the run over from where it is: completed steps keep their outputs (get_run shows them).`,
+      running.length > 0
+        ? `Steps that were running had their agents archived too: ${running.join(", ")}. When they show as ended (lost), call complete_step with "failure" to start them again (a lost attempt does not count as a retry), unless their report or the worktree shows the work is done.`
+        : "",
+      reported.length > 0
+        ? `Steps waiting for complete_step: ${reported.join(", ")}. Read them with get_run; a step that ended (lost) without a report had its agent archived: complete it with "failure" to start it again, unless the work is done.`
+        : "",
+      current.status === "waiting_gate" ? "A gate is waiting for a human decision: ask them again (see get_run)." : "",
+    ].filter(Boolean);
+    await replacement.send(`${managerTakeover(current, engine.readySteps(current), "after its previous manager was archived with its parent")}\n\n${note.join(" ")}`);
+    await this.deliver(runId);
+    return true;
   }
 
   async askManagerToRetry(runId: string, stepId: string): Promise<void> {
@@ -647,16 +702,25 @@ export class Runtime {
     await this.onManagerTurnEnded(agentId);
   }
 
-  async onAgentArchived(agentId: string): Promise<void> {
+  async onAgentArchived(agentId: string, parentAgentId: string | null = null): Promise<void> {
     this.pendingHandoffs.delete(agentId);
     const active = this.activeRunOfManager(agentId);
-    if (active) await this.failRun(active.id, "manager lost (archived)");
-    // Archiving the manager archives its runs (an active one was just failed above).
+    if (active) {
+      const adopted = parentAgentId !== null && (await this.archivedWithParent(parentAgentId)) && (await this.adoptOrphanedRun(active.id, parentAgentId));
+      if (!adopted) await this.failRun(active.id, "manager lost (archived)");
+    }
+    // Archiving the manager archives its runs (an adopted one is no longer its own; another active one was just failed).
     for (const run of this.runsOfManager(agentId)) {
       if (!run.archivedAt) await this.archiveRun(run.id).catch(() => undefined);
     }
     const step = this.stepRunOf(agentId);
     if (step) await this.onStepTurnEnded(step.run.id, agentId, "lost");
+  }
+
+  /** Whether the agent was archived by Paseo's cascade from its archived parent, not on its own. */
+  private async archivedWithParent(parentAgentId: string): Promise<boolean> {
+    const parent = await this.api().agents.ref(parentAgentId).refresh().catch(() => null);
+    return !parent || Boolean(parent.agent.archivedAt);
   }
 
   async onWorkspaceArchived(workspaceId: string): Promise<void> {
