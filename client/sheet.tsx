@@ -198,7 +198,7 @@ export function GateActions(props: { theme: Theme; run: Run; gate: Gate; hostLab
   );
 }
 
-/** "Restart from here" on a finished run: the step and what follows run again, with the same manager. */
+/** "Restart from here" on a finished run: the step and what follows run again, with the same manager (or a new one if it was archived). */
 function RestartRun(props: { theme: Theme; run: Run; stepId: string; hostLabel: string; onDone(): void }) {
   const { theme, run, stepId } = props;
   const restart = useRpc(restartRunRpc);
@@ -210,7 +210,7 @@ function RestartRun(props: { theme: Theme; run: Run; stepId: string; hostLabel: 
   return (
     <View style={{ gap: 8 }}>
       <Line theme={theme} muted>
-        Reopens this {run.status} run: "{stepLabel(stepId)}" and every step after it run again, with the same manager. Completed steps before it keep their outputs.
+        Reopens this {run.status} run: "{stepLabel(stepId)}" and every step after it run again, with the same manager (a new one if it was archived). Completed steps before it keep their outputs.
       </Line>
       {ran.length > 0 ? (
         <Line theme={theme}>

@@ -49,10 +49,10 @@ Then start the ready steps.`;
 }
 
 /** Kickoff for an existing agent the panel made manager of an already-created run. */
-export function managerTakeover(run: { id: string; playbook: Playbook; inputs: Record<string, VarValue> }, ready: string[]): string {
+export function managerTakeover(run: { id: string; playbook: Playbook; inputs: Record<string, VarValue> }, ready: string[], how = "started from the Playbooks panel"): string {
   return `${MANAGER_PROTOCOL}
 
-You are now the Playbook Manager of run ${run.id} (playbook "${run.playbook.id}"), started from the Playbooks panel. The run already exists: do not call start_playbook.
+You are now the Playbook Manager of run ${run.id} (playbook "${run.playbook.id}"), ${how}. The run already exists: do not call start_playbook.
 Inputs:
 ${JSON.stringify(run.inputs, null, 2)}
 Ready now: ${ready.join(", ") || "none"}. Start them with start_step.`;
