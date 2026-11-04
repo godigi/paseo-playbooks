@@ -75,7 +75,7 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.archived", ({ agent }, context) =>
     quietly("agent.archived", async () => {
       await enter(context.paseo);
-      await runtime.onAgentArchived(agent.id);
+      await runtime.onAgentArchived(agent.id, agent.parentAgentId);
     }),
   );
   server.on("workspace.archived", ({ workspace }, context) =>

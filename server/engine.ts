@@ -931,3 +931,10 @@ export function markReadonlyViolation(run: Run, stepId: string, detail: string, 
   attempt.report = { outcome: "failure", summary: `readonly role modified the checkout: ${detail}`, outputs: {} };
   log(run, now, "readonly_violation", stepId, detail);
 }
+
+/** Hands the run to another manager agent (its previous one was archived with its parent). */
+export function replaceManager(run: Run, managerAgentId: string, reason: string, now: string): void {
+  const previous = run.managerAgentId;
+  run.managerAgentId = managerAgentId;
+  log(run, now, "manager_replaced", null, `${previous} → ${managerAgentId}: ${reason}`);
+}
