@@ -5,7 +5,7 @@ import { useState, type ReactNode } from "react";
 import { Pressable, Text, View } from "react-native";
 import { decideGateRpc, nudgeStepRpc, retryStepRpc } from "../shared/contracts";
 import { ASK_CHOICES, destinationOf, gateChoices, gateText, linkify, LOOP_LIMIT_CHOICES } from "../shared/gates";
-import { isStepLive, type Gate, type GateChoice, type Playbook, type Run } from "../shared/types";
+import { isPaused, isStepLive, type Gate, type GateChoice, type Playbook, type Run } from "../shared/types";
 import { stepLabel, type Theme } from "./theme";
 
 export function Button(props: { theme: Theme; label: string; onPress(): void; kind?: "primary" | "danger" | "plain"; disabled?: boolean; accessibilityLabel?: string }) {
@@ -221,7 +221,8 @@ export function StepSheet(props: {
   const [message, setMessage] = useState("");
   const active = run !== null && isStepLive(run, stepId);
   const canNudge = active && (state?.status === "running" || state?.status === "reported");
-  const canRetry = active && state?.status === "reported" && (latest?.report?.outcome === "failure" || latest?.report === null);
+  // Retry goes through the manager, which a paused run does not wake.
+  const canRetry = active && !isPaused(run) && state?.status === "reported" && (latest?.report?.outcome === "failure" || latest?.report === null);
 
   return (
     <Modal title={`${stepLabel(step.id)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>

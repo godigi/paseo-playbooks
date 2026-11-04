@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { planAdmissions, slotHolders } from "../shared/slots";
 import type { Playbook, Run } from "../shared/types";
-import { admitBlock, completeStep, endTurn, newRun, queuedSteps, readySteps, recordReport, startAttempt } from "./engine";
+import { admitBlock, completeStep, endTurn, newRun, pauseRun, queuedSteps, readySteps, recordReport, resumeRun, startAttempt } from "./engine";
 import { loadPlaybooks } from "./loader";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
@@ -146,6 +146,20 @@ describe("concurrency on a sub-playbook", () => {
     admit(runs);
     expect(runs[2]!.steps["release.prepare"]!.status).toBe("ready");
     expect(runs[3]!.steps["release.prepare"]!.status).toBe("queued");
+  });
+
+  it("skips a paused run when admitting, so it does not hold a slot it cannot use", async () => {
+    const { playbook } = await load({ "pr.yaml": PR, "release.yaml": RELEASE("concurrency: 1"), "capability.yaml": CAPABILITY }, "capability");
+    const a = start(playbook!, "a");
+    const b = start(playbook!, "b");
+    reachRelease(a);
+    reachRelease(b);
+    pauseRun(a, now());
+    expect(planAdmissions([a, b])).toEqual([{ runId: "b", prefix: "release" }]);
+    admit([a, b]);
+    expect(a.steps["release.prepare"]!.status).toBe("queued");
+    resumeRun(a, now());
+    expect(planAdmissions([a, b])).toEqual([]);
   });
 
   it("scopes slots to the project and counts a top-level run of the same playbook", async () => {

@@ -2,7 +2,7 @@ import { defineAgentTool, type AgentToolDefinition, type AgentToolResult } from 
 import { GATE_SUMMARY_MAX } from "../shared/gates";
 import { z } from "zod";
 import type { PlaybookEntry, Run } from "../shared/types";
-import { isActive, isTerminal, runningAfterTasks, VarValueSchema } from "../shared/types";
+import { isActive, isPaused, isTerminal, runningAfterTasks, VarValueSchema } from "../shared/types";
 import * as engine from "./engine";
 import { loadPlaybooks } from "./loader";
 import { MANAGER_PROTOCOL } from "./prompts";
@@ -31,6 +31,8 @@ export function runSummary(run: Run) {
     failure: run.failure,
     /** True while the main graph or an after-task still runs. */
     active: isActive(run),
+    /** True while a human has paused the run: start_step is refused until they resume it. */
+    paused: isPaused(run),
     branch: run.branch,
     inputs: run.inputs,
     outputs: run.outputs,
@@ -184,7 +186,8 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
                   : run.status === "waiting_gate"
                   ? `A gate is waiting for a human decision. End your turn.`
                   : `Ready: ${ready.join(", ") || (queued.length ? "none" : "none (waiting for running steps)")}.${queued.length ? ` Queued for a free concurrency slot of another run: ${queued.join(", ")}; end your turn, you are woken when they are ready.` : ""}${gates.length ? ` Gate(s) to open with request_gate: ${gates.join(", ")}.` : ""}`;
-          return ok(text, runSummary(run));
+          const paused = isPaused(run) ? " The run is paused by a human: do not start steps; end your turn, you are woken on resume." : "";
+          return ok(text + paused, runSummary(run));
         }),
     }),
     defineAgentTool({
@@ -265,6 +268,7 @@ export function runListing(run: Run) {
     title: run.playbook.title,
     status: run.status,
     active: isActive(run),
+    paused: isPaused(run),
     workspaceId: run.workspaceId,
     workspaceDir: run.workspaceDir,
     branch: run.branch,

@@ -266,6 +266,8 @@ export const RunSchema = z.object({
   updatedAt: z.string(),
   /** Set when the run is archived from the panel: hidden there, its state and agents kept. */
   archivedAt: z.string().nullable().default(null),
+  /** Set while a human has paused the run: no step starts and the manager is not woken until resume. */
+  pausedAt: z.string().nullable().default(null),
   steps: z.record(z.string(), RunStepSchema),
   /** Times each goto edge fired, keyed "source->target", and extra loops granted at a loop-limit gate. */
   loops: z.record(z.string(), z.number().int()),
@@ -296,6 +298,11 @@ export function runningAfterTasks(run: Run): string[] {
  */
 export function isActive(run: Run): boolean {
   return !isTerminal(run.status) || runningAfterTasks(run).length > 0;
+}
+
+/** Paused by a human and still active. A pause left on a run that has since ended means nothing. */
+export function isPaused(run: Run): boolean {
+  return run.pausedAt !== null && isActive(run);
 }
 
 /** Whether a step can still move: a main step while the run is not finished, an after-step while its task runs. */

@@ -4,8 +4,8 @@ import { Icon, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Pressable, Text, View } from "react-native";
-import { archiveRunRpc, cancelRunRpc, listPlaybooks, listRuns } from "../shared/contracts";
-import { isActive, isTerminal, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
+import { archiveRunRpc, cancelRunRpc, listPlaybooks, listRuns, pauseRunRpc, resumeRunRpc } from "../shared/contracts";
+import { isActive, isPaused, isTerminal, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
 import { Graph, useReduceMotion } from "./graph";
 import { Button, StepSheet } from "./sheet";
 import { StartForm, type StartTarget } from "./start-form";
@@ -419,13 +419,16 @@ function StartButton(props: { theme: Theme; title: string; onStart(target: Start
   );
 }
 
-/** A run tab with a chevron menu: the run's details (branch, start, inputs, manager), then Cancel for active runs. */
+/** A run tab with a chevron menu: the run's details (branch, start, inputs, manager), then Pause/Resume and Cancel for active runs. */
 function RunChip(props: { theme: Theme; run: Run; selected: boolean; read: boolean; onSelect(): void; onCanceled(): void; onOpenManager(): void }) {
   const { theme, run, selected } = props;
   const cancel = useRpc(cancelRunRpc);
   const archive = useRpc(archiveRunRpc);
+  const pause = useRpc(pauseRunRpc);
+  const resume = useRpc(resumeRunRpc);
   const toast = useToast();
   const [menu, setMenu] = useState<"closed" | "open" | "confirm">("closed");
+  const paused = isPaused(run);
   // Blue running, yellow waiting for a decision, green done, grey done and opened, red failed.
   const color = run.status === "completed" && props.read ? theme.colors.foregroundMuted : runStatusColor(theme, run.status);
   const active = isActive(run);
@@ -441,6 +444,7 @@ function RunChip(props: { theme: Theme; run: Run; selected: boolean; read: boole
           <Text style={{ color: text, fontSize: 11 }}>
             {run.id.replace(/^run_/, "")} · {runStatusLabel(run.status)}
             {wrapping ? " · wrapping up" : ""}
+            {paused ? " · paused" : ""}
           </Text>
         </Pressable>
         {(
@@ -519,6 +523,31 @@ function RunChip(props: { theme: Theme; run: Run; selected: boolean; read: boole
             {active ? (
             <>
             <View style={{ height: 1, backgroundColor: theme.colors.border }} />
+            <Pressable
+              accessibilityRole="menuitem"
+              accessibilityHint={
+                paused
+                  ? "Lets the Playbook Manager start steps again and wakes it with what happened meanwhile."
+                  : "No new step starts; running steps finish their current turn."
+              }
+              onPress={() =>
+                void (paused ? resume : pause)({ runId: run.id })
+                  .then(() => {
+                    setMenu("closed");
+                    props.onCanceled();
+                  })
+                  .catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)))
+              }
+              style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}
+            >
+              <Icon name={paused ? "Play" : "Pause"} size={15} color={theme.colors.foreground} />
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{paused ? "Resume run" : "Pause run"}</Text>
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+                  {paused ? "The manager picks up where it stopped" : "Running steps finish; no new step starts"}
+                </Text>
+              </View>
+            </Pressable>
             <Pressable
               accessibilityRole="menuitem"
               onPress={() => setMenu("confirm")}
@@ -644,7 +673,7 @@ function RunDots(props: { theme: Theme; runs: Run[]; readRuns: string[]; onOpen(
 function RunDot(props: { theme: Theme; run: Run; read: boolean; onPress(): void }) {
   const { theme, run } = props;
   const reduceMotion = useReduceMotion();
-  const pulsing = isActive(run) && !reduceMotion;
+  const pulsing = isActive(run) && !isPaused(run) && !reduceMotion;
   const color = run.status === "completed" && props.read ? theme.colors.foregroundMuted : runStatusColor(theme, run.status);
   const pulse = useRef(new Animated.Value(1)).current;
   useEffect(() => {
@@ -664,7 +693,7 @@ function RunDot(props: { theme: Theme; run: Run; read: boolean; onPress(): void 
   // Ended with after-tasks still running: the run's own colour, pulsing, "completed, wrapping up".
   const wrapping = isActive(run) && isTerminal(run.status);
   const state = wrapping ? `${runStatusLabel(run.status)}, wrapping up` : run.status === "completed" && !props.read ? "completed, not opened yet" : runStatusLabel(run.status);
-  const label = `Run ${run.id.replace(/^run_/, "")}, ${state}. Opens it.`;
+  const label = `Run ${run.id.replace(/^run_/, "")}, ${state}${isPaused(run) ? ", paused" : ""}. Opens it.`;
   return (
     <Pressable accessibilityRole="button" accessibilityLabel={label} hitSlop={6} onPress={props.onPress} style={{ padding: 3 }}>
       <View style={{ width: 10, height: 10, alignItems: "center", justifyContent: "center" }}>

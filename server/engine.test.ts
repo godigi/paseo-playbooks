@@ -7,11 +7,14 @@ import {
   decideGate,
   endTurn,
   newRun,
+  pauseRun,
   readySteps,
   recordReport,
   requestGate,
+  resumeRun,
   startAttempt,
 } from "./engine";
+import { isPaused } from "../shared/types";
 import { loadPlaybooks } from "./loader";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
@@ -199,5 +202,33 @@ describe("engine", () => {
     const fx = cancelRun(r, "user", now());
     expect(fx.cancelAgents).toEqual(["inv"]);
     expect(r.status).toBe("canceled");
+  });
+
+  it("pauses by draining: running steps report, nothing starts until resume", () => {
+    const r = run();
+    runStep(r, "investigate", "success");
+    runStep(r, "implement", "success");
+    startAttempt(r, "review", { agentId: "rev", brief: "", now: now(), readonlySnapshot: null });
+    expect(pauseRun(r, now())).toBe(true);
+    expect(pauseRun(r, now())).toBe(false);
+    expect(isPaused(r)).toBe(true);
+    expect(() => startAttempt(r, "local_qa", { agentId: "qa", brief: "", now: now(), readonlySnapshot: null })).toThrow(/paused by a human/);
+    // The running step still reports and is completed: only new starts are held.
+    recordReport(r, "rev", { outcome: "success", summary: "ok", outputs: OUTPUTS.review! }, now());
+    endTurn(r, "rev", { turnEnd: "completed", lastMessage: null, now: now() });
+    completeStep(r, "review", { outcome: "success", now: now() });
+    expect(readySteps(r)).toEqual(["local_qa"]);
+    expect(resumeRun(r, now())).toBe(true);
+    expect(resumeRun(r, now())).toBe(false);
+    runStep(r, "local_qa", "success");
+    expect(r.history.map((event) => event.type)).toEqual(expect.arrayContaining(["run_paused", "run_resumed"]));
+  });
+
+  it("refuses to pause an ended run, and canceling clears the pause", () => {
+    const r = run();
+    pauseRun(r, now());
+    cancelRun(r, "user", now());
+    expect(r.pausedAt).toBeNull();
+    expect(() => pauseRun(r, now())).toThrow(/only an active run can be paused/);
   });
 });

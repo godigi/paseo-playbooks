@@ -4,7 +4,7 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 /** The daemon API handed to plugin handlers (typed via the SDK, so the build needs no @getpaseo/client). */
 type PaseoApi = PluginHandlerContext["paseo"];
 import type { Playbook, Run, Step, VarValue } from "../shared/types";
-import { isActive, isStepLive, isTerminal } from "../shared/types";
+import { isActive, isPaused, isStepLive, isTerminal } from "../shared/types";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
 import { checkoutSnapshot, currentRef, snapshotDiff } from "./git";
@@ -167,10 +167,10 @@ export class Runtime {
     });
   }
 
-  /** Sends queued wake-ups to the manager when it is idle, merged into one prompt. */
+  /** Sends queued wake-ups to the manager when it is idle, merged into one prompt. A paused run keeps them until resume. */
   async deliver(runId: string): Promise<void> {
     const run = this.store.get(runId);
-    if (!run || run.inbox.length === 0 || this.busyManagers.has(run.managerAgentId)) return;
+    if (!run || run.inbox.length === 0 || isPaused(run) || this.busyManagers.has(run.managerAgentId)) return;
     const text = await this.store.mutate(runId, (current) => {
       const merged = current.inbox.join("\n\n");
       current.inbox = [];
@@ -385,16 +385,59 @@ export class Runtime {
     return this.store.get(runId)!;
   }
 
+  /**
+   * Pauses the run from the panel (drain). Running steps finish their turn; their reports wait.
+   * A manager in the middle of a turn is told, so it stops starting steps; an idle one is left alone.
+   */
+  async pauseRun(runId: string): Promise<Run> {
+    const changed = await this.store.mutate(runId, (current) => engine.pauseRun(current, nowIso()));
+    const run = this.store.get(runId)!;
+    if (changed && this.busyManagers.has(run.managerAgentId)) {
+      await this.api()
+        .agents.ref(run.managerAgentId)
+        .send(
+          `[playbooks] ${run.id} · A human paused the run from the panel. start_step is refused until they resume it; running steps finish their current turn and their reports reach you on resume. Do not start steps: finish what you are doing and end your turn.`,
+          { activeTurnBehavior: "steer" },
+        )
+        .catch((error) => console.error(`[playbooks] could not tell the manager of ${runId} about the pause:`, errorText(error)));
+    }
+    return run;
+  }
+
+  /** Lifts the pause and wakes the manager with everything that queued up meanwhile. */
+  async resumeRun(runId: string): Promise<Run> {
+    const changed = await this.store.mutate(runId, (current) => engine.resumeRun(current, nowIso()));
+    // Slots freed while paused went to other runs; this run may take one now.
+    await this.admitQueued();
+    if (changed) {
+      const run = this.store.get(runId)!;
+      const ready = engine.readySteps(run);
+      await this.enqueue(runId, [
+        `A human resumed the run from the panel.`,
+        run.inbox.length > 0 ? "What happened while it was paused follows." : "",
+        isTerminal(run.status) ? "" : `Ready: ${ready.join(", ") || "none"}.${ready.length ? " Start them with start_step." : ""}`,
+      ].filter(Boolean));
+      // The resume note goes first, then the wake-ups held during the pause.
+      await this.store.mutate(runId, (current) => {
+        const note = current.inbox.pop();
+        if (note) current.inbox.unshift(note);
+      });
+      await this.deliver(runId);
+    }
+    return this.store.get(runId)!;
+  }
+
   private async failRun(runId: string, reason: string): Promise<void> {
     const effects = await this.store.mutate(runId, (current) => engine.failRun(current, reason, nowIso()));
     await this.applyEffects(runId, effects);
     await this.admitQueued(runId);
   }
 
-  /** Sends a follow-up to the current attempt's agent, in the same conversation. */
-  async nudgeStep(runId: string, stepId: string, message: string): Promise<void> {
+  /** Sends a follow-up to the current attempt's agent, in the same conversation. While paused, only a human may. */
+  async nudgeStep(runId: string, stepId: string, message: string, byHuman = false): Promise<void> {
     const run = this.store.get(runId);
     if (!run) throw new UserError(`unknown run "${runId}"`);
+    if (!byHuman && isPaused(run)) throw new UserError(`run ${run.id} is paused by a human: wait until it is resumed. End your turn.`);
     const state = run.steps[stepId];
     const attempt = state?.attempts.at(-1);
     if (!state || !attempt) throw new UserError(`step "${stepId}" has no attempt to nudge`);
@@ -430,6 +473,8 @@ export class Runtime {
   }
 
   async askManagerToRetry(runId: string, stepId: string): Promise<void> {
+    const run = this.store.get(runId);
+    if (run && isPaused(run)) throw new UserError(`run ${runId} is paused: resume it first`);
     await this.enqueue(runId, [`A human asked to retry step "${stepId}" from the panel. Check get_run and start it again if it is ready, or complete it with "failure" first so it becomes ready.`]);
     await this.deliver(runId);
   }
