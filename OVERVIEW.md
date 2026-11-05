@@ -36,9 +36,9 @@ Agent modes: playbooks may use any mode, `bypassPermissions` included, so steps 
 shell commands work unattended. Only start playbooks from repositories you trust.
 
 Agents get tools from the plugin: every agent except step agents gets `validate_playbooks`,
-`list_runs`, `cancel_run` and `restart_run` (so you can stop a run, or recover a finished,
-failed or canceled one from the step it reached, from any chat, with `takeOver` to manage it
-yourself);
+`list_runs`, `cancel_run`, `start_after_task` and `restart_run` (so you can stop a run,
+start a manual after-task such as a retro, or recover a finished, failed or canceled one from
+the step it reached, from any chat, with `takeOver` to manage it yourself);
 agents in a workspace with playbooks get the manager tools; step agents get
 `report_step_result`. The
 repository also ships an agent skill, `skills/paseo-playbooks/SKILL.md`, that teaches

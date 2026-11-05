@@ -44,8 +44,8 @@ compris, pour que les étapes qui lancent des commandes shell tournent sans surv
 lancez que des playbooks de dépôts en lesquels vous avez confiance.
 
 Les agents reçoivent des outils du plugin : tous les agents sauf ceux des étapes reçoivent
-`validate_playbooks`, `list_runs`, `cancel_run` et `restart_run` (pour arrêter une exécution,
-ou reprendre une exécution terminée, échouée ou annulée depuis l'étape atteinte, depuis
+`validate_playbooks`, `list_runs`, `cancel_run`, `start_after_task` et `restart_run` (pour
+arrêter une exécution, lancer une tâche de fin manuelle comme une rétro, ou reprendre une exécution terminée, échouée ou annulée depuis l'étape atteinte, depuis
 n'importe quelle conversation, avec `takeOver` pour la piloter soi-même) ;
 les agents d'un workspace qui contient des playbooks reçoivent les outils du manager ; les
 agents des étapes reçoivent `report_step_result`. Le dépôt fournit aussi un skill pour

@@ -48,8 +48,8 @@ export default function contribute(server: PluginServerContext) {
     });
 
   // Tools: report_step_result for step agents; manager tools for agents whose workspace has
-  // playbooks (or that already manage a run); validate_playbooks, list_runs, cancel_run and restart_run
-  // for every other agent, so a human can stop or restart a run from any chat.
+  // playbooks (or that already manage a run); validate_playbooks, list_runs, cancel_run, start_after_task and
+  // restart_run for every other agent, so a human can stop, wrap up or restart a run from any chat.
   const tools = { manager: managerTools(runtime), common: [validateTool(runtime), ...runTools(runtime)], step: stepTool(runtime) };
   server.before("agent.session_open", async ({ request }, context) => {
     if (request.purpose === "history") return;
