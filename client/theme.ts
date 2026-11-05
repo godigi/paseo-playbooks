@@ -104,4 +104,4 @@ export function gateBackground(theme: Theme): string {
   return withAlpha(theme.colors.statusWarning, 0.14) ?? theme.colors.surface0;
 }
 
-export { stepLabel } from "../shared/labels";
+export { stepLabel, stepShortTitle, stepTitle, stepTitleOf } from "../shared/labels";

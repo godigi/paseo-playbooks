@@ -10,7 +10,7 @@ import { useReduceMotion } from "./graph";
 import { LABEL_WIDTH, labelLayout, ROW_HEIGHT } from "./layout";
 import { useOverview, type OverviewStore } from "./overview-store";
 import { GateActions } from "./sheet";
-import { stepLabel, withAlpha, type Theme } from "./theme";
+import { stepShortTitle, stepTitle, stepTitleOf, withAlpha, type Theme } from "./theme";
 
 /** Id of the Playbooks screen, opened from the sidebar row. */
 export const SCREEN_ID = "playbooks";
@@ -198,12 +198,12 @@ function progress(run: Run): { position: number; marks: number[]; tone: Tone; st
   const completed = steps.flatMap((step, index) => (run.steps[step.id]?.status === "completed" ? [index] : []));
   const marks = live.length > 0 ? live : [Math.min(done, (completed.at(-1) ?? -1) + 1)];
   const position = Math.max(...marks);
-  const at = steps[position] ? stepLabel(steps[position]!.id) : "Done";
+  const at = steps[position] ? stepTitle(steps[position]!) : "Done";
   if (run.status === "failed" || run.status === "canceled") return { position, marks, tone: "failed", status: `${run.status === "failed" ? "Failed" : "Canceled"} at ${at}` };
   if (isPaused(run)) return { position, marks, tone: "paused", status: `Paused at ${at}` };
   const gates = pendingGates(run);
-  if (gates.length > 0) return { position, marks, tone: "waiting", status: `Ready for you: ${gates.map((gate) => stepLabel(gate.stepId)).join(", ")}` };
-  const named = (status: string) => steps.filter((step) => run.steps[step.id]?.status === status).map((step) => stepLabel(step.id));
+  if (gates.length > 0) return { position, marks, tone: "waiting", status: `Ready for you: ${gates.map((gate) => stepTitleOf(run.playbook, gate.stepId)).join(", ")}` };
+  const named = (status: string) => steps.filter((step) => run.steps[step.id]?.status === status).map(stepTitle);
   const running = named("running");
   if (running.length > 0) return { position, marks, tone: "running", status: `Working: ${running.join(", ")}` };
   const queued = named("queued");
@@ -510,7 +510,7 @@ function NeedsYouRow(props: {
   const [open, setOpen] = useState(false);
   const refresh = useStoreRefresh();
   const warning = theme.colors.statusWarning;
-  const summary = gateText(gate).summary.split("\n")[0] || `${stepLabel(gate.stepId)} is waiting`;
+  const summary = gateText(gate).summary.split("\n")[0] || `${stepTitleOf(run.playbook, gate.stepId)} is waiting`;
   return (
     <View style={{ borderTopWidth: props.first ? 0 : 1, borderTopColor: theme.colors.border }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 10 }}>
@@ -525,7 +525,7 @@ function NeedsYouRow(props: {
             {summary} <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{shortId(run)}</Text>
           </Text>
           <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
-            {run.playbook.title} › {stepLabel(gate.stepId)} · {props.workspace} · {runTitle(run)}
+            {run.playbook.title} › {stepTitleOf(run.playbook, gate.stepId)} · {props.workspace} · {runTitle(run)}
           </Text>
         </View>
         {props.compact ? null : <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{ago(gate.requestedAt)}</Text>}
@@ -664,7 +664,7 @@ function PlaybookGroup(props: {
   // The most recently updated run's definition gives the columns (runs come in that order);
   // older runs of an edited playbook keep their own steps.
   const playbook = props.runs[0]!.playbook;
-  const columns = [...mainSteps(props.runs[0]!).map((step) => stepLabel(step.id)), "Done"];
+  const columns = [...mainSteps(props.runs[0]!).map(stepShortTitle), "Done"];
   const runs = useMemo(() => sortRuns(props.runs, sort), [props.runs, sort]);
   const working = runs.filter((run) => isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length;
   return (
@@ -758,7 +758,7 @@ function RunRow(props: {
   const { theme, run, compact } = props;
   const state = progress(run);
   const color = toneColor(theme, state.tone);
-  const columns = [...mainSteps(run).map((step) => stepLabel(step.id)), "Done"];
+  const columns = [...mainSteps(run).map(stepShortTitle), "Done"];
   const markSeen = useRpc(markRunSeenRpc);
   const refresh = useStoreRefresh();
   /** Opening a finished run from here marks it seen: a green done run turns grey. */

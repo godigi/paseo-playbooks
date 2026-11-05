@@ -131,6 +131,8 @@ steps:
 | Field | Meaning |
 | --- | --- |
 | `id` | Unique; `end`, `fail` and `outputs` are reserved. |
+| `title` | Full name, shown in the step's details and on its graph node. Default: the id, capitalised (`investigate` → Investigate). On a playbook step it names the block's frame. |
+| `short_title` | Name in the Playbooks screen's step columns. Default: `title`. Not on playbook steps (their own steps are the columns). |
 | `needs` | Steps that must complete first. No `needs` = starts with the run. Steps ready together run in parallel. File order does not matter. |
 | `role` / `gate` / `playbook` / `script` | Exactly one: an agent step, a human gate with its message, a sub-playbook, or a script the plugin runs itself (see below). |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |

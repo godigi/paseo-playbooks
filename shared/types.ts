@@ -82,6 +82,10 @@ export type Role = z.infer<typeof RoleSchema>;
 
 export const StepSchema = z.object({
   id: z.string(),
+  /** Full name (details panel, graph). Unset = stepLabel(id). */
+  title: z.string().optional(),
+  /** Name in the Playbooks screen columns. Unset = the title. */
+  shortTitle: z.string().optional(),
   kind: z.enum(["agent", "gate", "script"]),
   role: z.string().optional(),
   gate: z.string().optional(),

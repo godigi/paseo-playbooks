@@ -72,6 +72,10 @@ const RawTransitionSchema = z.union([
 
 const RawStepSchema = z.object({
     id: z.string(),
+    /** Full name (details panel, graph); on a playbook step, the block's frame. Default: the id, capitalised. */
+    title: z.string().min(1).optional(),
+    /** Name in the Playbooks screen columns. Default: the title. */
+    short_title: z.string().min(1).optional(),
     needs: z.array(z.string()).default([]),
     role: z.string().optional(),
     gate: z.string().optional(),
@@ -108,7 +112,6 @@ const RawStepSchema = z.object({
 
 /** An after-task: a step (role, gate or playbook) with a trigger and no needs. */
 const RawAfterSchema = RawStepSchema.extend({
-    title: z.string().optional(),
     trigger: z.enum(["auto", "manual"]).default("auto"),
     /** Refused: each after-task starts on its own. */
     needs: z.unknown().optional(),
@@ -418,6 +421,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       for (const field of ["prompt", "outputs", "outcomes", "timeout", "agent", "choices", "on"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a playbook step (the sub-playbook defines it)`);
       }
+      if (rawStep.short_title !== undefined) err(`${where}: \`short_title\` does not apply to a playbook step (its steps are the columns)`);
       const subId = rawStep.playbook!;
       let sub: Playbook | null = null;
       if (subId === id || stack.includes(subId)) {
@@ -442,6 +446,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         agent: {},
         on: {},
         choices: [],
+        ...(rawStep.title !== undefined ? { title: rawStep.title } : {}),
         ...afterTask,
       });
       continue;
@@ -545,6 +550,8 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       choices,
       ...afterTask,
     };
+    if (rawStep.title !== undefined) step.title = rawStep.title;
+    if (rawStep.short_title !== undefined) step.shortTitle = rawStep.short_title;
     if (rawStep.role) step.role = rawStep.role;
     if (rawStep.gate !== undefined) step.gate = rawStep.gate;
     if (script !== undefined) step.script = script;
@@ -838,6 +845,7 @@ function expandBlocks(
   // A nested playbook's own after-tasks are ignored: only the outermost playbook's run.
   const mainOf = (sub: Playbook) => sub.steps.filter((step) => !step.afterTask);
   const isAfter = new Set(steps.filter((step) => step.afterTask && blocks.has(step.id)).map((step) => step.id));
+  const titles = new Map(steps.flatMap((step) => (blocks.has(step.id) && step.title ? [[step.id, step.title] as const] : [])));
   for (const [blockId, sub] of blocks) {
     const subSteps = mainOf(sub);
     const needed = new Set(subSteps.flatMap((step) => step.needs));
@@ -845,7 +853,7 @@ function expandBlocks(
     roots.set(blockId, subSteps.filter((step) => step.needs.length === 0).map((step) => `${blockId}.${step.id}`));
     // After-tasks hold no concurrency slot: a sub-playbook used as one has its `concurrency` ignored.
     const limit = !isAfter.has(blockId) && sub.concurrency !== undefined ? { concurrency: sub.concurrency } : {};
-    info[blockId] = { title: sub.title, playbook: sub.id, ...limit };
+    info[blockId] = { title: titles.get(blockId) ?? sub.title, playbook: sub.id, ...limit };
     for (const [prefix, nested] of Object.entries(sub.blocks)) {
       if (!subSteps.some((step) => step.id.startsWith(`${prefix}.`))) continue;
       const { concurrency, ...rest } = nested;

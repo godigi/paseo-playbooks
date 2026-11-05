@@ -252,6 +252,34 @@ steps:
     expect(entry.playbook!.title).toBe("Odd");
   });
 
+  it("reads step titles, falling back to the id; a playbook step's title names its block", async () => {
+    const dir = await workspace({
+      "outer.yaml": `
+steps:
+  - { id: investigate, role: investigator, title: Investigate the bug, short_title: Investig. }
+  - { id: approve, needs: [investigate], gate: Go?, title: Approve the plan }
+  - { id: pr, needs: [approve], playbook: inner, title: Pull request }
+`,
+      "inner.yaml": "steps:\n  - { id: review, role: reviewer }\n",
+    });
+    const pb = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "outer")!.playbook!;
+    expect(pb.steps.map((step) => [step.id, step.title, step.shortTitle])).toEqual([
+      ["investigate", "Investigate the bug", "Investig."],
+      ["approve", "Approve the plan", undefined],
+      ["pr.review", undefined, undefined],
+    ]);
+    expect(pb.blocks.pr!.title).toBe("Pull request");
+  });
+
+  it("refuses short_title on a playbook step", async () => {
+    const dir = await workspace({
+      "outer.yaml": "steps:\n  - { id: pr, playbook: inner, short_title: PR }\n",
+      "inner.yaml": "steps:\n  - { id: review, role: reviewer }\n",
+    });
+    const entry = (await loadPlaybooks(dir)).entries.find((candidate) => candidate.id === "outer")!;
+    expect(entry.errors.join("\n")).toMatch(/`short_title` does not apply to a playbook step/);
+  });
+
   it("refuses the removed next key", async () => {
     const dir = await workspace({
       "first.yaml": `
