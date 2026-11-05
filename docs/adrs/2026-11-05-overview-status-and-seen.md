@@ -1,6 +1,6 @@
 # Status colours, motion and "seen" runs on the Playbooks screen
 
-Status: Accepted. Supersedes the "chips come from the runs on screen" rule and the
+Status: Accepted; its **Show done** rule is superseded by `2026-11-05-show-done-hides-all-done.md`. Supersedes the "chips come from the runs on screen" rule and the
 `includeDone` input of `2026-11-05-overview-project-filters.md`.
 
 ## Context
