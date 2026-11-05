@@ -6,6 +6,7 @@ import { DEFAULT_GATE_CHOICES } from "../shared/gates";
 import { ancestorsOf, findCycle } from "../shared/graph";
 import { stepLabel } from "../shared/labels";
 import type {
+  AskChoice,
   GateChoice,
   AgentSettings,
   InputWiring,
@@ -42,8 +43,30 @@ const RawOutputSchema = RawVarDefSchema.extend({ value: z.string().optional() })
 
 const RawTransitionSchema = z.union([
   z.enum(["complete", "end", "fail"]),
-  /** Ask a human (gate with a required comment), then go back to `goto` (default: this step) with the answer. */
-  z.object({ ask: z.string().min(1), goto: z.string().optional(), max_loops: z.number().int().positive().optional() }),
+  /**
+   * Ask a human (gate with a required comment), then go back to `goto` (default: this step) with
+   * the answer. `choices` gives the gate several buttons, each with its own `goto` (default: the
+   * ask's) and comment rule (default: required); the comment becomes the target's feedback.
+   */
+  z.object({
+    ask: z.string().min(1),
+    goto: z.string().optional(),
+    max_loops: z.number().int().positive().optional(),
+    choices: z
+      .record(
+        z.string(),
+        z
+          .object({
+            goto: z.string().optional(),
+            max_loops: z.number().int().positive().optional(),
+            label: z.string().optional(),
+            comment: z.enum(["none", "optional", "required"]).default("required"),
+            color: z.enum(["primary", "neutral", "success", "warning", "danger"]).optional(),
+          })
+          .nullable(),
+      )
+      .optional(),
+  }),
   z.object({ goto: z.string(), max_loops: z.number().int().positive().optional() }),
 ]);
 
@@ -423,7 +446,29 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       if (!outcomes.includes(outcome)) err(`${where}: on.${outcome}: not an outcome of this step (${outcomes.join(", ")})`);
       if (typeof transition === "object" && "ask" in transition) {
         if (isGate) err(`${where}: on.${outcome}: \`ask\` only applies to an agent step`);
-        on[outcome] = { kind: "ask", ask: transition.ask, target: transition.goto ?? rawStep.id, ...(transition.max_loops !== undefined ? { maxLoops: transition.max_loops } : {}) };
+        const target = transition.goto ?? rawStep.id;
+        const maxLoops = transition.max_loops;
+        const askChoices: AskChoice[] = Object.entries(transition.choices ?? {}).map(([id, raw]) => {
+          if (!ID.test(id)) err(`${where}: on.${outcome}.choices.${id}: invalid name (lowercase letters, digits, - and _)`);
+          const choiceMaxLoops = raw?.max_loops ?? maxLoops;
+          const choice: AskChoice = {
+            id,
+            label: raw?.label ?? stepLabel(id.replace(/[_-]+/g, " ")),
+            comment: raw?.comment ?? "required",
+            target: raw?.goto ?? target,
+            ...(choiceMaxLoops !== undefined ? { maxLoops: choiceMaxLoops } : {}),
+          };
+          if (raw?.color) choice.color = raw.color;
+          return choice;
+        });
+        if (transition.choices !== undefined && askChoices.length === 0) err(`${where}: on.${outcome}.choices: declare at least one choice`);
+        on[outcome] = {
+          kind: "ask",
+          ask: transition.ask,
+          target: askChoices[0]?.target ?? target,
+          ...(maxLoops !== undefined ? { maxLoops } : {}),
+          ...(askChoices.length > 0 ? { choices: askChoices } : {}),
+        };
         continue;
       }
       on[outcome] =
@@ -488,9 +533,15 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     for (const step of steps) {
       for (const [outcome, transition] of Object.entries(step.on)) {
         if (transition.kind !== "goto" && transition.kind !== "ask") continue;
-        if (!ids.has(transition.target)) err(`step "${step.id}": on.${outcome}: goto unknown step "${transition.target}"`);
-        else if (transition.target !== step.id && !ancestors.get(step.id)!.has(transition.target)) {
-          err(`step "${step.id}": on.${outcome}: goto "${transition.target}" must point to an earlier step this one needs`);
+        const targets =
+          transition.kind === "ask" && transition.choices
+            ? transition.choices.map((choice) => ({ where: `on.${outcome}.choices.${choice.id}`, target: choice.target }))
+            : [{ where: `on.${outcome}`, target: transition.target }];
+        for (const { where, target } of targets) {
+          if (!ids.has(target)) err(`step "${step.id}": ${where}: goto unknown step "${target}"`);
+          else if (target !== step.id && !ancestors.get(step.id)!.has(target)) {
+            err(`step "${step.id}": ${where}: goto "${target}" must point to an earlier step this one needs`);
+          }
         }
       }
     }
@@ -791,14 +842,17 @@ function expandBlocks(
     const sub = blocks.get(step.id);
     if (!sub) {
       const on = Object.fromEntries(
-        Object.entries(step.on).map(([outcome, transition]) => {
-          if ((transition.kind !== "goto" && transition.kind !== "ask") || !blocks.has(transition.target)) return [outcome, transition];
-          const first = roots.get(transition.target)!;
-          if (first.length !== 1) {
-            err(`step "${step.id}": on.${outcome}: goto "${transition.target}" needs a playbook with a single first step (it has ${first.join(", ")})`);
-          }
-          return [outcome, { ...transition, target: first[0] ?? transition.target }];
-        }),
+        Object.entries(step.on).map(([outcome, transition]) => [
+          outcome,
+          mapTargets(transition, (target) => {
+            if (!blocks.has(target)) return target;
+            const first = roots.get(target)!;
+            if (first.length !== 1) {
+              err(`step "${step.id}": on.${outcome}: goto "${target}" needs a playbook with a single first step (it has ${first.join(", ")})`);
+            }
+            return first[0] ?? target;
+          }),
+        ]),
       );
       const inputs = Object.fromEntries(Object.entries(step.inputs).map(([name, wired]) => [name, { ...wired, source: outer(wired.source) }]));
       result.push({ ...step, needs: mapNeeds(step.needs), inputs, on });
@@ -806,9 +860,7 @@ function expandBlocks(
     }
     for (const innerStep of mainOf(sub)) {
       const on = Object.fromEntries(
-        Object.entries(innerStep.on).map(([outcome, transition]) =>
-          [outcome, transition.kind === "goto" || transition.kind === "ask" ? { ...transition, target: `${step.id}.${transition.target}` } : transition],
-        ),
+        Object.entries(innerStep.on).map(([outcome, transition]) => [outcome, mapTargets(transition, (target) => `${step.id}.${target}`)]),
       );
       const inputs = Object.fromEntries(
         Object.entries(innerStep.inputs).map(([name, wired]) => {
@@ -872,3 +924,10 @@ function resolveOutputSource(
   return { error: "no step output or playbook input has this name; set `value`" };
 }
 
+/** A transition with its goto targets (an ask's choices' too) passed through `map`. */
+function mapTargets(transition: Transition, map: (target: string) => string): Transition {
+  if (transition.kind === "goto") return { ...transition, target: map(transition.target) };
+  if (transition.kind !== "ask") return transition;
+  const choices = transition.choices?.map((choice) => ({ ...choice, target: map(choice.target) }));
+  return { ...transition, target: map(transition.target), ...(choices ? { choices } : {}) };
+}

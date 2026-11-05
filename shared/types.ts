@@ -24,13 +24,37 @@ export const AgentSettingsSchema = z.object({
 });
 export type AgentSettings = z.infer<typeof AgentSettingsSchema>;
 
+/** A button on a human gate. Its id is the outcome; where it leads comes from the step's `on`. */
+export const GateChoiceSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  /** Whether pressing it asks for a comment first (sent to the manager and, on a goto, to the target step). */
+  comment: z.enum(["none", "optional", "required"]),
+  /** Theme colour of the button; unset = primary for the first choice, neutral for the others. */
+  color: z.enum(["primary", "neutral", "success", "warning", "danger"]).optional(),
+});
+export type GateChoice = z.infer<typeof GateChoiceSchema>;
+
+/** A choice of an `ask` gate: a button that goes to its own `target` with the comment as feedback. */
+export const AskChoiceSchema = GateChoiceSchema.extend({ target: z.string(), maxLoops: z.number().int().positive().optional() });
+export type AskChoice = z.infer<typeof AskChoiceSchema>;
+
 export const TransitionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("complete") }),
   z.object({ kind: z.literal("end") }),
   z.object({ kind: z.literal("fail") }),
   z.object({ kind: z.literal("goto"), target: z.string(), maxLoops: z.number().int().positive().optional() }),
-  /** Opens a human gate asking for an answer, then goes back to `target` with the answer as feedback. */
-  z.object({ kind: z.literal("ask"), ask: z.string(), target: z.string(), maxLoops: z.number().int().positive().optional() }),
+  /**
+   * Opens a human gate asking for an answer, then goes back to `target` with the answer as feedback.
+   * With `choices`, each button goes to its own target; `target` is then the first choice's.
+   */
+  z.object({
+    kind: z.literal("ask"),
+    ask: z.string(),
+    target: z.string(),
+    maxLoops: z.number().int().positive().optional(),
+    choices: z.array(AskChoiceSchema).optional(),
+  }),
 ]);
 export type Transition = z.infer<typeof TransitionSchema>;
 
@@ -55,16 +79,6 @@ export const RoleSchema = z.object({
 });
 export type Role = z.infer<typeof RoleSchema>;
 
-/** A button on a human gate. Its id is the outcome; where it leads comes from the step's `on`. */
-export const GateChoiceSchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  /** Whether pressing it asks for a comment first (sent to the manager and, on a goto, to the target step). */
-  comment: z.enum(["none", "optional", "required"]),
-  /** Theme colour of the button; unset = primary for the first choice, neutral for the others. */
-  color: z.enum(["primary", "neutral", "success", "warning", "danger"]).optional(),
-});
-export type GateChoice = z.infer<typeof GateChoiceSchema>;
 
 export const StepSchema = z.object({
   id: z.string(),
@@ -210,8 +224,10 @@ export const GateSchema = z.object({
   id: z.string(),
   kind: z.enum(["gate", "loop_limit", "ask"]),
   stepId: z.string(),
-  /** For loop_limit and ask gates: the step the goto leads to. */
+  /** For loop_limit and ask gates: the step the goto leads to (an ask gate's first choice's). */
   gotoTarget: z.string().nullable(),
+  /** For ask gates: the step outcome that opened it (null on gates opened before it existed). */
+  outcome: z.string().nullable().default(null),
   /** "pending", or the chosen outcome (a choice id; "approved" / "rejected" for loop-limit gates). */
   status: z.string(),
   /** Full text (summary then details), as sent by chat. */

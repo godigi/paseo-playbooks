@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import { Pressable, Text, View } from "react-native";
 import { decideGateRpc, nudgeStepRpc, restartRunRpc, retryStepRpc } from "../shared/contracts";
-import { choicesOfGate, destinationOf, gateText, linkify } from "../shared/gates";
+import { askChoices, askTransitionOf, choicesOfGate, destinationOf, gateText, linkify } from "../shared/gates";
 import { isPaused, isStepLive, restartBlocker, type Gate, type GateChoice, type Playbook, type Run } from "../shared/types";
 import { stepLabel, type Theme } from "./theme";
 
@@ -74,9 +74,13 @@ function choiceColors(theme: Theme, color: NonNullable<GateChoice["color"]>): { 
 
 /** Where a choice leads, for its button: "→ End", "→ End Release" (inside a block), "→ Write", "→ Fail run". */
 function destinationLabel(run: Run, gate: Gate, choiceId: string): string {
-  if (gate.kind === "ask") return `→ ${stepLabel(gate.gotoTarget ?? "")}`;
-  if (gate.kind === "loop_limit") return choiceId === "approved" ? `→ ${stepLabel(gate.gotoTarget ?? "")}` : "→ Fail run";
   const step = run.playbook.steps.find((candidate) => candidate.id === gate.stepId);
+  if (gate.kind === "ask") {
+    const ask = askTransitionOf(gate, step);
+    const target = (ask ? askChoices(ask).find((choice) => choice.id === choiceId)?.target : undefined) ?? gate.gotoTarget ?? "";
+    return `→ ${stepLabel(target)}`;
+  }
+  if (gate.kind === "loop_limit") return choiceId === "approved" ? `→ ${stepLabel(gate.gotoTarget ?? "")}` : "→ Fail run";
   if (!step) return "";
   const destination = destinationOf(run.playbook, step, choiceId);
   if (destination.kind === "end") return "→ End";

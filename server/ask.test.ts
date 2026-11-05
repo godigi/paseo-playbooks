@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Playbook } from "../shared/types";
+import { choicesOfGate } from "../shared/gates";
 import { completeStep, decideGate, endTurn, newRun, readySteps, recordReport, startAttempt } from "./engine";
 import { loadPlaybooks } from "./loader";
 
@@ -144,6 +145,84 @@ steps:
     expect((await load({ "p.yaml": notOutcome }, "p")).errors.join("\n")).toMatch(/not an outcome of this step/);
   });
 
+  it("offers several choices, each going to its own step with the comment as feedback", async () => {
+    const yaml = `
+inputs: { request: { required: true } }
+steps:
+  - id: investigate
+    role: investigator
+    inputs: [request]
+    outputs: { plan: {} }
+  - id: implement
+    role: implementer
+    needs: [investigate]
+    inputs: [request, plan]
+    outcomes: [success, blocked]
+    outputs: { pr_url: {} }
+    on:
+      blocked:
+        ask: "Implementation is blocked."
+        max_loops: 2
+        choices:
+          answered: {}
+          replan: { goto: investigate, label: "Re-plan", max_loops: 1 }
+          skip: { comment: none, color: warning }
+`;
+    const { playbook, errors } = await load({ "p.yaml": yaml }, "p");
+    expect(errors).toEqual([]);
+    expect(playbook!.steps[1]!.on.blocked).toEqual({
+      kind: "ask",
+      ask: "Implementation is blocked.",
+      target: "implement",
+      maxLoops: 2,
+      choices: [
+        { id: "answered", label: "Answered", comment: "required", target: "implement", maxLoops: 2 },
+        { id: "replan", label: "Re-plan", comment: "required", target: "investigate", maxLoops: 1 },
+        { id: "skip", label: "Skip", comment: "none", color: "warning", target: "implement", maxLoops: 2 },
+      ],
+    });
+    const run = newRun({ id: "r", playbook: playbook!, workspaceId: "w", workspaceDir: "/tmp", projectId: "p", branch: null, managerAgentId: "m", inputs: { request: "x" }, now: now() });
+    const step = (stepId: string, agent: string, outcome: string, outputs: Record<string, string>) => {
+      startAttempt(run, stepId, { agentId: agent, brief: "", now: now(), readonlySnapshot: null });
+      recordReport(run, agent, { outcome, summary: "s", outputs }, now());
+      endTurn(run, agent, { turnEnd: "completed", lastMessage: null, now: now() });
+      return completeStep(run, stepId, { outcome, now: now() });
+    };
+    step("investigate", "i1", "success", { plan: "p" });
+    const fx = step("implement", "x1", "blocked", {});
+    expect(fx.notes.join(" ")).toContain('"replan" (Re-plan, needs a comment)');
+    const gate = run.gates.at(-1)!;
+    expect(gate).toMatchObject({ kind: "ask", outcome: "blocked", gotoTarget: "implement" });
+    expect(choicesOfGate(gate, playbook!.steps[1]).map((choice) => choice.id)).toEqual(["answered", "replan", "skip"]);
+    expect(() => decideGate(run, gate.id, { decision: "replan", comment: "", by: null, via: "panel", now: now() })).toThrow(/needs a comment/);
+
+    // The chosen choice's goto, with the choice and the comment as feedback.
+    decideGate(run, gate.id, { decision: "replan", comment: "Split the migration", by: null, via: "panel", now: now() });
+    expect(readySteps(run)).toEqual(["investigate"]);
+    expect(run.steps.investigate!.feedback).toBe('The human answered "replan": Split the migration');
+    expect(run.loops["implement->investigate"]).toBe(1);
+
+    // A choice without a comment goes back to the step itself.
+    step("investigate", "i2", "success", { plan: "p" });
+    step("implement", "x2", "blocked", {});
+    decideGate(run, run.gates.at(-1)!.id, { decision: "skip", comment: null, by: null, via: "chat", now: now() });
+    expect(readySteps(run)).toEqual(["implement"]);
+    expect(run.steps.implement!.feedback).toBe('The human answered "skip".');
+
+    // Each choice keeps its own max_loops.
+    step("implement", "x3", "blocked", {});
+    decideGate(run, run.gates.at(-1)!.id, { decision: "replan", comment: "again", by: null, via: "panel", now: now() });
+    expect(run.gates.at(-1)!).toMatchObject({ kind: "loop_limit", gotoTarget: "investigate" });
+  });
+
+  it("validates ask choices", async () => {
+    const withChoices = (choices: string) => PB(`{ ask: "q", choices: ${choices} }`);
+    expect((await load({ "p.yaml": withChoices("{}") }, "p")).errors.join("\n")).toMatch(/choices: declare at least one choice/);
+    expect((await load({ "p.yaml": withChoices("{ Bad: {} }") }, "p")).errors.join("\n")).toMatch(/choices\.Bad: invalid name/);
+    expect((await load({ "p.yaml": withChoices("{ go: { goto: nope } }") }, "p")).errors.join("\n")).toMatch(/on\.needs_input\.choices\.go: goto unknown step "nope"/);
+    expect((await load({ "p.yaml": withChoices("{ go: { goto: implement } }") }, "p")).errors.join("\n")).toMatch(/goto "implement" must point to an earlier step/);
+  });
+
   it("works inside a sub-playbook (target is prefixed)", async () => {
     const { playbook, errors } = await load(
       { "pr.yaml": PB(ASK), "cap.yaml": "inputs: { request: { required: true } }\nsteps:\n  - id: pr\n    playbook: pr\n" },
@@ -151,5 +230,13 @@ steps:
     );
     expect(errors).toEqual([]);
     expect(playbook!.steps.find((step) => step.id === "pr.investigate")!.on.needs_input).toMatchObject({ kind: "ask", target: "pr.investigate" });
+  });
+
+  it("prefixes ask choice targets inside a sub-playbook", async () => {
+    const pr = PB('{ ask: "q", choices: { answered: {}, other: { comment: optional } } }');
+    const { playbook, errors } = await load({ "pr.yaml": pr, "cap.yaml": "inputs: { request: { required: true } }\nsteps:\n  - id: pr\n    playbook: pr\n" }, "cap");
+    expect(errors).toEqual([]);
+    const on = playbook!.steps.find((step) => step.id === "pr.investigate")!.on.needs_input!;
+    expect(on.kind === "ask" && on.choices!.map((choice) => choice.target)).toEqual(["pr.investigate", "pr.investigate"]);
   });
 });

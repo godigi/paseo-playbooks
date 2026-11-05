@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AccessibilityInfo, Animated, Pressable, Text, View } from "react-native";
 import { Button, GateActions } from "./sheet";
 import { startAfterTaskRpc } from "../shared/contracts";
+import { askChoices } from "../shared/gates";
 import { END, layerOf, layoutGraph, START, withTerminals } from "../shared/graph";
 import { isTerminal, type AfterTask, type Playbook, type Run, type Step } from "../shared/types";
 import { agentBackground, gateBackground, stepLabel, nodeColor, nodeIcon, nodeStateLabel, type NodeState, type Theme } from "./theme";
@@ -44,11 +45,28 @@ function forwardLabels(steps: readonly Step[]): Map<string, string> {
 
 function loopEdges(steps: readonly Step[], run: Run | null): LoopEdge[] {
   return steps.flatMap((step) =>
-    Object.entries(step.on).flatMap(([outcome, transition]) =>
-      transition.kind === "goto" || (transition.kind === "ask" && transition.target !== step.id)
-        ? [{ from: step.id, to: transition.target, outcome, count: run?.loops[`${step.id}->${transition.target}`] ?? 0, max: transition.maxLoops }]
-        : [],
-    ),
+    Object.entries(step.on).flatMap(([outcome, transition]) => {
+      if (transition.kind === "goto") {
+        return [{ from: step.id, to: transition.target, outcome, count: run?.loops[`${step.id}->${transition.target}`] ?? 0, max: transition.maxLoops }];
+      }
+      if (transition.kind !== "ask") return [];
+      // One edge per ask target other than the step itself, labelled with the choices that take it.
+      const byTarget = new Map<string, { ids: string[]; max: number | undefined }>();
+      for (const choice of askChoices(transition)) {
+        if (choice.target === step.id) continue;
+        const edge = byTarget.get(choice.target) ?? { ids: [], max: choice.maxLoops };
+        edge.ids.push(choice.id);
+        byTarget.set(choice.target, edge);
+      }
+      const multi = (transition.choices?.length ?? 0) > 0;
+      return [...byTarget].map(([to, edge]) => ({
+        from: step.id,
+        to,
+        outcome: multi ? `${outcome}: ${edge.ids.join(" / ")}` : outcome,
+        count: run?.loops[`${step.id}->${to}`] ?? 0,
+        max: edge.max,
+      }));
+    }),
   );
 }
 
