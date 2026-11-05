@@ -649,7 +649,10 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
   const state = run?.steps[step.id];
   const attempts = state?.attempts ?? [];
   const latest = attempts.at(-1);
-  const live = useAgent(latest?.agentId ?? "", (agent) => ({ status: agent.status, attention: agent.attentionReason }));
+  const isScript = step.kind === "script";
+  // Script steps have no agent: their attempts open the details sheet instead of a conversation.
+  const latestAgent = latest && !isScript ? latest.agentId : null;
+  const live = useAgent(latestAgent ?? "", (agent) => ({ status: agent.status, attention: agent.attentionReason }));
   const reduceMotion = useReduceMotion();
   let nodeState: NodeState = run ? state?.status ?? "pending" : "definition";
   if (nodeState === "running" && live?.attention === "permission") nodeState = "needs_permission";
@@ -674,9 +677,13 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
     return () => loop.stop();
   }, [nodeState, reduceMotion, pulse]);
 
-  const subtitle = isGate ? "Gate" : `${role?.title ?? step.role}${role?.readonly ? " · ro" : ""}`;
+  const subtitle = isGate
+    ? "Gate"
+    : isScript
+      ? `Script${nodeState === "running" && latest?.checks ? ` · check ${latest.checks}` : ""}`
+      : `${role?.title ?? step.role}${role?.readonly ? " · ro" : ""}`;
   const stateLabel = nodeStateLabel(nodeState);
-  const onPress = () => (latest ? props.onOpenAgent(latest.agentId) : props.onOpenSheet(step.id));
+  const onPress = () => (latestAgent ? props.onOpenAgent(latestAgent) : props.onOpenSheet(step.id));
   const isHighlighted = highlighted === step.id;
 
   return (
@@ -695,7 +702,7 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
       >
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`${stepLabel(step.id)}, ${subtitle}${stateLabel ? `, ${stateLabel}` : ""}${props.loops.map((loop) => `, on ${loop.outcome} loops back to ${loop.to}${loop.max !== undefined ? ` (${loop.count} of ${loop.max})` : ""}`).join("")}${latest ? `, attempt ${latest.n}, opens conversation` : ", opens details"}`}
+          accessibilityLabel={`${stepLabel(step.id)}, ${subtitle}${stateLabel ? `, ${stateLabel}` : ""}${props.loops.map((loop) => `, on ${loop.outcome} loops back to ${loop.to}${loop.max !== undefined ? ` (${loop.count} of ${loop.max})` : ""}`).join("")}${latest ? `, attempt ${latest.n}` : ""}${latestAgent ? ", opens conversation" : ", opens details"}`}
           onPress={onPress}
           style={{ paddingHorizontal: 8, paddingVertical: 6, gap: 2 }}
         >
@@ -734,7 +741,7 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
                 key={attempt.n}
                 accessibilityRole="button"
                 accessibilityLabel={`Open attempt ${attempt.n} of ${step.id}`}
-                onPress={() => props.onOpenAgent(attempt.agentId)}
+                onPress={() => (isScript ? props.onOpenSheet(step.id) : props.onOpenAgent(attempt.agentId))}
                 style={{ borderRadius: 6, paddingHorizontal: 5, paddingVertical: 1, backgroundColor: theme.colors.surface2 }}
               >
                 <Text style={{ color: theme.colors.foreground, fontSize: 10 }}>#{attempt.n}</Text>

@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { access, constants, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -77,6 +77,10 @@ const RawStepSchema = z.object({
     gate: z.string().optional(),
     /** A sub-playbook from the same folder, run in place of this step. */
     playbook: z.string().optional(),
+    /** An executable in the folder's scripts/, run by the plugin itself. */
+    script: z.string().optional(),
+    /** Script steps: rerun the script this often while it exits with SCRIPT_NOT_YET (`30s`, `1m`). */
+    poll: z.string().optional(),
     prompt: z.string().optional(),
     inputs: z.union([z.array(z.string()), z.record(z.string(), z.string().nullable())]).optional(),
     outputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
@@ -321,6 +325,19 @@ export async function loadPlaybooks(workspaceDir: string): Promise<LoadResult> {
   return { roots, exists: roots.length > 0, entries };
 }
 
+/**
+ * A script step's file: a plain name in the folder's scripts/ (no path), executable. Its
+ * shebang picks the interpreter.
+ */
+async function checkScript(root: string, name: string): Promise<{ name: string } | { error: string }> {
+  if (!/^[A-Za-z0-9][\w.-]*$/.test(name)) return { error: `"${name}" must be a file name in scripts/ (letters, digits, ., - and _; no path)` };
+  const file = path.join(root, "scripts", name);
+  const info = await stat(file).catch(() => null);
+  if (!info?.isFile()) return { error: `scripts/${name} not found` };
+  if (!(await access(file, constants.X_OK).then(() => true, () => false))) return { error: `scripts/${name} is not executable (chmod +x it)` };
+  return { name };
+}
+
 /** One playbook folder: its files, defaults, roles, and a cached loader for sub-playbooks. */
 interface Folder {
   root: string;
@@ -392,9 +409,11 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     seen.add(rawStep.id);
     const isGate = rawStep.gate !== undefined;
     const isBlock = rawStep.playbook !== undefined;
-    if ([rawStep.role, rawStep.gate, rawStep.playbook].filter((value) => value !== undefined).length !== 1) {
-      err(`${where}: set exactly one of \`role\`, \`gate\` or \`playbook\``);
+    const isScript = rawStep.script !== undefined;
+    if ([rawStep.role, rawStep.gate, rawStep.playbook, rawStep.script].filter((value) => value !== undefined).length !== 1) {
+      err(`${where}: set exactly one of \`role\`, \`gate\`, \`playbook\` or \`script\``);
     }
+    if (!isScript && rawStep.poll !== undefined) err(`${where}: \`poll\` only applies to a script step`);
     if (isBlock) {
       for (const field of ["prompt", "outputs", "outcomes", "timeout", "agent", "choices", "on"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a playbook step (the sub-playbook defines it)`);
@@ -433,6 +452,20 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       }
     }
     if (!isGate && rawStep.choices !== undefined) err(`${where}: \`choices\` only applies to a gate`);
+    let script: string | undefined;
+    let pollMs: number | undefined;
+    if (isScript) {
+      for (const field of ["prompt", "agent"] as const) {
+        if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a script step`);
+      }
+      const checked = await checkScript(root, rawStep.script!);
+      if ("error" in checked) err(`${where}: script: ${checked.error}`);
+      else script = `${folder.relDir}/scripts/${checked.name}`;
+      if (rawStep.poll !== undefined) {
+        pollMs = parseDuration(rawStep.poll) ?? undefined;
+        if (pollMs === undefined) err(`${where}: poll: expected a duration such as 30s or 1m`);
+      }
+    }
     const choices: GateChoice[] = Object.entries(isGate ? rawStep.choices ?? {} : {}).map(([id, raw]) => {
       if (!ID.test(id)) err(`${where}: choices.${id}: invalid name (lowercase letters, digits, - and _)`);
       const choice: GateChoice = { id, label: raw?.label ?? stepLabel(id.replace(/[_-]+/g, " ")), comment: raw?.comment ?? "none" };
@@ -500,20 +533,22 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     const stepRole = rawStep.role ? roles[rawStep.role] : undefined;
     const step: Step = {
       id: rawStep.id,
-      kind: isGate ? "gate" : "agent",
+      kind: isGate ? "gate" : isScript ? "script" : "agent",
       needs: rawStep.needs,
       prompt: rawStep.prompt ?? "",
       inputs: {},
       outputs,
       outcomes,
       retries: rawStep.retries,
-      agent: isGate ? {} : mergeAgent(defaults.agent, pb.agent, stepRole?.agent, rawStep.agent),
+      agent: isGate || isScript ? {} : mergeAgent(defaults.agent, pb.agent, stepRole?.agent, rawStep.agent),
       on,
       choices,
       ...afterTask,
     };
     if (rawStep.role) step.role = rawStep.role;
     if (rawStep.gate !== undefined) step.gate = rawStep.gate;
+    if (script !== undefined) step.script = script;
+    if (pollMs !== undefined) step.pollMs = pollMs;
     if (timeoutMs !== undefined && !isGate) step.timeoutMs = timeoutMs;
     steps.push(step);
   }

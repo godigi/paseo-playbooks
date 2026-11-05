@@ -2,7 +2,7 @@ import { defineAgentTool, type AgentToolDefinition, type AgentToolResult } from 
 import { askHumanText, choicesOfGate, GATE_SUMMARY_MAX } from "../shared/gates";
 import { z } from "zod";
 import type { PlaybookEntry, Run } from "../shared/types";
-import { isActive, isPaused, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
+import { isActive, isPaused, isScriptAttempt, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
 import * as engine from "./engine";
 import { hasPlaybooks, loadPlaybooks } from "./loader";
 import { MANAGER_PROTOCOL } from "./prompts";
@@ -52,7 +52,8 @@ export function runSummary(run: Run) {
             outcomes: step.outcomes,
             status: state.status,
             attempts: state.attempts.length,
-            agentId: attempt?.agentId ?? null,
+            agentId: attempt && !isScriptAttempt(attempt.agentId) ? attempt.agentId : null,
+            ...(step.kind === "script" ? { script: step.script, checks: attempt?.checks ?? 0, nextCheckAt: attempt?.nextCheckAt ?? null } : {}),
             report: attempt?.report ?? null,
             lastMessage: attempt?.report ? null : attempt?.lastMessage ?? null,
             turnEnd: attempt?.turnEnd ?? null,
@@ -100,6 +101,7 @@ function describeEntry(entry: PlaybookEntry) {
       kind: step.kind,
       role: step.role ? `${step.role} (${pb.roles[step.role]!.title}${pb.roles[step.role]!.readonly ? ", readonly" : ""})` : null,
       gate: step.gate ?? null,
+      ...(step.kind === "script" ? { script: step.script, poll: step.pollMs ? `${step.pollMs / 1000}s` : null } : {}),
       afterTask: step.afterTask ?? null,
       needs: step.needs,
       inputs: Object.fromEntries(Object.entries(step.inputs).map(([name, wiring]) => [name, `${wiring.label}${wiring.auto ? " (auto)" : ""}`])),

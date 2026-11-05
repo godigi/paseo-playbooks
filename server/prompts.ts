@@ -12,7 +12,9 @@ How to run a playbook:
 3. For each ready agent step, call start_step with a short brief: what matters from the
    request and earlier results that the step prompt does not already say. The plugin
    renders the step's prompt and inputs; do not repeat them. Start every ready step;
-   steps ready at the same time run in parallel.
+   steps ready at the same time run in parallel. Script steps (\`script:\` instead of a
+   role) are not yours: the plugin runs and completes them itself, and wakes you with their
+   result and what is ready next. Never start_step, nudge_step or wait for them yourself.
 4. Then end your turn and wait. The plugin wakes you with a "[playbooks]" message when a
    step agent finishes, or when a human decides a gate.
 5. Read the step's report (get_run shows everything). Decide its outcome and call

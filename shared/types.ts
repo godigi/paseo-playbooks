@@ -82,9 +82,13 @@ export type Role = z.infer<typeof RoleSchema>;
 
 export const StepSchema = z.object({
   id: z.string(),
-  kind: z.enum(["agent", "gate"]),
+  kind: z.enum(["agent", "gate", "script"]),
   role: z.string().optional(),
   gate: z.string().optional(),
+  /** Script steps: the executable, relative to the workspace (`<playbooks folder>/scripts/<name>`). */
+  script: z.string().optional(),
+  /** Script steps: rerun the script this often while it exits with SCRIPT_NOT_YET. Unset = run it once. */
+  pollMs: z.number().int().positive().optional(),
   needs: z.array(z.string()),
   prompt: z.string(),
   inputs: z.record(z.string(), InputWiringSchema),
@@ -203,6 +207,10 @@ export const AttemptSchema = z.object({
   readonlySnapshot: z.string().nullable(),
   /** True once the plugin asked the agent to report after a turn ended without a report. */
   reminded: z.boolean().default(false),
+  /** Script steps: how many times the script has run in this attempt. */
+  checks: z.number().int().min(0).default(0),
+  /** Script steps: when the next check runs, while the script says "not yet". */
+  nextCheckAt: z.string().nullable().default(null),
 });
 export type Attempt = z.infer<typeof AttemptSchema>;
 
@@ -300,6 +308,18 @@ export const RunSchema = z.object({
   seq: z.number().int(),
 });
 export type Run = z.infer<typeof RunSchema>;
+
+/** Exit code a script step uses to say "not done yet, run me again after `poll`" (EX_TEMPFAIL). */
+export const SCRIPT_NOT_YET = 75;
+
+/** Script steps have no agent: their attempts carry this id instead, unique across runs. */
+export function scriptAttemptId(runId: string, stepId: string, attempt: number): string {
+  return `script:${runId}:${stepId}:${attempt}`;
+}
+
+export function isScriptAttempt(agentId: string): boolean {
+  return agentId.startsWith("script:");
+}
 
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["completed", "failed", "canceled"];
 
