@@ -178,11 +178,6 @@ function isMoving(tone: Tone): boolean {
 
 const LIVE = new Set(["running", "waiting", "reported", "queued", "ready", "failed"]);
 
-/** A completed run a human has not opened yet from the screen. */
-function isUnseenDone(run: Run): boolean {
-  return run.status === "completed" && !isActive(run) && !run.seenAt;
-}
-
 /**
  * Where a run stands on its line: the column of its furthest live step (Done once completed),
  * the columns of every live step, and its tone.
@@ -284,10 +279,10 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   const inProject = allRuns.filter((run) => !project || projectOf(run) === project);
   const workspaceChips = project ? chipsOf(inProject, (run) => run.workspaceId, (run) => names.get(run.workspaceId) ?? run.workspaceId) : [];
   const scope = workspaceFilter && workspaceChips.some((chip) => chip.id === workspaceFilter) ? workspaceFilter : null;
-  // Done runs already opened are listed with Show done; everything else (working, waiting, failed, done and not opened) always.
-  const runs = inProject
-    .filter((run) => (!scope || run.workspaceId === scope) && (showDone || run.status !== "completed" || isActive(run) || isUnseenDone(run)))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const inScope = inProject.filter((run) => !scope || run.workspaceId === scope);
+  const isDone = (run: Run) => run.status === "completed" && !isActive(run);
+  // Done runs, opened or not, are listed with Show done; everything else (working, waiting, failed) always.
+  const runs = inScope.filter((run) => showDone || !isDone(run)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 
   const needs = runs.flatMap((run) => pendingGates(run).map((gate) => ({ run, gate })));
   const groups = useMemo(() => {
@@ -299,7 +294,8 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
     needsYou: needs.length,
     working: runs.filter((run) => isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length,
     paused: runs.filter((run) => isPaused(run)).length,
-    done: runs.filter((run) => run.status === "completed" && !isActive(run)).length,
+    // Counted even when hidden, so new done runs are not missed.
+    done: inScope.filter(isDone).length,
     failed: runs.filter((run) => run.status === "failed" || run.status === "canceled").length,
   };
 
@@ -420,7 +416,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
           <View style={{ alignItems: "center", gap: 8, paddingVertical: 32 }}>
             <Icon name="Workflow" size={28} color={theme.colors.foregroundMuted} />
             <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13, textAlign: "center" }}>
-              {showDone ? "No runs yet." : "Nothing new. Show done lists the runs you have opened."}
+              {showDone ? "No runs yet." : "Nothing running. Show done lists the finished runs."}
             </Text>
           </View>
         ) : null}
