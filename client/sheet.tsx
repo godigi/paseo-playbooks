@@ -6,7 +6,7 @@ import { Pressable, Text, View } from "react-native";
 import { decideGateRpc, nudgeStepRpc, restartRunRpc, retryStepRpc } from "../shared/contracts";
 import { askChoices, askTransitionOf, choicesOfGate, destinationOf, gateText, linkify } from "../shared/gates";
 import { isPaused, isStepLive, restartBlocker, type Gate, type GateChoice, type Playbook, type Run } from "../shared/types";
-import { stepLabel, type Theme } from "./theme";
+import { stepTitle, stepTitleOf, type Theme } from "./theme";
 
 /** A poll interval as people say it: 30 s, 1 min, 2 h. */
 function formatInterval(ms: number): string {
@@ -85,15 +85,15 @@ function destinationLabel(run: Run, gate: Gate, choiceId: string): string {
   if (gate.kind === "ask") {
     const ask = askTransitionOf(gate, step);
     const target = (ask ? askChoices(ask).find((choice) => choice.id === choiceId)?.target : undefined) ?? gate.gotoTarget ?? "";
-    return `→ ${stepLabel(target)}`;
+    return `→ ${stepTitleOf(run.playbook, target)}`;
   }
-  if (gate.kind === "loop_limit") return choiceId === "approved" ? `→ ${stepLabel(gate.gotoTarget ?? "")}` : "→ Fail run";
+  if (gate.kind === "loop_limit") return choiceId === "approved" ? `→ ${stepTitleOf(run.playbook, gate.gotoTarget ?? "")}` : "→ Fail run";
   if (!step) return "";
   const destination = destinationOf(run.playbook, step, choiceId);
   if (destination.kind === "end") return "→ End";
   if (destination.kind === "end_block") return `→ End ${run.playbook.blocks[destination.targets[0]!]?.title ?? destination.targets[0]}`;
   if (destination.kind === "fail") return "→ Fail run";
-  return `→ ${destination.targets.map(stepLabel).join(", ")}`;
+  return `→ ${destination.targets.map((target) => stepTitleOf(run.playbook, target)).join(", ")}`;
 }
 
 /** A pending gate: its summary, collapsed details, and one full-width button per choice. Choices that take a comment open a text box with Send. */
@@ -222,7 +222,7 @@ function RestartRun(props: { theme: Theme; run: Run; stepId: string; hostLabel: 
   return (
     <View style={{ gap: 8 }}>
       <Line theme={theme} muted>
-        Reopens this {run.status} run: "{stepLabel(stepId)}" and every step after it run again, with the same manager (a new one if it was archived). Completed steps before it keep their outputs.
+        Reopens this {run.status} run: "{stepTitleOf(run.playbook, stepId)}" and every step after it run again, with the same manager (a new one if it was archived). Completed steps before it keep their outputs.
       </Line>
       {ran.length > 0 ? (
         <Line theme={theme}>
@@ -290,7 +290,7 @@ export function StepSheet(props: {
   const canRetry = active && !isPaused(run) && state?.status === "reported" && (latest?.report?.outcome === "failure" || latest?.report === null);
 
   return (
-    <Modal title={`${stepLabel(step.id)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : step.kind === "script" ? " · Script" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>
+    <Modal title={`${stepTitle(step)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : step.kind === "script" ? " · Script" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>
       <Modal.Content>
         {state ? <Line theme={theme}>Status: {state.status}{latest ? ` · attempt ${latest.n}` : ""}</Line> : null}
         {step.kind === "agent" ? (
