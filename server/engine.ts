@@ -6,7 +6,7 @@ import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
 import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
 import type { AfterTask, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
-import { isActive, isPaused, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
+import { isActive, isPaused, isScriptAttempt, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, parseDuration, renderTemplate, replaceRefs, resolveValue, templateRefs } from "../shared/vars";
 
 export class EngineError extends Error {}
@@ -14,12 +14,14 @@ export class EngineError extends Error {}
 export interface Effects {
   /** Step agents whose running turn must be interrupted. */
   cancelAgents: string[];
+  /** Agents of completed steps, no longer needed: archived to free their sessions. */
+  archiveAgents: string[];
   /** Human-readable lines for the manager. */
   notes: string[];
 }
 
 function effects(): Effects {
-  return { cancelAgents: [], notes: [] };
+  return { cancelAgents: [], archiveAgents: [], notes: [] };
 }
 
 export function stepDef(run: Run, stepId: string): Step {
@@ -584,15 +586,22 @@ export function startAfterTask(run: Run, taskId: string, now: string): Effects {
 }
 
 function markCompleted(run: Run, stepId: string, now: string, fx: Effects): void {
-  setCompleted(run, stepId, now);
+  setCompleted(run, stepId, now, fx);
   advance(run, stepId, now, fx);
 }
 
-function setCompleted(run: Run, stepId: string, now: string): void {
+function setCompleted(run: Run, stepId: string, now: string, fx: Effects): void {
   const state = run.steps[stepId]!;
   state.status = "completed";
   state.completedSeq = run.seq + 1;
   log(run, now, "step_completed", stepId, state.attempts.at(-1)?.outcome ?? "approved");
+  archiveDone(run, stepId, fx);
+}
+
+/** A completed step's agents are no longer needed. */
+function archiveDone(run: Run, stepId: string, fx: Effects): void {
+  if (stepDef(run, stepId).archiveAgents === false) return;
+  fx.archiveAgents.push(...run.steps[stepId]!.attempts.map((attempt) => attempt.agentId).filter((agentId) => !isScriptAttempt(agentId)));
 }
 
 /** After a step finished: ends its flow (the run, or its after-task) when all of it is done, else makes the next steps ready. */
@@ -622,11 +631,12 @@ function endFrom(run: Run, stepId: string, outcome: string | undefined, now: str
   const prefix = scopeOf(run, step, stepId);
   if (prefix === null) {
     run.steps[stepId]!.status = "completed";
+    archiveDone(run, stepId, fx);
     if (outcome) log(run, now, "run_outcome", stepId, outcome);
     endFlow(run, step, "completed", "", now, fx);
     return;
   }
-  setCompleted(run, stepId, now);
+  setCompleted(run, stepId, now, fx);
   endBlock(run, step, prefix, outcome, `"${stepId}"`, now, fx);
 }
 

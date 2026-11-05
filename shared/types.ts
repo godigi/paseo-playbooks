@@ -111,6 +111,8 @@ export const StepSchema = z.object({
   timeout: z.string().optional(),
   /** Agent steps: remind the agent after this long without activity. 0 = never; unset = the plugin default. */
   silenceMs: z.number().int().min(0).optional(),
+  /** Agent steps: archive the step's agents once it completes, and each attempt's once the next starts. Unset = true. */
+  archiveAgents: z.boolean().optional(),
   /** Resolved agent settings (step > role > playbook > defaults). Provider/model may stay unset. */
   agent: AgentSettingsSchema,
   on: z.record(z.string(), TransitionSchema),
