@@ -49,6 +49,7 @@ const RawTransitionSchema = z.union([
    * Ask a human (gate with a required comment), then go back to `goto` (default: this step) with
    * the answer. `choices` gives the gate several buttons, each with its own `goto` (default: the
    * ask's) and comment rule (default: required); the comment becomes the target's feedback.
+   * A choice with `outcome` ends the step with that outcome and `outputs` instead.
    */
   z.object({
     ask: z.string().min(1),
@@ -61,6 +62,10 @@ const RawTransitionSchema = z.union([
           .object({
             goto: z.string().optional(),
             max_loops: z.number().int().positive().optional(),
+            /** Ends the step with this outcome (its `on` entry) instead of a `goto`: the step does not run again. */
+            outcome: z.string().optional(),
+            /** With `outcome`: outputs set on the step, templates over gate.*, report.* and inputs.*. */
+            outputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]).transform(String)).optional(),
             label: z.string().optional(),
             comment: z.enum(["none", "optional", "required"]).default("required"),
             color: z.enum(["primary", "neutral", "success", "warning", "danger"]).optional(),
@@ -538,12 +543,23 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         const target = transition.goto ?? rawStep.id;
         const maxLoops = transition.max_loops;
         const askChoices: AskChoice[] = Object.entries(transition.choices ?? {}).map(([id, raw]) => {
-          if (!ID.test(id)) err(`${where}: on.${outcome}.choices.${id}: invalid name (lowercase letters, digits, - and _)`);
+          const at = `${where}: on.${outcome}.choices.${id}`;
+          if (!ID.test(id)) err(`${at}: invalid name (lowercase letters, digits, - and _)`);
+          const label = raw?.label ?? stepLabel(id.replace(/[_-]+/g, " "));
+          const comment = raw?.comment ?? "required";
+          if (raw?.outcome !== undefined) {
+            // Ends the step with another outcome: checked against the step's `on` and outputs below.
+            if (raw.goto !== undefined || raw.max_loops !== undefined) err(`${at}: \`outcome\` ends the step, so \`goto\` and \`max_loops\` do not apply`);
+            const choice: AskChoice = { id, label, comment, target, outcome: raw.outcome, ...(raw.outputs ? { outputs: raw.outputs } : {}) };
+            if (raw.color) choice.color = raw.color;
+            return choice;
+          }
+          if (raw?.outputs !== undefined) err(`${at}: \`outputs\` needs an \`outcome\` (a choice without one runs a step again)`);
           const choiceMaxLoops = raw?.max_loops ?? maxLoops;
           const choice: AskChoice = {
             id,
-            label: raw?.label ?? stepLabel(id.replace(/[_-]+/g, " ")),
-            comment: raw?.comment ?? "required",
+            label,
+            comment,
             target: raw?.goto ?? target,
             ...(choiceMaxLoops !== undefined ? { maxLoops: choiceMaxLoops } : {}),
           };
@@ -584,6 +600,20 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       if (!ID.test(name)) err(`${where}: outputs.${name}: invalid name`);
       outputs[name] = toVarDef(rawDef);
       checkVarDef(`${file}: ${where}: outputs.${name}`, outputs[name]!, errors);
+    }
+    // Ask choices that end the step: a real outcome that does not ask again, and declared outputs.
+    for (const [outcome, transition] of Object.entries(on)) {
+      if (transition.kind !== "ask") continue;
+      for (const choice of transition.choices ?? []) {
+        if (choice.outcome === undefined) continue;
+        const at = `${where}: on.${outcome}.choices.${choice.id}`;
+        const next = on[choice.outcome];
+        if (!outcomes.includes(choice.outcome)) err(`${at}: outcome "${choice.outcome}" is not an outcome of this step (${outcomes.join(", ")})`);
+        else if (next?.kind === "ask") err(`${at}: outcome "${choice.outcome}" asks again; pick an outcome that completes, ends, fails or loops`);
+        for (const name of Object.keys(choice.outputs ?? {})) {
+          if (!(name in outputs)) err(`${at}: outputs.${name}: not an output of this step${Object.keys(outputs).length ? ` (${Object.keys(outputs).join(", ")})` : ""}`);
+        }
+      }
     }
     let timeoutMs = defaultTimeout;
     // A templated timeout is rendered with the step's inputs at each attempt (refs checked in wireStep).
@@ -732,6 +762,9 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   return { entry };
 }
 
+/** What an ask choice's `outputs` may read besides `inputs.<name>` and `report.outputs.<name>`. */
+const ASK_OUTPUT_REFS = /^(gate\.comment|gate\.choice|report\.summary)$/;
+
 const PROMPT_REFS = /^(inputs\.[A-Za-z_][\w-]*|run\.id|run\.status|run\.failure|attempt)$/;
 
 /** The run field to suggest when an after-task input has no source. */
@@ -873,6 +906,24 @@ function wireStep(
     const name = /^inputs\.([A-Za-z_][\w-]*)$/.exec(ref)?.[1];
     if (name === undefined) err(`${where}: timeout uses "{{ ${ref} }}"; a timeout may only use inputs.<name> (a declared input of the step)`);
     else if (!(name in declared)) err(`${where}: timeout uses "{{ ${ref} }}" but the step declares no such input`);
+  }
+  for (const [outcome, transition] of Object.entries(step.on)) {
+    if (transition.kind !== "ask") continue;
+    for (const choice of transition.choices ?? []) {
+      for (const [name, template] of Object.entries(choice.outputs ?? {})) {
+        for (const ref of templateRefs(template)) {
+          const input = /^inputs\.([A-Za-z_][\w-]*)$/.exec(ref)?.[1];
+          const output = /^report\.outputs\.([A-Za-z_][\w-]*)$/.exec(ref)?.[1];
+          const known =
+            ASK_OUTPUT_REFS.test(ref) || (input !== undefined && input in declared) || (output !== undefined && output in step.outputs);
+          if (!known) {
+            err(
+              `${where}: on.${outcome}.choices.${choice.id}.outputs.${name} uses "{{ ${ref} }}"; it may use gate.comment, gate.choice, report.summary, report.outputs.<output of this step> and inputs.<declared input>`,
+            );
+          }
+        }
+      }
+    }
   }
 }
 

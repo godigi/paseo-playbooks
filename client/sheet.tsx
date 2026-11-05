@@ -82,14 +82,17 @@ function choiceColors(theme: Theme, color: NonNullable<GateChoice["color"]>): { 
 /** Where a choice leads, for its button: "→ End", "→ End Release" (inside a block), "→ Write", "→ Fail run". */
 function destinationLabel(run: Run, gate: Gate, choiceId: string): string {
   const step = run.playbook.steps.find((candidate) => candidate.id === gate.stepId);
+  let outcome = choiceId;
   if (gate.kind === "ask") {
     const ask = askTransitionOf(gate, step);
-    const target = (ask ? askChoices(ask).find((choice) => choice.id === choiceId)?.target : undefined) ?? gate.gotoTarget ?? "";
-    return `→ ${stepTitleOf(run.playbook, target)}`;
+    const choice = ask ? askChoices(ask).find((candidate) => candidate.id === choiceId) : undefined;
+    // A choice with `outcome` leads where that outcome does; the others go back to a step.
+    if (choice?.outcome === undefined) return `→ ${stepTitleOf(run.playbook, choice?.target ?? gate.gotoTarget ?? "")}`;
+    outcome = choice.outcome;
   }
   if (gate.kind === "loop_limit") return choiceId === "approved" ? `→ ${stepTitleOf(run.playbook, gate.gotoTarget ?? "")}` : "→ Fail run";
   if (!step) return "";
-  const destination = destinationOf(run.playbook, step, choiceId);
+  const destination = destinationOf(run.playbook, step, outcome);
   if (destination.kind === "end") return "→ End";
   if (destination.kind === "end_block") return `→ End ${run.playbook.blocks[destination.targets[0]!]?.title ?? destination.targets[0]}`;
   if (destination.kind === "fail") return "→ Fail run";

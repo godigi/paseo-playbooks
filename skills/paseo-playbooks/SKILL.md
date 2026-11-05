@@ -141,7 +141,7 @@ steps:
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
-| `on` | Per outcome: `complete`, `end`, `{ end: <playbook outcome> }`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; see Loops). |
+| `on` | Per outcome: `complete`, `end`, `{ end: <playbook outcome> }`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; a choice may `goto` a step or end the step with an `outcome` and `outputs`; see Loops). |
 | `retries` | Extra attempts after `failure`. |
 | `timeout` | `30m`, `2h`…, or a template of the step's inputs (`"{{ inputs.release_timeout }}"`), rendered when each attempt starts; an empty value falls back to the default timeout, a value that is not a duration fails the start (or the run's start, when it only depends on the run's inputs). Expiry counts as a failure. The agent is reminded shortly before. If its work turns out done, `nudge_step` it: its next report replaces the timeout failure. |
 | `silence` | Agent steps: after this long without agent activity (default `30m`, or `off`), the plugin asks the agent once to report or say what it is waiting for, and tells the manager. |
@@ -364,7 +364,7 @@ To let an agent step ask a human a question, give it an outcome that routes to `
 `complete_step` with that outcome opens a gate (the step shows as waiting); the human types
 the answer in the panel (required). The step then runs again, with the answer as feedback.
 `goto` (default: the step itself) may name an earlier step instead. The report needs no
-outputs. `ask` is not available on gate steps.
+outputs (those it gives are kept). `ask` is not available on gate steps.
 
 `choices` gives the ask gate several buttons, each going to its own step. Keys are the
 choice ids; each takes `goto` (default: the ask's `goto`, else the step itself),
@@ -383,6 +383,30 @@ on:
 
 The target gets `The human answered "<id>": <comment>` as feedback. Without `choices` the gate
 has the single `answered` button and the target gets the answer alone.
+
+A choice with `outcome` instead ends the asking step with that outcome, as if the step had
+reported it, without running it again: the outcome's `on` entry applies (`complete`, `end`,
+`fail` or `goto`, not another `ask`). `outputs` sets the step's outputs, merged over the ones
+of its last report (an `ask` report keeps the outputs it gives, none required). They are
+templates over `{{ gate.comment }}` (empty: `(none)`), `{{ gate.choice }}`,
+`{{ report.summary }}`, `{{ report.outputs.<output> }}` and `{{ inputs.<input> }}`. Once
+merged they are checked like a report: a missing output refuses the decision.
+
+```yaml
+outcomes: [success, unverified, fail]
+outputs: { report: {}, passed: { type: boolean }, accepted_unverified: {} }
+on:
+  fail: fail
+  unverified:
+    ask: "Some criteria could not be verified."
+    choices:
+      continue:                       # go on as a success, keeping the QA report
+        outcome: success
+        comment: optional
+        outputs: { passed: true, accepted_unverified: "{{ gate.comment }}" }
+      answered: {}                    # re-run QA with the evidence
+      stop: { outcome: fail, comment: optional }
+```
 
 ### Rules the validator enforces
 
