@@ -182,9 +182,21 @@ function queueNote(run: Run, queued: string[]): string {
   return `Queued: ${queued.join(", ")}, waiting for a free "${playbooks.join('", "')}" slot held by other runs. You are woken when they are ready; do not start them before.`;
 }
 
-/** Ready steps that can start now (a finished run's leftover ready steps are not listed). */
+/**
+ * Ready steps the manager starts (a finished run's leftover ready steps are not listed).
+ * Script steps are left out: the plugin runs them itself (see readyScripts).
+ */
 export function readySteps(run: Run): string[] {
-  return run.playbook.steps.filter((step) => run.steps[step.id]!.status === "ready" && isStepLive(run, step.id)).map((step) => step.id);
+  return run.playbook.steps
+    .filter((step) => step.kind !== "script" && run.steps[step.id]!.status === "ready" && isStepLive(run, step.id))
+    .map((step) => step.id);
+}
+
+/** Ready script steps, which the plugin starts on its own. */
+export function readyScripts(run: Run): string[] {
+  return run.playbook.steps
+    .filter((step) => step.kind === "script" && run.steps[step.id]!.status === "ready" && isStepLive(run, step.id))
+    .map((step) => step.id);
 }
 
 function updateStatus(run: Run): void {
@@ -238,7 +250,7 @@ export function startAttempt(
   assertLive(run, stepId);
   const step = stepDef(run, stepId);
   const state = runStep(run, stepId);
-  if (step.kind !== "agent") throw new EngineError(`step "${stepId}" is a gate; call request_gate`);
+  if (step.kind === "gate") throw new EngineError(`step "${stepId}" is a gate; call request_gate`);
   if (isPaused(run)) {
     throw new EngineError(`run ${run.id} is paused by a human: no step starts until it is resumed. End your turn; you are woken on resume.`);
   }
@@ -260,6 +272,8 @@ export function startAttempt(
     turnEnd: null,
     readonlySnapshot: input.readonlySnapshot,
     reminded: false,
+    checks: 0,
+    nextCheckAt: null,
   };
   const context = {
     inputs: Object.fromEntries(Object.entries(values).map(([name, entry]) => [name, entry.value])),
@@ -668,7 +682,7 @@ export function completeStep(
   assertLive(run, stepId);
   const step = stepDef(run, stepId);
   const state = runStep(run, stepId);
-  if (step.kind !== "agent") throw new EngineError(`step "${stepId}" is a gate; its outcome comes from a gate decision`);
+  if (step.kind === "gate") throw new EngineError(`step "${stepId}" is a gate; its outcome comes from a gate decision`);
   if (state.status !== "reported" && state.status !== "running") {
     throw new EngineError(`step "${stepId}" is ${state.status}; only a running or reported step can be completed`);
   }

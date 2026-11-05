@@ -23,16 +23,18 @@ Everything lives in the repository, under `.paseo/plugins/playbooks/` or the sho
 │   └── main.yaml              # optional: repo-wide agent defaults
 ├── pr.yaml                    # a playbook; its id is the file name ("pr")
 ├── release.yaml
-└── roles/
-    └── reviewer/
-        ├── role.yaml          # title, readonly, agent
-        └── instructions.md    # the role's system prompt (required, non-empty)
+├── roles/
+│   └── reviewer/
+│       ├── role.yaml          # title, readonly, agent
+│       └── instructions.md    # the role's system prompt (required, non-empty)
+└── scripts/
+    └── wait-pr-merged.sh      # optional: executables for script steps
 ```
 
 - Every top-level `*.yaml` or `*.yml` file is a playbook. Shared settings live in folders, so no file
   name is reserved.
 - Each of the two folders is self-contained: a playbook uses the `roles/` and
-  `defaults/main.yaml` of its own folder. The same playbook id in both folders is an error.
+  `defaults/main.yaml` (and `scripts/`) of its own folder. The same playbook id in both folders is an error.
 - Ids (playbooks, roles, steps, inputs, outputs) use lowercase letters, digits, `-` and `_`,
   and start with a letter.
 - A playbook refers to a role by its directory name. Roles are shared by playbooks.
@@ -130,7 +132,7 @@ steps:
 | --- | --- |
 | `id` | Unique; `end`, `fail` and `outputs` are reserved. |
 | `needs` | Steps that must complete first. No `needs` = starts with the run. Steps ready together run in parallel. File order does not matter. |
-| `role` / `gate` / `playbook` | Exactly one: an agent step, a human gate with its message, or a sub-playbook (see below). |
+| `role` / `gate` / `playbook` / `script` | Exactly one: an agent step, a human gate with its message, a sub-playbook, or a script the plugin runs itself (see below). |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
@@ -138,6 +140,7 @@ steps:
 | `on` | Per outcome: `complete`, `end`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; see Loops). |
 | `retries` | Extra attempts after `failure`. |
 | `timeout` | `30m`, `2h`… Expiry counts as a failure. |
+| `poll` | Script steps only: rerun the script this often (`30s`, `1m`) while it exits with 75. |
 | `agent` | Step-level agent settings. |
 | `choices` | Gates only: the buttons, in order. Each key is an outcome, with `label`, `comment: none \| optional \| required` and `color: primary \| neutral \| success \| warning \| danger` (theme colours; default primary for the first, neutral for the others). Without `choices`, the default Reject is `danger`. |
 
@@ -162,6 +165,52 @@ One rule for agent steps and gates:
 `end` ends the playbook it is written in: the run at top level, the block when the
 playbook is nested as a sub-playbook, the task inside an after-task. `fail` always fails
 the whole run (inside an after-task, the task only).
+
+### Script steps
+
+A step with `script: <file>` runs an executable from the folder's `scripts/`, with no
+agent and no manager: the plugin starts it as soon as it is ready and completes it from the
+result. Use it for deterministic work, above all **waiting** (a PR merged, a deploy
+finished, a lane clear), so that no agent spends turns polling:
+
+```yaml
+steps:
+  - id: wait_dev_lane
+    script: wait-dev-lane-clear.sh
+    poll: 1m                    # check every minute while it says "not yet"
+    timeout: 2h                 # then fail (retries apply)
+    inputs: [services]
+    outputs: { lane_head: {} }
+  - id: dev_release
+    needs: [wait_dev_lane]
+    role: env_releaser
+```
+
+The script contract:
+
+- **The file:** a plain name in `scripts/` (no path), executable (`chmod +x`). Its
+  shebang picks the language: `#!/usr/bin/env bash`, `#!/usr/bin/env python3`… It runs in the
+  run's worktree, with the daemon's environment.
+- **Inputs** come as environment variables, never in a command line:
+  `PLAYBOOK_INPUT_<NAME>` (upper case; `services` → `PLAYBOOK_INPUT_SERVICES`), plus
+  `PLAYBOOK_RUN_ID`, `PLAYBOOK_STEP_ID`, `PLAYBOOK_ATTEMPT`, `PLAYBOOK_CHECK` (1, 2, … within
+  the attempt), `PLAYBOOK_WORKSPACE` and, after a `goto`, `PLAYBOOK_FEEDBACK`.
+- **Exit code:** `0` = done; `75` = not yet, run me again after `poll` (without `poll`, 75 is a
+  failure); anything else = `failure`.
+- **Result:** on success, the last line of stdout may be a JSON object
+  `{"outcome": "...", "summary": "...", "outputs": {...}}`, each key optional. `outcome`
+  defaults to the first outcome, so a script can branch (`outcomes: [merged, closed]` with
+  `on.closed`). Outputs are checked against `outputs` like an agent's report; a wrong one fails
+  the attempt. On failure, `summary` (or the last stderr line) says why.
+- **Checks must be idempotent and short:** each check looks once and exits. The plugin does
+  the waiting between checks, and it reruns the current check after a daemon restart.
+  A script must not edit the checkout (the concurrency rule does not check scripts).
+- `prompt` and `agent` do not apply; `inputs`, `outputs`, `outcomes`, `on`, `retries`,
+  `timeout` and `needs` work as for agent steps. A failure with retries left runs again by
+  itself; the manager is woken only with the final result. Without `timeout` (here or in
+  `defaults/main.yaml`) a polling script waits forever.
+- Pausing the run lets a running script keep checking; its result waits for the resume.
+  Canceling the run, or a `goto` that resets the step, kills it.
 
 ### Sub-playbooks
 
@@ -304,6 +353,7 @@ has the single `answered` button and the target gets the answer alone.
 - prompts use only `inputs`, `run.id` and `attempt` (after-tasks also `run.status` and
   `run.failure`); inputs only reference ancestors (after-tasks also main steps and `run.*`)
 - after-tasks have no `needs`, and only after-tasks have `trigger`
+- a `script` names an existing, executable file of `scripts/`; only script steps have `poll`
 - no `next` key: chaining was removed; to run a playbook after another, write a parent
   playbook that includes both as sub-playbook steps
 

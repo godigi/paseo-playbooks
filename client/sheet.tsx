@@ -8,6 +8,13 @@ import { askChoices, askTransitionOf, choicesOfGate, destinationOf, gateText, li
 import { isPaused, isStepLive, restartBlocker, type Gate, type GateChoice, type Playbook, type Run } from "../shared/types";
 import { stepLabel, type Theme } from "./theme";
 
+/** A poll interval as people say it: 30 s, 1 min, 2 h. */
+function formatInterval(ms: number): string {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000} h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000} min`;
+  return `${Math.round(ms / 1000)} s`;
+}
+
 export function Button(props: { theme: Theme; label: string; onPress(): void; kind?: "primary" | "danger" | "plain"; disabled?: boolean; accessibilityLabel?: string }) {
   const { theme, kind = "plain" } = props;
   const background = kind === "primary" ? theme.colors.accent : kind === "danger" ? theme.colors.statusDanger : theme.colors.surface2;
@@ -275,13 +282,14 @@ export function StepSheet(props: {
   const toast = useToast();
   const [message, setMessage] = useState("");
   const active = run !== null && isStepLive(run, stepId);
-  const canNudge = active && (state?.status === "running" || state?.status === "reported");
+  // A script step has no agent to talk to.
+  const canNudge = active && step.kind !== "script" && (state?.status === "running" || state?.status === "reported");
   const canRestart = run !== null && restartBlocker(run, stepId) === null;
   // Retry goes through the manager, which a paused run does not wake.
   const canRetry = active && !isPaused(run) && state?.status === "reported" && (latest?.report?.outcome === "failure" || latest?.report === null);
 
   return (
-    <Modal title={`${stepLabel(step.id)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>
+    <Modal title={`${stepLabel(step.id)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : step.kind === "script" ? " · Script" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>
       <Modal.Content>
         {state ? <Line theme={theme}>Status: {state.status}{latest ? ` · attempt ${latest.n}` : ""}</Line> : null}
         {step.kind === "agent" ? (
@@ -291,6 +299,21 @@ export function StepSheet(props: {
               {step.timeoutMs ? ` · timeout ${Math.round(step.timeoutMs / 60000)} min` : ""}
               {step.retries ? ` · retries ${step.retries}` : ""}
             </Line>
+          </Section>
+        ) : null}
+        {step.kind === "script" ? (
+          <Section theme={theme} title="Script">
+            <Line theme={theme} muted>
+              {step.script}
+              {step.pollMs ? ` · every ${formatInterval(step.pollMs)} until done` : " · runs once"}
+              {step.timeoutMs ? ` · timeout ${Math.round(step.timeoutMs / 60000)} min` : ""}
+              {step.retries ? ` · retries ${step.retries}` : ""}
+            </Line>
+            {latest ? (
+              <Line theme={theme} muted>
+                {latest.checks} check(s){latest.nextCheckAt && state?.status === "running" ? ` · next at ${new Date(latest.nextCheckAt).toLocaleTimeString()}` : ""}
+              </Line>
+            ) : null}
           </Section>
         ) : null}
         {Object.keys(step.inputs).length > 0 ? (
@@ -321,7 +344,14 @@ export function StepSheet(props: {
               </Line>
             ))}
           </Section>
-        ) : latest?.lastMessage ? (
+        ) : null}
+        {step.kind === "script" && latest?.lastMessage ? (
+          <Section theme={theme} title={latest.report ? "Output" : "Output of the last check"}>
+            <Line theme={theme} muted>
+              {latest.lastMessage}
+            </Line>
+          </Section>
+        ) : !latest?.report && latest?.lastMessage ? (
           <Section theme={theme} title="Ended without a report · last message">
             <Line theme={theme}>{latest.lastMessage}</Line>
           </Section>
@@ -344,18 +374,24 @@ export function StepSheet(props: {
         ))}
         {attempts.length > 0 ? (
           <Section theme={theme} title="Attempts">
-            {attempts.map((attempt) => (
-              <Pressable
-                key={attempt.n}
-                accessibilityRole="button"
-                accessibilityLabel={`Open the conversation of attempt ${attempt.n}`}
-                onPress={() => props.onOpenAgent(attempt.agentId)}
-              >
-                <Text style={{ color: theme.colors.accent, fontSize: 13 }}>
-                  #{attempt.n} · {attempt.outcome ?? attempt.report?.outcome ?? attempt.turnEnd ?? "running"} · open conversation ↗
-                </Text>
-              </Pressable>
-            ))}
+            {step.kind === "script"
+              ? attempts.map((attempt) => (
+                  <Line key={attempt.n} theme={theme} muted>
+                    #{attempt.n} · {attempt.outcome ?? attempt.report?.outcome ?? attempt.turnEnd ?? "running"} · {attempt.checks} check(s)
+                  </Line>
+                ))
+              : attempts.map((attempt) => (
+                  <Pressable
+                    key={attempt.n}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Open the conversation of attempt ${attempt.n}`}
+                    onPress={() => props.onOpenAgent(attempt.agentId)}
+                  >
+                    <Text style={{ color: theme.colors.accent, fontSize: 13 }}>
+                      #{attempt.n} · {attempt.outcome ?? attempt.report?.outcome ?? attempt.turnEnd ?? "running"} · open conversation ↗
+                    </Text>
+                  </Pressable>
+                ))}
           </Section>
         ) : null}
         {canNudge ? (

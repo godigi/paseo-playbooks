@@ -1,10 +1,12 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import path from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 
 /** The daemon API handed to plugin handlers (typed via the SDK, so the build needs no @getpaseo/client). */
 type PaseoApi = PluginHandlerContext["paseo"];
 import type { Playbook, Run, Step, VarValue } from "../shared/types";
-import { isActive, isPaused, isStepLive, isTerminal, restartBlocker } from "../shared/types";
+import { SCRIPT_NOT_YET, isActive, isPaused, isScriptAttempt, isStepLive, isTerminal, restartBlocker, scriptAttemptId } from "../shared/types";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
 import { checkoutSnapshot, currentRef, snapshotDiff } from "./git";
@@ -64,6 +66,64 @@ interface Reservation {
   inputs: Record<string, VarValue>;
 }
 
+/** Kept of a script's output: the end of stdout and stderr, shown in the panel and to the manager. */
+const SCRIPT_OUTPUT_MAX = 4000;
+
+/** What a finished script check says, from its exit code and the JSON object on its last stdout line. */
+export function scriptResult(
+  step: Step,
+  exit: { code: number | null; signal: string | null },
+  stdout: string,
+  stderr: string,
+): { outcome: string; summary: string; outputs: Record<string, unknown> } | "not_yet" {
+  if (exit.code === SCRIPT_NOT_YET && step.pollMs) return "not_yet";
+  const lastLine = stdout.trimEnd().split("\n").at(-1)?.trim() ?? "";
+  let result: { outcome?: unknown; summary?: unknown; outputs?: unknown } = {};
+  if (lastLine.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(lastLine);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) result = parsed as typeof result;
+    } catch {
+      // Not a result line: plain output.
+    }
+  }
+  const summary = typeof result.summary === "string" ? result.summary : null;
+  const outputs = result.outputs && typeof result.outputs === "object" && !Array.isArray(result.outputs) ? (result.outputs as Record<string, unknown>) : {};
+  if (exit.code === 0) {
+    const outcome = typeof result.outcome === "string" ? result.outcome : step.outcomes[0]!;
+    return { outcome, summary: summary ?? `${step.script} exited 0`, outputs };
+  }
+  const why =
+    exit.code === SCRIPT_NOT_YET
+      ? `exit ${SCRIPT_NOT_YET} ("not yet"), but the step has no \`poll\``
+      : exit.code !== null
+        ? `exit ${exit.code}`
+        : `killed by ${exit.signal ?? "a signal"}`;
+  const tail = stderr.trimEnd().split("\n").at(-1)?.trim();
+  return { outcome: "failure", summary: summary ?? `${step.script}: ${why}${tail ? `: ${tail}` : ""}`, outputs: {} };
+}
+
+/** Environment of a script check: the step's inputs as PLAYBOOK_INPUT_<NAME>, never pasted into a command line. */
+function scriptEnv(run: Run, stepId: string, attempt: Run["steps"][string]["attempts"][number], feedback: string | null): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PLAYBOOK_RUN_ID: run.id,
+    PLAYBOOK_STEP_ID: stepId,
+    PLAYBOOK_ATTEMPT: String(attempt.n),
+    PLAYBOOK_CHECK: String(attempt.checks + 1),
+    PLAYBOOK_WORKSPACE: run.workspaceDir,
+  };
+  if (feedback) env.PLAYBOOK_FEEDBACK = feedback;
+  for (const [name, input] of Object.entries(attempt.inputs)) {
+    env[`PLAYBOOK_INPUT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] = input.value === "(none)" ? "" : input.value;
+  }
+  return env;
+}
+
+function tailOf(text: string): string {
+  return text.length > SCRIPT_OUTPUT_MAX ? text.slice(-SCRIPT_OUTPUT_MAX) : text;
+}
+
 /** Last assistant message from a timeline page, for steps that end without reporting. */
 function lastAssistantText(entries: ReadonlyArray<{ item: { type: string; text?: string } }>): string | null {
   for (let index = entries.length - 1; index >= 0; index--) {
@@ -82,6 +142,10 @@ export class Runtime {
   private readonly reservations = new Map<string, Reservation>();
   /** Runs started from the panel for a busy agent: agent id → run id, delivered when its turn ends. */
   private readonly pendingHandoffs = new Map<string, string>();
+  /** Script steps in flight, by attempt id: the running check, or the timer of the next one. */
+  private readonly scripts = new Map<string, { child: ChildProcess | null; next: ReturnType<typeof setTimeout> | null }>();
+  /** Feedback a script attempt started with (after a goto), passed to each of its checks. */
+  private readonly scriptFeedback = new Map<string, string>();
 
   constructor(private readonly store: RunStore) {}
 
@@ -102,6 +166,7 @@ export class Runtime {
   dispose(): void {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    for (const id of [...this.scripts.keys()]) this.stopScript(id);
   }
 
   /** After a (re)start: find step agents that stopped, re-arm timeouts, flush wake-ups. */
@@ -117,6 +182,12 @@ export class Runtime {
       for (const [stepId, state] of Object.entries(run.steps)) {
         if (state.status !== "running") continue;
         const attempt = state.attempts.at(-1)!;
+        if (isScriptAttempt(attempt.agentId)) {
+          // Checks are idempotent: the one cut by the restart runs again.
+          this.armTimeout(run, stepId);
+          this.runCheck(run.id, stepId, attempt.agentId);
+          continue;
+        }
         const agent = await this.api().agents.ref(attempt.agentId).refresh().catch(() => null);
         if (agent?.agent.status === "running") {
           this.armTimeout(run, stepId);
@@ -124,6 +195,7 @@ export class Runtime {
         }
         await this.onStepTurnEnded(run.id, attempt.agentId, "lost");
       }
+      await this.settleScripts(run.id);
       await this.deliver(run.id);
     }
     await this.admitQueued();
@@ -211,6 +283,10 @@ export class Runtime {
   private async applyEffects(runId: string, effects: engine.Effects): Promise<void> {
     for (const agentId of effects.cancelAgents) {
       this.clearTimeout(agentId);
+      if (isScriptAttempt(agentId)) {
+        this.stopScript(agentId);
+        continue;
+      }
       await this.api()
         .agents.ref(agentId)
         .reload()
@@ -279,14 +355,182 @@ export class Runtime {
     for (const { runId, prefix } of planAdmissions(this.store.list())) {
       const admitted = await this.store.mutate(runId, (run) => engine.admitBlock(run, prefix, nowIso()));
       if (admitted.length === 0 || runId === callerRunId) continue;
-      await this.enqueue(runId, [`A concurrency slot is free: ${admitted.join(", ")} ${admitted.length === 1 ? "is" : "are"} now ready. Start ${admitted.length === 1 ? "it" : "them"} with start_step.`]);
+      const run = this.store.get(runId)!;
+      const toStart = admitted.filter((id) => engine.stepDef(run, id).kind !== "script");
+      if (toStart.length === 0) continue;
+      await this.enqueue(runId, [`A concurrency slot is free: ${toStart.join(", ")} ${toStart.length === 1 ? "is" : "are"} now ready. Start ${toStart.length === 1 ? "it" : "them"} with start_step.`]);
       await this.deliver(runId);
     }
+    // Every place that may make steps ready ends here, so ready script steps start here too.
+    await this.startScripts();
+  }
+
+  // ---------------------------------------------------------------- script steps
+
+  /** Starts the ready script steps of every active, unpaused run: the plugin runs them, not the manager. */
+  private async startScripts(): Promise<void> {
+    for (const run of this.store.list()) {
+      if (!isActive(run) || isPaused(run)) continue;
+      for (const stepId of engine.readyScripts(run)) {
+        const started = await this.store.mutate(run.id, (current) => {
+          if (current.steps[stepId]!.status !== "ready" || isPaused(current)) return null;
+          const feedback = current.steps[stepId]!.feedback;
+          const id = scriptAttemptId(current.id, stepId, current.steps[stepId]!.attempts.length + 1);
+          engine.startAttempt(current, stepId, { agentId: id, brief: "", now: nowIso(), readonlySnapshot: null });
+          return { id, feedback };
+        });
+        if (!started) continue;
+        if (started.feedback) this.scriptFeedback.set(started.id, started.feedback);
+        this.armTimeout(this.store.get(run.id)!, stepId);
+        this.runCheck(run.id, stepId, started.id);
+      }
+    }
+  }
+
+  /** Runs the script once in the run's worktree. "Not yet" schedules the next check; anything else ends the attempt. */
+  private runCheck(runId: string, stepId: string, attemptId: string): void {
+    const run = this.store.get(runId);
+    const attempt = run?.steps[stepId]?.attempts.at(-1);
+    if (!run || attempt?.agentId !== attemptId || run.steps[stepId]!.status !== "running") return;
+    const step = engine.stepDef(run, stepId);
+    const slot = { child: null as ChildProcess | null, next: null as ReturnType<typeof setTimeout> | null };
+    this.scripts.set(attemptId, slot);
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const done = (exit: { code: number | null; signal: string | null }, spawnError?: string) => {
+      if (settled) return;
+      settled = true;
+      slot.child = null;
+      // Stopped (canceled, reset by a goto, timed out): whoever stopped it owns the attempt now.
+      if (this.scripts.get(attemptId) !== slot) return;
+      const result = spawnError
+        ? { outcome: "failure", summary: `${step.script}: ${spawnError}`, outputs: {} }
+        : scriptResult(step, exit, stdout, stderr);
+      void this.onCheckEnded(runId, stepId, attemptId, result, tailOf([stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join("\n")));
+    };
+    try {
+      const child = spawn(path.join(run.workspaceDir, step.script!), [], {
+        cwd: run.workspaceDir,
+        env: scriptEnv(run, stepId, attempt, this.scriptFeedback.get(attemptId) ?? null),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      slot.child = child;
+      child.stdout!.on("data", (chunk: Buffer) => (stdout = tailOf(stdout + chunk.toString())));
+      child.stderr!.on("data", (chunk: Buffer) => (stderr = tailOf(stderr + chunk.toString())));
+      child.on("error", (error) => done({ code: null, signal: null }, errorText(error)));
+      child.on("close", (code, signal) => done({ code, signal }));
+    } catch (error) {
+      done({ code: null, signal: null }, errorText(error));
+    }
+  }
+
+  private async onCheckEnded(
+    runId: string,
+    stepId: string,
+    attemptId: string,
+    result: ReturnType<typeof scriptResult>,
+    output: string,
+  ): Promise<void> {
+    const run = this.store.get(runId);
+    if (!run) return this.stopScript(attemptId);
+    const step = engine.stepDef(run, stepId);
+    const nextAt = result === "not_yet" ? new Date(Date.now() + step.pollMs!).toISOString() : null;
+    const current = await this.store.mutate(runId, (run) => {
+      const attempt = run.steps[stepId]?.attempts.at(-1);
+      if (attempt?.agentId !== attemptId || run.steps[stepId]!.status !== "running") return false;
+      attempt.checks += 1;
+      attempt.nextCheckAt = nextAt;
+      attempt.lastMessage = output || null;
+      return true;
+    });
+    if (!current) return this.stopScript(attemptId);
+    if (result === "not_yet") {
+      const slot = this.scripts.get(attemptId);
+      if (!slot) return;
+      slot.next = setTimeout(() => this.runCheck(runId, stepId, attemptId), step.pollMs!);
+      (slot.next as unknown as { unref?: () => void }).unref?.();
+      return;
+    }
+    await this.finishScript(runId, stepId, attemptId, result, "completed");
+  }
+
+  /** Records a script attempt's result and ends it; the step completes now, or on resume if the run is paused. */
+  private async finishScript(
+    runId: string,
+    stepId: string,
+    attemptId: string,
+    result: { outcome: string; summary: string; outputs: Record<string, unknown> },
+    turnEnd: "completed" | "timeout" | "lost",
+  ): Promise<void> {
+    this.stopScript(attemptId);
+    this.clearTimeout(attemptId);
+    await this.store.mutate(runId, (run) => {
+      const attempt = run.steps[stepId]?.attempts.at(-1);
+      if (attempt?.agentId !== attemptId || run.steps[stepId]!.status !== "running") return;
+      attempt.nextCheckAt = null;
+      try {
+        engine.recordReport(run, attemptId, result, nowIso());
+      } catch (error) {
+        // A bad outcome or outputs line is the script's failure, not a reason to hang.
+        engine.recordReport(run, attemptId, { outcome: "failure", summary: `${result.summary} (result refused: ${errorText(error)})`, outputs: {} }, nowIso());
+      }
+      engine.endTurn(run, attemptId, { turnEnd, lastMessage: attempt.lastMessage, now: nowIso() });
+    });
+    await this.settleScripts(runId);
+  }
+
+  /** Completes script steps that reported (with the reported outcome) and wakes the manager with what follows. Waits while paused. */
+  private async settleScripts(runId: string): Promise<void> {
+    const run = this.store.get(runId);
+    if (!run || isPaused(run)) return;
+    for (const step of run.playbook.steps) {
+      const state = this.store.get(runId)!.steps[step.id]!;
+      if (step.kind !== "script" || state.status !== "reported" || !isStepLive(this.store.get(runId)!, step.id)) continue;
+      const attempt = state.attempts.at(-1)!;
+      const report = attempt.report ?? { outcome: "failure", summary: `${step.script} ended without a result`, outputs: {} };
+      let effects: engine.Effects;
+      try {
+        effects = await this.store.mutate(runId, (current) =>
+          engine.completeStep(current, step.id, { outcome: report.outcome, summary: report.summary, outputs: report.outputs, now: nowIso() }),
+        );
+      } catch (error) {
+        // Left reported: the manager decides with complete_step.
+        await this.enqueue(runId, [`script step "${step.id}" attempt ${attempt.n} ended ${report.outcome} but could not be completed (${errorText(error)}). Call complete_step for it.`]);
+        continue;
+      }
+      await this.applyEffects(runId, effects);
+      await this.admitQueued();
+      const after = this.store.get(runId)!;
+      // A failure with retries left: the script already runs again, nothing for the manager yet.
+      const again = after.steps[step.id]!;
+      if ((again.status === "running" || again.status === "ready") && again.attempts.length > state.attempts.length) continue;
+      const ready = engine.readySteps(after);
+      await this.enqueue(runId, [
+        `script step "${step.id}" attempt ${attempt.n} ended ${report.outcome} after ${attempt.checks} check(s): ${report.summary}${Object.keys(report.outputs).length ? ` Outputs: ${JSON.stringify(report.outputs)}.` : ""}`,
+        "The plugin completed it; do not call complete_step for it.",
+        ...effects.notes,
+        isActive(after) && ready.length > 0 ? `Ready: ${ready.join(", ")}. Start them with start_step (or request_gate for a gate).` : "",
+        isTerminal(after.status) && !isActive(after) ? `The run is ${after.status}. Tell the human.` : "",
+      ].filter(Boolean));
+    }
+    await this.deliver(runId);
+  }
+
+  /** Kills a script's running check and drops its next one. */
+  private stopScript(attemptId: string): void {
+    const slot = this.scripts.get(attemptId);
+    this.scripts.delete(attemptId);
+    this.scriptFeedback.delete(attemptId);
+    if (!slot) return;
+    if (slot.next) clearTimeout(slot.next);
+    slot.child?.kill("SIGTERM");
   }
 
   async startStep(managerId: string, runId: string, stepId: string, brief: string): Promise<{ agentId: string; attempt: number }> {
     const run = this.ownedRun(managerId, runId);
     const step = engine.stepDef(run, stepId);
+    if (step.kind === "script") throw new UserError(`step "${stepId}" is a script step: the plugin runs it by itself and wakes you with its result`);
     if (step.kind !== "agent" || !step.role) throw new UserError(`step "${stepId}" is a gate; call request_gate`);
     if (run.steps[stepId]!.status !== "ready") {
       throw new UserError(`step "${stepId}" is ${run.steps[stepId]!.status}, not ready (ready now: ${engine.readySteps(run).join(", ") || "none"})`);
@@ -435,6 +679,8 @@ export class Runtime {
     const changed = await this.store.mutate(runId, (current) => engine.resumeRun(current, nowIso()));
     // Slots freed while paused went to other runs; this run may take one now.
     await this.admitQueued();
+    // Script steps that finished during the pause complete now; their wake-ups join the others.
+    await this.settleScripts(runId);
     if (changed) {
       const run = this.store.get(runId)!;
       const ready = engine.readySteps(run);
@@ -467,6 +713,7 @@ export class Runtime {
     const state = run.steps[stepId];
     const attempt = state?.attempts.at(-1);
     if (!state || !attempt) throw new UserError(`step "${stepId}" has no attempt to nudge`);
+    if (isScriptAttempt(attempt.agentId)) throw new UserError(`step "${stepId}" is a script step: there is no agent to nudge`);
     if (!isStepLive(run, stepId)) throw new UserError(`step "${stepId}" can no longer change: run ${run.id} is ${run.status}`);
     if (state.status === "reported") {
       // The agent works again: its next turn end reports again.
@@ -768,6 +1015,11 @@ export class Runtime {
     const run = this.store.get(runId);
     const attempt = run?.steps[stepId]?.attempts.at(-1);
     if (!run || attempt?.agentId !== agentId || run.steps[stepId]!.status !== "running") return;
+    if (isScriptAttempt(agentId)) {
+      const checks = attempt.checks;
+      await this.finishScript(runId, stepId, agentId, { outcome: "failure", summary: `timed out after ${Math.round(timeoutMs / 60000)} min (${checks} check(s))`, outputs: {} }, "timeout");
+      return;
+    }
     await this.store.mutate(runId, (current) => {
       const last = current.steps[stepId]!.attempts.at(-1)!;
       last.report ??= { outcome: "failure", summary: `timed out after ${Math.round(timeoutMs / 60000)} min`, outputs: {} };
