@@ -95,6 +95,8 @@ const RawStepSchema = z.object({
     timeout: z.string().optional(),
     /** Agent steps: remind the agent after this long without activity (`30m`), or `off`. */
     silence: z.string().optional(),
+    /** Agent steps: archive the step's agents once it completes, and each attempt's once the next starts. Default true. */
+    archive_agents: z.boolean().optional(),
     agent: AgentSettingsSchema.optional(),
     on: z.record(z.string(), RawTransitionSchema).optional(),
     /** Gates only: the buttons, in order. Keys are the outcomes; the first one continues by default. */
@@ -150,6 +152,7 @@ const RawDefaultsSchema = z.object({
     manager: AgentSettingsSchema.optional(),
     timeout: z.string().optional(),
     silence: z.string().optional(),
+    archive_agents: z.boolean().optional(),
   });
 type RawDefaults = z.infer<typeof RawDefaultsSchema>;
 
@@ -447,7 +450,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     }
     if (!isScript && rawStep.poll !== undefined) err(`${where}: \`poll\` only applies to a script step`);
     if (isBlock) {
-      for (const field of ["prompt", "outputs", "outcomes", "timeout", "silence", "agent", "choices"] as const) {
+      for (const field of ["prompt", "outputs", "outcomes", "timeout", "silence", "archive_agents", "agent", "choices"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a playbook step (the sub-playbook defines it)`);
       }
       if (rawStep.short_title !== undefined) err(`${where}: \`short_title\` does not apply to a playbook step (its steps are the columns)`);
@@ -500,7 +503,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       continue;
     }
     if (isGate) {
-      for (const field of ["prompt", "inputs", "outputs", "outcomes", "timeout", "silence", "agent"] as const) {
+      for (const field of ["prompt", "inputs", "outputs", "outcomes", "timeout", "silence", "archive_agents", "agent"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a gate`);
       }
     }
@@ -508,7 +511,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     let script: string | undefined;
     let pollMs: number | undefined;
     if (isScript) {
-      for (const field of ["prompt", "silence", "agent"] as const) {
+      for (const field of ["prompt", "silence", "archive_agents", "agent"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a script step`);
       }
       const checked = await checkScript(root, rawStep.script!);
@@ -618,6 +621,8 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (timeoutMs !== undefined && !isGate) step.timeoutMs = timeoutMs;
     if (timeoutTemplate !== undefined && !isGate) step.timeout = timeoutTemplate;
     if (silenceMs !== undefined && !isGate && !isScript) step.silenceMs = silenceMs;
+    const archiveAgents = rawStep.archive_agents ?? defaults.archive_agents;
+    if (archiveAgents !== undefined && !isGate && !isScript) step.archiveAgents = archiveAgents;
     steps.push(step);
   }
 

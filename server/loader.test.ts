@@ -290,6 +290,19 @@ steps:
     expect(errors).toMatch(/step "ok": `silence` does not apply to a gate/);
   });
 
+  it("reads archive_agents on steps and in defaults; refuses it where there is no agent", async () => {
+    const steps = "steps:\n  - id: a\n    role: investigator\n    prompt: go\n  - id: b\n    role: investigator\n    prompt: go\n    archive_agents: true\n";
+    const dir = await workspace({ "defaults/main.yaml": "archive_agents: false\n", "pr.yaml": steps });
+    const playbook = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "pr")!.playbook!;
+    expect(playbook.steps.map((step) => step.archiveAgents)).toEqual([false, true]);
+
+    const plain = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: investigator\n    prompt: go\n" });
+    expect((await loadPlaybooks(plain)).entries[0]!.playbook!.steps[0]!.archiveAgents).toBeUndefined();
+
+    const bad = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: investigator\n    prompt: go\n  - id: ok\n    gate: Go?\n    archive_agents: false\n    needs: [a]\n" });
+    expect((await loadPlaybooks(bad)).entries.flatMap((entry) => entry.errors).join("\n")).toMatch(/step "ok": `archive_agents` does not apply to a gate/);
+  });
+
   it("refuses short_title on a playbook step", async () => {
     const dir = await workspace({
       "outer.yaml": "steps:\n  - { id: pr, playbook: inner, short_title: PR }\n",

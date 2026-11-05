@@ -304,6 +304,8 @@ export class Runtime {
   private async applyEffects(runId: string, effects: engine.Effects): Promise<void> {
     for (const agentId of effects.cancelAgents) {
       this.clearTimeout(agentId);
+      // Archiving stops it too.
+      if (effects.archiveAgents.includes(agentId)) continue;
       if (isScriptAttempt(agentId)) {
         this.stopScript(agentId);
         continue;
@@ -312,6 +314,19 @@ export class Runtime {
         .agents.ref(agentId)
         .reload()
         .catch((error) => console.error(`[playbooks] could not stop agent ${agentId}:`, errorText(error)));
+    }
+    for (const agentId of effects.archiveAgents) await this.archiveStepAgent(agentId);
+  }
+
+  /** Archives a step agent the run no longer needs, which ends its session; already archived is fine. */
+  private async archiveStepAgent(agentId: string): Promise<void> {
+    const agent = this.api().agents.ref(agentId);
+    try {
+      const current = await agent.refresh();
+      if (!current || current.agent.archivedAt) return;
+      await agent.archive();
+    } catch (error) {
+      console.error(`[playbooks] could not archive agent ${agentId}:`, errorText(error));
     }
   }
 
@@ -560,6 +575,7 @@ export class Runtime {
     const config = await this.stepAgentConfig(run, step);
     const snapshot = role.readonly ? await checkoutSnapshot(run.workspaceDir) : null;
     const attemptNo = run.steps[stepId]!.attempts.length + 1;
+    const previous = run.steps[stepId]!.attempts.at(-1);
     const agent = await this.api()
       .workspaces.ref(run.workspaceId)
       .agents.create({
@@ -573,6 +589,8 @@ export class Runtime {
     );
     await agent.send(started.prompt);
     this.armTimeout(this.store.get(run.id)!, stepId);
+    // The previous attempt's agent is done: the step's history keeps its outcome.
+    if (previous && step.archiveAgents !== false) await this.archiveStepAgent(previous.agentId);
     return { agentId: agent.id, attempt: started.attempt.n };
   }
 
