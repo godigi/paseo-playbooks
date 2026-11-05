@@ -219,7 +219,7 @@ after:
       run_id: "{{ run.id }}"   # run values are always mapped explicitly
   - id: notify
     role: reviewer
-    trigger: manual      # a Start button on the finished run (default: auto)
+    trigger: manual      # a Start button on the finished run, or start_after_task (default: auto)
     inputs:
       status: "{{ run.status }}"
     prompt: "Post a summary of run {{ run.id }} ({{ inputs.status }})."
@@ -228,7 +228,8 @@ after:
 - They belong to the same run and manager and show below End in the panel. They never
   change the run's status (fixed when the main graph ends).
 - `auto` tasks start when the run completes or fails, not when it is canceled. `manual`
-  tasks start from the panel on a finished run, in any end state, once.
+  tasks start on a finished run, in any end state, once: from the panel, or with
+  `start_after_task` (`runId`, `taskId`) when the human asks an agent in chat.
 - No `needs`. Inside an after-task, `end` completes the task (it ends the playbook it is written in), and `fail`, exhausted retries
   or a rejected gate fail the task only (in a sub-playbook, a nested block's `end` still
   ends only that block).

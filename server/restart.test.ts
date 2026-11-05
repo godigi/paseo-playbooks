@@ -43,6 +43,9 @@ steps:
 after:
   - id: retro
     role: reviewer
+  - id: notify
+    role: reviewer
+    trigger: manual
 `;
 
 async function playbook(): Promise<Playbook> {
@@ -309,5 +312,42 @@ describe("a manager archived with the agent that created it", () => {
     await runtime.onAgentArchived("m", "coordinator");
     expect(created).toEqual([]);
     expect(store.get("run_r")).toMatchObject({ status: "failed", failure: "manager lost (archived)" });
+  });
+});
+
+describe("Runtime.startAfterTask", () => {
+  async function stored() {
+    const dir = await mkdtemp(path.join(tmpdir(), "after-store-"));
+    temps.push(dir);
+    const store = new RunStore(dir);
+    await store.init();
+    const run = start(await playbook());
+    cancelRun(run, "stop", now());
+    await store.create(run);
+    const fake = fakePaseo({ m: { archivedAt: null } });
+    const runtime = new Runtime(store);
+    await runtime.attach(fake.paseo as never);
+    return { store, runtime, ...fake };
+  }
+
+  it("wakes the manager when another agent starts a manual after-task at the human's request", async () => {
+    const { store, runtime, sent } = await stored();
+    const run = await runtime.startAfterTask("run_r", "notify", "agent-x");
+    expect(run.after.notify?.status).toBe("running");
+    expect(readySteps(store.get("run_r")!)).toEqual(["notify"]);
+    expect(runListing(run).after).toEqual([
+      { id: "retro", title: "Retro", trigger: "auto", status: "canceled" },
+      { id: "notify", title: "Notify", trigger: "manual", status: "running" },
+    ]);
+    expect(sent.map((entry) => entry.agentId)).toEqual(["m"]);
+    expect(sent[0]!.text).toMatch(/Agent agent-x started the after-task "notify" at the human's request/);
+  });
+
+  it("does not wake the manager when it starts the task itself", async () => {
+    const { runtime, sent } = await stored();
+    await runtime.startAfterTask("run_r", "notify", "m");
+    expect(sent).toEqual([]);
+    await expect(runtime.startAfterTask("run_r", "notify", "m")).rejects.toThrow(/runs once/);
+    await expect(runtime.startAfterTask("run_r", "retro", "m")).rejects.toThrow(/trigger: auto/);
   });
 });

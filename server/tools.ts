@@ -279,6 +279,8 @@ export function runListing(run: Run) {
     createdAt: run.createdAt,
     runningSteps: Object.entries(run.steps).filter(([, state]) => state.status === "running").map(([id]) => id),
     archived: run.archivedAt !== null,
+    /** After-tasks and their status; start_after_task starts a pending manual one. */
+    after: run.playbook.after.map((task) => ({ id: task.id, title: task.title, trigger: task.trigger, status: run.after[task.id]?.status ?? "pending" })),
     /** Steps restart_run accepts (empty while the run is active). */
     restartableFrom: isTerminal(run.status) ? run.playbook.steps.filter((step) => restartBlocker(run, step.id) === null).map((step) => step.id) : [],
   };
@@ -334,6 +336,26 @@ export function runTools(runtime: Runtime): AgentToolDefinition[] {
             isTerminal(run.status) && run.status !== "canceled" ? `After-tasks of run ${run.id} canceled; the run stays ${run.status}.` : `Run ${run.id} canceled.`,
             isManager ? runSummary(run) : runListing(run),
           );
+        }),
+    }),
+    defineAgentTool({
+      name: "start_after_task",
+      description:
+        "Start a manual after-task (trigger: manual, e.g. a retro) of a finished run, the same as its Start button in the panel. Call it only when the human asks for it. It runs once. The run's manager is woken to run it; if you are that manager, start its ready steps with start_step. See get_run or list_runs for the run's after-tasks.",
+      input: z.object({
+        runId: IdArg,
+        taskId: z.string().describe("After-task id (see `after` in get_run or list_runs)"),
+      }),
+      execute: ({ runId, taskId }, { agent }) =>
+        guard(async () => {
+          const run = await runtime.startAfterTask(runId, taskId, agent.id);
+          if (run.managerAgentId === agent.id) {
+            return ok(
+              `After-task "${taskId}" of run ${run.id} started. Start its ready steps (${engine.readySteps(run).join(", ") || "none"}) with start_step (or request_gate for a gate).`,
+              runSummary(run),
+            );
+          }
+          return ok(`After-task "${taskId}" of run ${run.id} started. Its manager (agent ${run.managerAgentId}) was woken and runs it.`, runListing(run));
         }),
     }),
     defineAgentTool({

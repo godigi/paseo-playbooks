@@ -38,8 +38,9 @@ How to run a playbook:
 8. After-tasks: a playbook may declare tasks that run once the run has ended (completed or
    failed, not canceled), such as a retro. When they start, their steps become ready: run
    them like any step. They never change the run's status: inside an after-task, "end"
-   completes the task and a failure fails only the task. A human may also start a manual
-   after-task from the panel later; you are woken with its ready steps.
+   completes the task and a failure fails only the task. A manual after-task starts when a
+   human clicks Start in the panel (you are woken with its ready steps) or asks you in chat:
+   then call start_after_task and run its ready steps.
 9. Pause: a human may pause the run from the panel. While it is paused, start_step and
    nudge_step are refused and you are not woken; running steps finish their turn. End your
    turn. On resume you are woken with the ready steps and the reports that came in meanwhile.

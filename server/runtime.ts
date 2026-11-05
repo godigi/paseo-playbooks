@@ -476,8 +476,12 @@ export class Runtime {
     await this.api().agents.ref(attempt.agentId).send(message, { activeTurnBehavior: "steer" });
   }
 
-  /** A human starts a manual after-task from the panel: its manager is woken to run it. */
-  async startAfterTask(runId: string, taskId: string): Promise<Run> {
+  /**
+   * Starts a manual after-task, from the panel or, when the human asks in chat, the
+   * start_after_task tool (`by` is that agent). The manager is woken to run it, unless it
+   * is the caller: it reads the ready steps in the tool result.
+   */
+  async startAfterTask(runId: string, taskId: string, by: string | null = null): Promise<Run> {
     const run = this.store.get(runId);
     if (!run) throw new UserError(`unknown run "${runId}"`);
     const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
@@ -485,7 +489,9 @@ export class Runtime {
     const busy = this.store.list().find((other) => other.id !== run.id && other.workspaceId === run.workspaceId && isActive(other));
     if (busy) throw new UserError(`this workspace has another active run (${busy.id}); wait for it to end`);
     const effects = await this.store.mutate(runId, (current) => engine.startAfterTask(current, taskId, nowIso()));
-    await this.enqueue(runId, [`A human started the after-task "${taskId}" from the panel.`, ...effects.notes]);
+    if (by === run.managerAgentId) return this.store.get(runId)!;
+    const who = by ? `Agent ${by} started the after-task "${taskId}" at the human's request.` : `A human started the after-task "${taskId}" from the panel.`;
+    await this.enqueue(runId, [who, ...effects.notes]);
     await this.deliver(runId);
     return this.store.get(runId)!;
   }
