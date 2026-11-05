@@ -51,9 +51,10 @@ function loopEdges(steps: readonly Step[], run: Run | null): LoopEdge[] {
       }
       if (transition.kind !== "ask") return [];
       // One edge per ask target other than the step itself, labelled with the choices that take it.
+      // A choice with `outcome` goes on like that outcome: no loop edge.
       const byTarget = new Map<string, { ids: string[]; max: number | undefined }>();
       for (const choice of askChoices(transition)) {
-        if (choice.target === step.id) continue;
+        if (choice.target === step.id || choice.outcome !== undefined) continue;
         const edge = byTarget.get(choice.target) ?? { ids: [], max: choice.maxLoops };
         edge.ids.push(choice.id);
         byTarget.set(choice.target, edge);

@@ -35,8 +35,18 @@ export const GateChoiceSchema = z.object({
 });
 export type GateChoice = z.infer<typeof GateChoiceSchema>;
 
-/** A choice of an `ask` gate: a button that goes to its own `target` with the comment as feedback. */
-export const AskChoiceSchema = GateChoiceSchema.extend({ target: z.string(), maxLoops: z.number().int().positive().optional() });
+/**
+ * A choice of an `ask` gate: a button that goes to its own `target` with the comment as feedback,
+ * or, with `outcome`, ends the asking step with that outcome (its `on` entry) without running it
+ * again. `outputs` are templates over `gate.*`, `report.*` and `inputs.*`, merged over the
+ * step's last report; `target` is then unused.
+ */
+export const AskChoiceSchema = GateChoiceSchema.extend({
+  target: z.string(),
+  maxLoops: z.number().int().positive().optional(),
+  outcome: z.string().optional(),
+  outputs: z.record(z.string(), z.string()).optional(),
+});
 export type AskChoice = z.infer<typeof AskChoiceSchema>;
 
 export const TransitionSchema = z.discriminatedUnion("kind", [

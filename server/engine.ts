@@ -5,7 +5,7 @@
 import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
 import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
-import type { AfterTask, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
+import type { AfterTask, AskChoice, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
 import { isActive, isPaused, isScriptAttempt, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, parseDuration, renderTemplate, replaceRefs, resolveValue, templateRefs } from "../shared/vars";
 
@@ -367,6 +367,18 @@ export function validateOutputs(
   return errors.length > 0 ? { ok: false, errors } : { ok: true, outputs: result };
 }
 
+/** The declared outputs a report gives with the right type; missing or wrong ones are left out. */
+function partialOutputs(step: Step, outputs: Record<string, unknown>): Record<string, VarValue> {
+  const result: Record<string, VarValue> = {};
+  for (const [name, def] of Object.entries(step.outputs)) {
+    const raw = outputs[name];
+    if (raw === undefined || raw === null || raw === "") continue;
+    const coerced = coerceValue(def, raw);
+    if (coerced.ok) result[name] = coerced.value;
+  }
+  return result;
+}
+
 /** Stores a step agent's report on its running attempt. */
 export function recordReport(
   run: Run,
@@ -384,11 +396,15 @@ export function recordReport(
     throw new EngineError(`outcome "${report.outcome}" is not allowed; use one of: ${step.outcomes.join(", ")}`);
   }
   let outputs: Record<string, VarValue> = {};
+  const kind = defaultTransition(step, report.outcome).kind;
   // A failure, or a question for a human (`ask`), is not a result: no outputs expected.
-  if (report.outcome !== "failure" && defaultTransition(step, report.outcome).kind !== "ask") {
+  if (report.outcome !== "failure" && kind !== "ask") {
     const checked = validateOutputs(step, report.outputs);
     if (!checked.ok) throw new EngineError(`report refused: ${checked.errors.join("; ")}. Fix these and call report_step_result again.`);
     outputs = checked.outputs;
+  } else if (kind === "ask") {
+    // Kept as given, for an ask choice that ends the step with `outputs` reading `report.outputs`.
+    outputs = partialOutputs(step, report.outputs);
   }
   attempt.report = { outcome: report.outcome, summary: report.summary, outputs };
   log(run, now, "step_reported", stepId, `${report.outcome}: ${report.summary}`);
@@ -831,39 +847,70 @@ export function completeStep(
   attempt.outcome = input.outcome;
   state.summary = summary || null;
   log(run, input.now, "step_outcome", stepId, input.outcome);
+  followOutcome(run, step, input.outcome, summary, input.now, fx);
+  updateStatus(run);
+  return fx;
+}
 
+/** Takes the transition of an agent or script step's outcome (from completeStep, or an ask choice with `outcome`). */
+function followOutcome(run: Run, step: Step, outcome: string, summary: string, now: string, fx: Effects): void {
+  const state = run.steps[step.id]!;
+  const transition = defaultTransition(step, outcome);
   switch (transition.kind) {
     case "complete":
-      markCompleted(run, stepId, input.now, fx);
+      markCompleted(run, step.id, now, fx);
       break;
     case "end":
-      endFrom(run, stepId, transition.outcome, input.now, fx);
+      endFrom(run, step.id, transition.outcome, now, fx);
       break;
     case "fail":
       state.status = "failed";
-      endFlow(run, step, "failed", `step "${stepId}" ended with "${input.outcome}"`, input.now, fx);
+      endFlow(run, step, "failed", `step "${step.id}" ended with "${outcome}"`, now, fx);
       break;
     case "retry": {
       const counted = state.attempts.filter((a) => a.turnEnd !== "lost").length;
       if (counted <= step.retries) {
         state.status = "ready";
         state.feedback = summary ? `Previous attempt failed: ${summary}` : null;
-        fx.notes.push(`"${stepId}" failed; retry ${counted}/${step.retries} allowed. Ready: ${readySteps(run).join(", ")}.`);
+        fx.notes.push(`"${step.id}" failed; retry ${counted}/${step.retries} allowed. Ready: ${readySteps(run).join(", ")}.`);
       } else {
         state.status = "failed";
-        endFlow(run, step, "failed", `step "${stepId}" failed after ${counted} attempt(s)`, input.now, fx);
+        endFlow(run, step, "failed", `step "${step.id}" failed after ${counted} attempt(s)`, now, fx);
       }
       break;
     }
     case "goto":
-      gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, input.now, fx);
+      gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, now, fx);
       break;
     case "ask":
-      openAskGate(run, step, input.outcome, transition, summary, input.now, fx);
+      openAskGate(run, step, outcome, transition, summary, now, fx);
       break;
   }
-  updateStatus(run);
-  return fx;
+}
+
+/**
+ * The outputs an ask choice with `outcome` sets: its `outputs` templates (over the gate's
+ * comment and choice, the step's last report and its inputs) merged over the last report's.
+ * Checked like a report when the outcome completes, ends or loops; null otherwise.
+ */
+function askChoiceOutputs(run: Run, step: Step, choice: AskChoice, comment: string): Record<string, VarValue> | null {
+  const attempt = run.steps[step.id]!.attempts.at(-1);
+  const report = attempt?.report;
+  const context = {
+    gate: { comment, choice: choice.id },
+    report: { summary: report?.summary ?? run.steps[step.id]!.summary ?? "", outputs: report?.outputs ?? {} },
+    inputs: Object.fromEntries(Object.entries(attempt?.inputs ?? {}).map(([name, entry]) => [name, entry.value])),
+  };
+  const merged: Record<string, unknown> = { ...(report?.outputs ?? {}) };
+  for (const [name, template] of Object.entries(choice.outputs ?? {})) {
+    const value = resolveValue(template, context);
+    merged[name] = value === undefined || value === "" ? "(none)" : value;
+  }
+  const kind = defaultTransition(step, choice.outcome!).kind;
+  if (kind !== "complete" && kind !== "end" && kind !== "goto") return null;
+  const checked = validateOutputs(step, merged);
+  if (!checked.ok) throw new EngineError(`"${choice.label}" cannot complete "${step.id}": ${checked.errors.join("; ")}`);
+  return checked.outputs;
 }
 
 /** Opens the human gate of a ready gate step. */
@@ -924,18 +971,32 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   const choice = choices.find((candidate) => candidate.id === decision.decision);
   if (!choice) throw new EngineError(`"${decision.decision}" is not a choice of gate "${gate.stepId}" (${choices.map((c) => c.id).join(", ")})`);
   if (choice.comment === "required" && !decision.comment?.trim()) throw new EngineError(`"${choice.label}" needs a comment`);
+  const step = stepDef(run, gate.stepId);
+  const ask = gate.kind === "ask" ? askTransitionOf(gate, step) : null;
+  const picked = ask ? askChoices(ask).find((candidate) => candidate.id === choice.id) : undefined;
+  // Checked before the gate closes: outputs the step lacks refuse the decision.
+  const outputs = picked?.outcome !== undefined ? askChoiceOutputs(run, step, picked, decision.comment?.trim() ?? "") : null;
   gate.status = decision.decision;
   gate.comment = decision.comment;
   gate.decidedBy = decision.by;
   gate.decidedVia = decision.via;
   gate.decidedAt = decision.now;
   log(run, decision.now, "gate_decided", gate.stepId, `${gate.id}: ${decision.decision} via ${decision.via}`);
-  const step = stepDef(run, gate.stepId);
+  if (gate.kind === "ask" && picked?.outcome !== undefined) {
+    // The step ends with the choice's outcome, as if it had reported it: it does not run again.
+    const state = run.steps[gate.stepId]!;
+    if (outputs) state.outputs = outputs;
+    const attempt = state.attempts.at(-1);
+    if (attempt) attempt.outcome = picked.outcome;
+    log(run, decision.now, "step_outcome", gate.stepId, `${picked.outcome} (${gate.id}: ${choice.id})`);
+    fx.notes.push(`Gate ${gate.id}: the human chose "${choice.id}", so "${gate.stepId}" ends with "${picked.outcome}" without running again.`);
+    followOutcome(run, step, picked.outcome, state.summary ?? "", decision.now, fx);
+    updateStatus(run);
+    return { gate, alreadyDecided: false, effects: fx };
+  }
   if (gate.kind === "ask") {
     // Each choice goes to its own target. With declared choices the target also learns which
     // one the human picked; the single default "answered" passes the answer alone.
-    const ask = askTransitionOf(gate, step);
-    const picked = ask ? askChoices(ask).find((candidate) => candidate.id === choice.id) : undefined;
     const comment = decision.comment?.trim() ?? "";
     const feedback = ask?.choices?.length ? `The human answered "${choice.id}"${comment ? `: ${comment}` : "."}` : decision.comment ?? "";
     gotoOrLimit(run, step, picked?.target ?? gate.gotoTarget!, picked?.maxLoops, feedback, decision.now, fx);

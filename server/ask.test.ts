@@ -215,6 +215,97 @@ steps:
     expect(run.gates.at(-1)!).toMatchObject({ kind: "loop_limit", gotoTarget: "investigate" });
   });
 
+  it("can end the asking step with another outcome and outputs, without running it again", async () => {
+    const yaml = `
+inputs: { request: { required: true } }
+steps:
+  - id: qa
+    role: investigator
+    inputs: [request]
+    outcomes: [success, unverified, stop]
+    outputs: { report: {}, passed: { type: boolean }, accepted: {} }
+    on:
+      stop: fail
+      unverified:
+        ask: "Some criteria are unverified."
+        choices:
+          continue: { outcome: success, comment: optional, outputs: { passed: true, accepted: "{{ gate.choice }} for {{ inputs.request }}: {{ gate.comment }}" } }
+          answered: {}
+          stop: { outcome: stop, comment: none }
+  - id: next
+    role: implementer
+    needs: [qa]
+    inputs: [report, accepted]
+    outputs: { pr_url: {} }
+`;
+    const { playbook, errors } = await load({ "p.yaml": yaml }, "p");
+    expect(errors).toEqual([]);
+    const on = playbook!.steps[0]!.on.unverified!;
+    expect(on.kind === "ask" && on.choices![0]).toEqual({
+      id: "continue",
+      label: "Continue",
+      comment: "optional",
+      target: "qa",
+      outcome: "success",
+      outputs: { passed: "true", accepted: "{{ gate.choice }} for {{ inputs.request }}: {{ gate.comment }}" },
+    });
+    const start = () => {
+      const run = newRun({ id: "r", playbook: playbook!, workspaceId: "w", workspaceDir: "/tmp", projectId: "p", branch: null, managerAgentId: "m", inputs: { request: "x" }, now: now() });
+      startAttempt(run, "qa", { agentId: "q1", brief: "", now: now(), readonlySnapshot: null });
+      recordReport(run, "q1", { outcome: "unverified", summary: "2 criteria unverified", outputs: { report: "the report" } }, now());
+      endTurn(run, "q1", { turnEnd: "completed", lastMessage: null, now: now() });
+      completeStep(run, "qa", { outcome: "unverified", now: now() });
+      return run;
+    };
+
+    const run = start();
+    const gate = run.gates.at(-1)!;
+    const fx = decideGate(run, gate.id, { decision: "continue", comment: "fine for now", by: null, via: "panel", now: now() });
+    expect(fx.effects.notes.join(" ")).toMatch(/ends with "success" without running again/);
+    expect(gate.status).toBe("continue");
+    expect(run.steps.qa!.status).toBe("completed");
+    expect(run.steps.qa!.attempts).toHaveLength(1);
+    expect(run.steps.qa!.attempts[0]!.outcome).toBe("success");
+    expect(run.steps.qa!.outputs).toEqual({ report: "the report", passed: true, accepted: "continue for x: fine for now" });
+    expect(run.loops).toEqual({});
+    expect(readySteps(run)).toEqual(["next"]);
+
+    // Another outcome follows its own `on`.
+    const stopped = start();
+    decideGate(stopped, stopped.gates.at(-1)!.id, { decision: "stop", comment: null, by: null, via: "chat", now: now() });
+    expect(stopped.status).toBe("failed");
+    expect(stopped.steps.qa!.status).toBe("failed");
+
+    // Outputs the report and the choice do not give refuse the decision; the gate stays open.
+    const missing = start();
+    missing.steps.qa!.attempts[0]!.report!.outputs = {};
+    const pending = missing.gates.at(-1)!;
+    expect(() => decideGate(missing, pending.id, { decision: "continue", comment: "", by: null, via: "panel", now: now() })).toThrow(/missing output "report"/);
+    expect(pending.status).toBe("pending");
+    expect(missing.steps.qa!.status).toBe("waiting");
+  });
+
+  it("validates ask choices that end the step", async () => {
+    const pb = (choice: string, extra = "") => `
+steps:
+  - id: qa
+    role: investigator
+    outcomes: [success, unverified${extra}]
+    outputs: { report: {} }
+    on:
+      unverified: { ask: "q", choices: { go: ${choice} } }
+`;
+    const errorsOf = async (yaml: string) => (await load({ "p.yaml": yaml }, "p")).errors.join("\n");
+    expect(await errorsOf(pb("{ outcome: nope }"))).toMatch(/choices\.go: outcome "nope" is not an outcome of this step/);
+    expect(await errorsOf(pb("{ outcome: unverified }"))).toMatch(/outcome "unverified" asks again/);
+    expect(await errorsOf(pb("{ outcome: success, goto: qa }"))).toMatch(/`outcome` ends the step, so `goto` and `max_loops` do not apply/);
+    expect(await errorsOf(pb("{ outputs: { report: x } }"))).toMatch(/`outputs` needs an `outcome`/);
+    expect(await errorsOf(pb("{ outcome: success, outputs: { other: x } }"))).toMatch(/outputs\.other: not an output of this step \(report\)/);
+    expect(await errorsOf(pb('{ outcome: success, outputs: { report: "{{ steps.x.outputs.y }}" } }'))).toMatch(/outputs\.report uses "\{\{ steps\.x\.outputs\.y \}\}"/);
+    expect(await errorsOf(pb('{ outcome: success, outputs: { report: "{{ inputs.request }}" } }'))).toMatch(/uses "\{\{ inputs\.request \}\}"/);
+    expect(await errorsOf(pb('{ outcome: success, outputs: { report: "{{ report.outputs.report }} / {{ report.summary }} / {{ gate.comment }}" } }'))).toBe("");
+  });
+
   it("validates ask choices", async () => {
     const withChoices = (choices: string) => PB(`{ ask: "q", choices: ${choices} }`);
     expect((await load({ "p.yaml": withChoices("{}") }, "p")).errors.join("\n")).toMatch(/choices: declare at least one choice/);
