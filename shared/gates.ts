@@ -1,5 +1,5 @@
 import { innermostBlock } from "./slots";
-import type { Gate, GateChoice, Playbook, Step } from "./types";
+import type { AskChoice, Gate, GateChoice, Playbook, Step, Transition } from "./types";
 
 /** Choices of a gate step that declares none in its YAML. */
 export const DEFAULT_GATE_CHOICES: GateChoice[] = [
@@ -17,13 +17,33 @@ export function gateChoices(step: Step): GateChoice[] {
   return step.choices.length > 0 ? step.choices : DEFAULT_GATE_CHOICES;
 }
 
-/** The single choice of an `ask` gate: the answer, required, becomes the feedback of the step it goes back to. */
+/** The single choice of an `ask` gate without `choices`: the answer, required, becomes the feedback of the step it goes back to. */
 export const ASK_CHOICES: GateChoice[] = [{ id: "answered", label: "Send answer", comment: "required" }];
 
-/** The choices of an open gate: its step's, or the fixed ones of loop-limit and ask gates. */
+type AskTransition = Extract<Transition, { kind: "ask" }>;
+
+/** The buttons of an `ask` transition, each with where it goes: its `choices`, else the single "answered". */
+export function askChoices(transition: AskTransition): AskChoice[] {
+  if (transition.choices && transition.choices.length > 0) return transition.choices;
+  return ASK_CHOICES.map((choice) => ({ ...choice, target: transition.target, ...(transition.maxLoops !== undefined ? { maxLoops: transition.maxLoops } : {}) }));
+}
+
+/** The `ask` transition that opened an ask gate: by its outcome, else (older gates) by its target. */
+export function askTransitionOf(gate: Gate, step: Step | undefined): AskTransition | null {
+  if (!step) return null;
+  const byOutcome = gate.outcome ? step.on[gate.outcome] : undefined;
+  if (byOutcome?.kind === "ask") return byOutcome;
+  const found = Object.values(step.on).find((transition) => transition.kind === "ask" && transition.target === gate.gotoTarget);
+  return found?.kind === "ask" ? found : null;
+}
+
+/** The choices of an open gate: its step's, the fixed ones of loop-limit gates, or the ask's. */
 export function choicesOfGate(gate: Gate, step: Step | undefined): GateChoice[] {
   if (gate.kind === "loop_limit") return LOOP_LIMIT_CHOICES;
-  if (gate.kind === "ask") return ASK_CHOICES;
+  if (gate.kind === "ask") {
+    const transition = askTransitionOf(gate, step);
+    return transition ? askChoices(transition) : ASK_CHOICES;
+  }
   return step ? gateChoices(step) : [];
 }
 

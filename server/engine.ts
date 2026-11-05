@@ -4,7 +4,7 @@
  */
 import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
-import { askHumanText, choicesOfGate, outcomeTransition } from "../shared/gates";
+import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
 import type { AfterTask, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
 import { isActive, isPaused, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, renderTemplate, resolveValue } from "../shared/vars";
@@ -617,6 +617,7 @@ function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | un
     kind: "loop_limit",
     stepId: step.id,
     gotoTarget: target,
+    outcome: null,
     status: "pending",
     message: `Loop limit reached: "${step.id}" → "${target}" ran ${run.loops[key] ?? 0} times (max ${maxLoops}). Approve one more loop, or reject to fail the ${step.afterTask ? "after-task" : "run"}.\n\nLatest feedback: ${feedback || "(none)"}`,
     summary: `Loop limit reached: "${step.id}" → "${target}" ran ${run.loops[key] ?? 0} times (max ${maxLoops}). Approve one more loop, or reject to fail the ${step.afterTask ? "after-task" : "run"}.`,
@@ -633,7 +634,7 @@ function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | un
 }
 
 /** An `ask` transition: the step waits while a human answers, then goes back to the target with the answer. */
-function openAskGate(run: Run, step: Step, transition: Extract<Transition, { kind: "ask" }>, summary: string, now: string, fx: Effects): void {
+function openAskGate(run: Run, step: Step, outcome: string, transition: Extract<Transition, { kind: "ask" }>, summary: string, now: string, fx: Effects): void {
   run.steps[step.id]!.status = "waiting";
   const asked = run.gates.filter((gate) => gate.kind === "ask" && gate.stepId === step.id).length;
   const gate: Gate = {
@@ -641,6 +642,7 @@ function openAskGate(run: Run, step: Step, transition: Extract<Transition, { kin
     kind: "ask",
     stepId: step.id,
     gotoTarget: transition.target,
+    outcome,
     status: "pending",
     message: [transition.ask, summary].filter(Boolean).join("\n\n"),
     summary: transition.ask,
@@ -719,7 +721,7 @@ export function completeStep(
       gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, input.now, fx);
       break;
     case "ask":
-      openAskGate(run, step, transition, summary, input.now, fx);
+      openAskGate(run, step, input.outcome, transition, summary, input.now, fx);
       break;
   }
   updateStatus(run);
@@ -738,6 +740,7 @@ export function requestGate(run: Run, stepId: string, summary: string, now: stri
     kind: "gate",
     stepId,
     gotoTarget: null,
+    outcome: null,
     status: "pending",
     message: [summary, step.gate, details].filter(Boolean).join("\n\n"),
     summary,
@@ -791,8 +794,13 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   log(run, decision.now, "gate_decided", gate.stepId, `${gate.id}: ${decision.decision} via ${decision.via}`);
   const step = stepDef(run, gate.stepId);
   if (gate.kind === "ask") {
-    const ask = Object.values(step.on).find((transition) => transition.kind === "ask" && transition.target === gate.gotoTarget);
-    gotoOrLimit(run, step, gate.gotoTarget!, ask?.kind === "ask" ? ask.maxLoops : undefined, decision.comment ?? "", decision.now, fx);
+    // Each choice goes to its own target. With declared choices the target also learns which
+    // one the human picked; the single default "answered" passes the answer alone.
+    const ask = askTransitionOf(gate, step);
+    const picked = ask ? askChoices(ask).find((candidate) => candidate.id === choice.id) : undefined;
+    const comment = decision.comment?.trim() ?? "";
+    const feedback = ask?.choices?.length ? `The human answered "${choice.id}"${comment ? `: ${comment}` : "."}` : decision.comment ?? "";
+    gotoOrLimit(run, step, picked?.target ?? gate.gotoTarget!, picked?.maxLoops, feedback, decision.now, fx);
     updateStatus(run);
     return { gate, alreadyDecided: false, effects: fx };
   }

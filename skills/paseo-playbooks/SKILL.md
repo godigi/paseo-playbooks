@@ -135,7 +135,7 @@ steps:
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
-| `on` | Per outcome: `complete`, `end`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N }` (agent steps; see Loops). |
+| `on` | Per outcome: `complete`, `end`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; see Loops). |
 | `retries` | Extra attempts after `failure`. |
 | `timeout` | `30m`, `2h`… Expiry counts as a failure. |
 | `agent` | Step-level agent settings. |
@@ -277,6 +277,24 @@ To let an agent step ask a human a question, give it an outcome that routes to `
 the answer in the panel (required). The step then runs again, with the answer as feedback.
 `goto` (default: the step itself) may name an earlier step instead. The report needs no
 outputs. `ask` is not available on gate steps.
+
+`choices` gives the ask gate several buttons, each going to its own step. Keys are the
+choice ids; each takes `goto` (default: the ask's `goto`, else the step itself),
+`max_loops` (default: the ask's), `label`, `color` and `comment` (default `required`):
+
+```yaml
+on:
+  blocked:
+    ask: "Local QA is blocked."
+    max_loops: 3
+    choices:
+      answered: {}                      # re-run this step with the answer
+      fix: { goto: fix, label: "Request a code change" }
+      skip: { comment: none }
+```
+
+The target gets `The human answered "<id>": <comment>` as feedback. Without `choices` the gate
+has the single `answered` button and the target gets the answer alone.
 
 ### Rules the validator enforces
 
