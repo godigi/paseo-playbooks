@@ -880,8 +880,13 @@ function RunRow(props: {
             {title}
             {actions}
           </View>
-          <StepLabels theme={theme} columns={columns} />
-          <ProgressLine theme={theme} total={columns.length} position={state.position} marks={state.marks} color={color} moving={isMoving(state.tone)} />
+          {/* In rows: both stretch with `flex: 1`, which in this column would collapse their height. */}
+          <View style={{ flexDirection: "row" }}>
+            <StepLabels theme={theme} columns={columns} />
+          </View>
+          <View style={{ flexDirection: "row" }}>
+            <ProgressLine theme={theme} total={columns.length} position={state.position} marks={state.marks} color={color} moving={isMoving(state.tone)} />
+          </View>
         </>
       ) : (
         <View style={{ flexDirection: "row", alignItems: "center" }}>
