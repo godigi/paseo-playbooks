@@ -56,7 +56,10 @@ export default function contribute(server: PluginServerContext) {
   const tools = { manager: managerTools(runtime), common: [validateTool(runtime), ...runTools(runtime)], step: stepTool(runtime) };
   server.before("agent.session_open", async ({ request }, context) => {
     if (request.purpose === "history") return;
-    await enter(context.paseo);
+    // Only the store is needed here. Do not wait for reconcile: its own sends (resume a step, wake a
+    // manager) open sessions that land in this hook, and waiting would deadlock until the RPC timeout.
+    await ready;
+    void runtime.attach(context.paseo);
     if (request.labels[STEP_LABEL]) return { ...request, tools: [...request.tools, tools.step] };
     const manages = runtime.runsOfManager(request.agentId).length > 0 || request.labels["playbooks/manager"] === "true";
     const extra = manages || runtime.hasReservation(request.workspaceId) || (await hasPlaybooks(request.cwd)) ? tools.manager : [];
