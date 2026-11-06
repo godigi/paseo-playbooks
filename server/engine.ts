@@ -1258,10 +1258,10 @@ export function replaceManager(run: Run, managerAgentId: string, reason: string,
 // ---------------------------------------------------------------- singleton pipelines and jobs
 
 /** A train's open jobs, as its steps read them: `{{ run.jobs }}` (YAML), `PLAYBOOK_JOBS` (JSON). */
-export function openJobs(run: Run): Array<{ id: string; from: string; inputs: Record<string, VarValue>; outputs: Record<string, VarValue> }> {
+export function openJobs(run: Run): Array<{ id: string; from: string; detached?: true; inputs: Record<string, VarValue>; outputs: Record<string, VarValue> }> {
   return run.jobs
     .filter((job) => job.status === "open")
-    .map((job) => ({ id: job.id, from: job.label, inputs: job.inputs, outputs: job.outputs }));
+    .map((job) => ({ id: job.id, from: job.label, ...(job.detached ? { detached: true as const } : {}), inputs: job.inputs, outputs: job.outputs }));
 }
 
 export function jobsText(run: Run): string {

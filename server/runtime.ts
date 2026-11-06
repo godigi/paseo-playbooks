@@ -566,6 +566,7 @@ export class Runtime {
       waiting: [],
       riding: [],
       failedRides: {},
+      detached: step.handoffWait === false,
     };
     await this.store.mutate(pipeline.id, (current) => engine.addJob(current, job, nowIso()));
     await this.store.mutate(run.id, (current) => {
@@ -574,6 +575,11 @@ export class Runtime {
       attempt.job = { runId: pipeline.id, jobId: job.id };
       attempt.lastMessage = `Waiting at ${job.waiting.map((place) => `"${place.station}"`).join(", ") || "the first station"} of "${pipeline.playbook.title}".`;
     });
+    // Fire and forget: the step is done now; the job is the pipeline's from here on.
+    if (job.detached) {
+      const at = job.waiting.map((place) => `"${place.station}"`).join(", ") || "its first station";
+      await this.finishHandoff(run.id, stepId, attemptId, { outcome: step.outcomes[0]!, summary: `Handed job ${job.id} to "${pipeline.playbook.title}" (${pipeline.id}), waiting at ${at}; not waiting for its result.`, outputs: {} });
+    }
     this.tickAgain = true;
     return true;
   }
@@ -711,7 +717,7 @@ export class Runtime {
           const comment = gate.comment ? `: "${gate.comment}"` : "";
           text = gate.status === "pending" ? `${gate.stepId} of ${where} no longer waits: the train ${train.status}.` : `${gate.stepId} of ${where} was decided: ${gate.status} by ${gate.decidedBy ?? "a human"}${comment}.`;
         }
-        for (const runId of new Set(jobs.map((job) => job.fromRunId))) {
+        for (const runId of new Set(jobs.filter((job) => !job.detached).map((job) => job.fromRunId))) {
           const from = this.store.get(runId);
           if (!from || isTerminal(from.status)) continue;
           await this.enqueue(runId, [text]);
@@ -724,7 +730,7 @@ export class Runtime {
 
   /** Shows on the handing-off step where its job is. */
   private async noteHandoff(job: Job, text: string): Promise<void> {
-    if (!this.store.get(job.fromRunId)) return;
+    if (job.detached || !this.store.get(job.fromRunId)) return;
     const attemptId = handoffAttemptId(job.fromRunId, job.fromStepId, job.attempt);
     await this.store.mutate(job.fromRunId, (from) => {
       const attempt = from.steps[job.fromStepId]?.attempts.at(-1);
@@ -763,7 +769,8 @@ export class Runtime {
 
   /** A job's result reaches the step that handed it off (which completes now, or on resume when its run is paused). */
   private async deliverJob(job: Job, result: { outcome: string; summary: string; outputs: Record<string, unknown> }): Promise<void> {
-    if (!this.store.get(job.fromRunId)) return;
+    // A detached job's result stays on the pipeline: its run moved on long ago.
+    if (job.detached || !this.store.get(job.fromRunId)) return;
     await this.finishHandoff(job.fromRunId, job.fromStepId, handoffAttemptId(job.fromRunId, job.fromStepId, job.attempt), result);
   }
 
@@ -779,6 +786,8 @@ export class Runtime {
     const from = this.store.get(fromRunId);
     const attempt = from && Object.values(from.steps).flatMap((state) => state.attempts).find((candidate) => candidate.agentId === attemptId);
     if (!attempt?.job || !this.store.get(attempt.job.runId)) return;
+    // A detached job belongs to the pipeline: nothing its run does withdraws it.
+    if (this.store.get(attempt.job.runId)!.jobs.find((job) => job.id === attempt.job!.jobId)?.detached) return;
     const withdrawn = await this.store.mutate(attempt.job.runId, (current) => engine.withdrawJob(current, attempt.job!.jobId, reason, nowIso()));
     if (!withdrawn) return;
     for (const trainId of withdrawn.trains) {
@@ -1766,23 +1775,54 @@ export class Runtime {
       });
       return { status: "started" as const, workspaceId: workspace.id, managerAgentId: manager.id, runId, queued: false };
     }
+    return this.startInNewWorkspace(workspaceDir, playbook, resolved.inputs);
+  }
+
+  /** A new workspace branched off this one's current ref, with a new Playbook Manager that starts the run there. */
+  private async startInNewWorkspace(workspaceDir: string, playbook: Playbook, inputs: Record<string, VarValue>) {
     const id = shortId();
     const runId = `run_${id}`;
     const branch = `playbooks/${playbook.id}-${id}`;
     const base = (await currentRef(workspaceDir)) ?? undefined;
-    const headline = String(resolved.inputs.request ?? Object.values(resolved.inputs)[0] ?? "").slice(0, 60);
+    const headline = String(inputs.request ?? Object.values(inputs)[0] ?? "").slice(0, 60);
     const created = await this.api().workspaces.create({
       title: `${playbook.title}${headline ? `: ${headline}` : ""}`,
       source: { kind: "worktree", cwd: workspaceDir, action: "branch-off", branchName: branch, ...(base ? { refName: base } : {}) },
     });
-    this.reservations.set(created.id, { runId, branch, playbook, inputs: resolved.inputs });
+    this.reservations.set(created.id, { runId, branch, playbook, inputs });
     const manager = await created.agents.create({
       config: this.managerConfig(playbook),
       title: `Playbook Manager · ${playbook.title}`,
       labels: { [MANAGER_LABEL]: "true" },
-      prompt: managerKickoff(playbook, resolved.inputs),
+      prompt: managerKickoff(playbook, inputs),
     });
     return { status: "started" as const, workspaceId: created.id, managerAgentId: manager.id, runId };
+  }
+
+  /**
+   * start_playbook with `newWorkspace`: the run gets its own workspace and its own Playbook
+   * Manager, so any manager can start one, a train's included (rework for an ejected job).
+   */
+  async startPlaybookElsewhere(manager: { cwd: string; workspaceId: string | null }, playbookId: string, inputs: Record<string, unknown>) {
+    let workspaceDir = manager.cwd;
+    let projectId: string | null = null;
+    if (manager.workspaceId) {
+      const workspace = await this.api().workspaces.ref(manager.workspaceId).refresh();
+      if (workspace) {
+        workspaceDir = workspace.workspaceDirectory ?? manager.cwd;
+        projectId = workspace.projectId;
+      }
+    }
+    const loaded = await loadPlaybooks(workspaceDir);
+    const entry = loaded.entries.find((candidate) => candidate.id === playbookId);
+    if (!entry) throw new UserError(`no playbook "${playbookId}" in this workspace (have: ${loaded.entries.map((e) => e.id).join(", ") || "none"})`);
+    if (!entry.playbook) throw new UserError(`playbook "${playbookId}" is invalid:\n${entry.errors.join("\n")}`);
+    const playbook = entry.playbook;
+    if (playbook.singleton) throw new UserError(`"${playbookId}" is a singleton: it runs in its own pipeline workspace; start it without newWorkspace`);
+    const resolved = engine.resolveRunInputs(playbook, inputs);
+    if (!resolved.ok) throw new UserError(resolved.errors.join("; "));
+    if (projectId) this.checkConcurrency(playbook, projectId);
+    return this.startInNewWorkspace(workspaceDir, playbook, resolved.inputs);
   }
 
   hasReservation(workspaceId: string | null): boolean {

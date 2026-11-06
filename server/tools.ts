@@ -211,7 +211,7 @@ function describeEntry(entry: PlaybookEntry) {
       role: step.role ? `${step.role} (${pb.roles[step.role]!.title}${pb.roles[step.role]!.readonly ? ", readonly" : ""})` : null,
       gate: step.gate ?? null,
       ...(step.kind === "script" ? { script: step.script, poll: step.pollMs ? `${step.pollMs / 1000}s` : null } : {}),
-      ...(step.kind === "handoff" ? { handoff: step.handoff } : {}),
+      ...(step.kind === "handoff" ? { handoff: step.handoff, ...(step.handoffWait === false ? { wait: false } : {}) } : {}),
       ...(step.when ? { when: Object.fromEntries(step.when.map((condition) => [condition.input, condition.values])) } : {}),
       afterTask: step.afterTask ?? null,
       needs: step.needs,
@@ -242,13 +242,25 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
     }),
     defineAgentTool({
       name: "start_playbook",
-      description: "Create a run of a playbook with you as its manager, in your workspace (one active run per workspace). Returns the run id and the ready steps.",
+      description:
+        "Create a run of a playbook with you as its manager, in your workspace (one active run per workspace). Returns the run id and the ready steps. With newWorkspace, the run gets a new workspace and its own Playbook Manager instead (for example a train's manager starting rework for an ejected job).",
       input: z.object({
         playbook: z.string().describe("Playbook id (its file name without .yaml)"),
         inputs: z.record(z.string(), VarValueSchema).default({}).describe("Playbook inputs by name"),
+        newWorkspace: z
+          .boolean()
+          .default(false)
+          .describe("Start it in a new workspace (branched off this one's current branch) with a new Playbook Manager; you do not manage it"),
       }),
-      execute: ({ playbook, inputs }, { agent }) =>
+      execute: ({ playbook, inputs, newWorkspace }, { agent }) =>
         guard(async () => {
+          if (newWorkspace) {
+            const started = await runtime.startPlaybookElsewhere(agent, playbook, inputs);
+            return ok(
+              `Run ${started.runId} of "${playbook}" is starting in a new workspace (${started.workspaceId}) with its own Playbook Manager (${started.managerAgentId}). You do not manage it: carry on with your own run.`,
+              started,
+            );
+          }
           const run = await runtime.startPlaybook(agent, playbook, inputs);
           if (run.playbook.singleton) {
             return ok(

@@ -143,7 +143,13 @@ const RawScriptStepSchema = z
 const RawPlaybookStepSchema = z.object({ name: z.string().min(1) }).strict();
 
 /** A hand-off: a singleton playbook from the same folder, given a job; the step waits for its result. */
-const RawHandoffStepSchema = z.object({ name: z.string().min(1) }).strict();
+const RawHandoffStepSchema = z
+  .object({
+    name: z.string().min(1),
+    /** false: the step completes with the first outcome as soon as the pipeline takes the job, and the job no longer belongs to this run. Default true. */
+    wait: z.boolean().default(true),
+  })
+  .strict();
 
 /** Fields that moved into a kind's block; read flat only to refuse them with the new form. */
 const MOVED_FIELDS = { prompt: "role", silence: "role", archive_agents: "role", agent: "role", choices: "gate", poll: "script" } as const;
@@ -712,6 +718,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         else if (!target.singleton) err(`${where}: handoff: playbook "${targetId}" is not a singleton (add \`singleton: {}\` to it)`);
       }
       if (target?.singleton) handoffs.set(rawStep.id, target);
+      const wait = typeof rawStep.handoff === "string" || rawStep.handoff!.wait;
       const outcomes = target ? (target.outcomes.includes("failure") ? target.outcomes : [...target.outcomes, "failure"]) : ["success", "failure"];
       const on: Record<string, Transition> = {};
       for (const [outcome, transition] of Object.entries(rawStep.on ?? {})) {
@@ -721,7 +728,12 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         else if ("end" in transition) on[outcome] = endTransition(`${where}: on.${outcome}`, transition.end);
         else on[outcome] = transition.max_loops !== undefined ? { kind: "goto", target: transition.goto, maxLoops: transition.max_loops } : { kind: "goto", target: transition.goto };
       }
-      if (target) {
+      if (!wait) {
+        // Done once the job is in the pipeline: only the first outcome, or failure to hand it off.
+        for (const outcome of Object.keys(on)) {
+          if (outcome !== outcomes[0] && outcome !== "failure") err(`${where}: on.${outcome}: a hand-off with \`wait: false\` only ends with "${outcomes[0]}" (or "failure" if the job cannot be handed off)`);
+        }
+      } else if (target) {
         for (const outcome of target.outcomes.slice(1)) {
           if (outcome !== "failure" && !on[outcome]) err(`${where}: outcome "${outcome}" of playbook "${targetId}" needs an \`on\` entry (complete, end, fail or goto)`);
         }
@@ -735,10 +747,12 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         id: rawStep.id,
         kind: "handoff",
         handoff: targetId,
+        ...(wait ? {} : { handoffWait: false as const }),
         needs: rawStep.needs,
         prompt: "",
         inputs: {},
-        outputs: Object.fromEntries(Object.entries(target?.outputs ?? {}).map(([name, def]) => [name, { type: def.type, ...(def.values ? { values: def.values } : {}) }])),
+        // Without waiting, the step never sees the job's outputs.
+        outputs: !wait ? {} : Object.fromEntries(Object.entries(target?.outputs ?? {}).map(([name, def]) => [name, { type: def.type, ...(def.values ? { values: def.values } : {}) }])),
         outcomes,
         retries: rawStep.retries,
         agent: {},
@@ -1168,6 +1182,11 @@ type SourceRef =
   | { kind: "run"; field: "id" | "status" | "failure" }
   | { kind: "output"; name: string };
 
+/** Why a hand-off that does not wait has no outputs to read. */
+function noOutputsHint(step: Step): string {
+  return step.kind === "handoff" && step.handoffWait === false ? ` (a hand-off with \`wait: false\` does not wait for its job, so it gives no outputs)` : "";
+}
+
 function parseSourceRef(ref: string): SourceRef | null {
   const playbook = /^playbook\.inputs\.([A-Za-z_][\w-]*)$/.exec(ref);
   if (playbook) return { kind: "playbook", name: playbook[1]! };
@@ -1230,7 +1249,7 @@ function wireStep(
             err(`${where}: inputs.${name}: step "${source.step}" is not one this step needs (directly or not)`);
             ok = false;
           } else if (!byId.get(source.step)!.outputs[source.output]) {
-            err(`${where}: inputs.${name}: step "${source.step}" has no output "${source.output}"`);
+            err(`${where}: inputs.${name}: step "${source.step}" has no output "${source.output}"${noOutputsHint(byId.get(source.step)!)}`);
             ok = false;
           } else if (!sameWhen(byId.get(source.step)!, step)) {
             err(`${where}: inputs.${name}: step "${source.step}" has a \`when\` and may be skipped (its outputs unset); read it only from a step with the same \`when\``);
@@ -1462,7 +1481,7 @@ function resolveOutputSource(
       if (!source || source.kind === "run" || source.kind === "output") return { error: `"{{ ${ref} }}" must be playbook.inputs.<name> or steps.<id>.outputs.<name>` };
       if (source.kind === "playbook" && !inputs[source.name]) return { error: `playbook input "${source.name}" is not declared` };
       if (source.kind === "step" && !byId.get(source.step)?.outputs[source.output]) {
-        return { error: `step "${source.step}" has no output "${source.output}"` };
+        return { error: `step "${source.step}" has no output "${source.output}"${byId.get(source.step) ? noOutputsHint(byId.get(source.step)!) : ""}` };
       }
     }
     const single = singleRef(explicit);

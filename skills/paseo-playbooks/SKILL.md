@@ -362,6 +362,23 @@ A **hand-off step** gives a singleton a job and waits until the job leaves the p
   train, not to the handing-off run.
 - A hand-off that leads back to its own playbook is refused.
 
+**Without waiting**, `handoff: { name: release_trains, wait: false }` (default `true`): the step
+completes with the singleton's first outcome as soon as the pipeline takes the job, and the run
+moves on.
+
+- The job then belongs to the pipeline: it survives the run completing, failing or being
+  canceled, is never withdrawn by it, and how it ends is recorded on the pipeline only (the run
+  is not told, nor of the train's gates). Its card still shows which run handed it off, and
+  `{{ run.jobs }}` marks it `detached: true`.
+- The step gives no outputs: reading `steps.<id>.outputs.*` from it is refused, and `on` may
+  only name the first outcome or `failure` (the job could not be handed off).
+- **Rework after an eject:** the train's manager can start a new run of any playbook with
+  `start_playbook(playbook, inputs, newWorkspace: true)`. It gets a new workspace (branched off
+  the pipeline's) and its own Playbook Manager; the train's manager does not manage it. Write
+  in the singleton's playbook when to do it, e.g. in the prompt of the step that ejects:
+  "after `settle_job(… outcome: ejected)`, call `start_playbook` with playbook `pr-to-prod`,
+  inputs `{ pr_urls, ticket }` from the job, and `newWorkspace: true`".
+
 ### Sub-playbooks
 
 A step with `playbook: { name: <id> }` runs another playbook of the same folder in place, like a

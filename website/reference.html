@@ -184,6 +184,7 @@ steps:
     on:
       ejected: { goto: fix, max_loops: 2 }</code></pre>
 <p>Its contract is the singleton's inputs, outputs and outcomes (plus <code>failure</code>); every outcome but the first needs an <code>on</code> entry. The plugin starts and completes it. Canceling the run, or a <code>goto</code> that resets the step, withdraws the job; while the run is paused, a result waits for the resume. A hand-off that leads back to its own playbook is refused.</p>
+<p><strong>Without waiting</strong>, <code>handoff: { name: release_trains, wait: false }</code> (default <code>true</code>) completes with the singleton's first outcome as soon as the pipeline takes the job. The job then belongs to the pipeline: it survives the run completing, failing or being canceled, is never withdrawn by it, and how it ends is recorded on the pipeline only. The step gives no outputs (reading them is refused), and <code>on</code> may only name the first outcome or <code>failure</code>. To rework an ejected job, the train's manager calls <code>start_playbook</code> with <code>newWorkspace: true</code>: the new run gets its own workspace and Playbook Manager.</p>
 <p>The panel and the Playbooks screen show a singleton's stations (waiting list and current train) and its trains; a hand-off step shows where its job is.</p>
 
 <h2 id="subplaybooks">Sub-playbooks</h2>
