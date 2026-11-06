@@ -105,12 +105,16 @@ When you are done, call the report_step_result tool exactly once, as your last a
 If the tool refuses your report, fix what it says and call it again. If the tool is missing or
 "not found", do not work around it: write the outcome, summary and outputs in your last message and
 end your turn; the plugin then asks you to report again, with the tool available. Do not create
-other agents.`;
+other agents.
+If you must wait for something (CI, a review, a deploy), wait inside your turn with a bounded
+foreground poll (a command that checks, sleeps and returns when done or after a time limit), then
+report. Never end your turn to wait on a Monitor, a background command or a timer: you may not be
+woken again.`;
 }
 
 /** Sent to a step agent whose turn ended without a report; the new prompt also restores its plugin tools. */
 export function reportReminder(stepId: string): string {
-  return `[playbooks] Your turn ended without a report for step "${stepId}". If your work is done, call report_step_result now; it is available again even if it was "not found" before. If you are still waiting for something, say what and end your turn.`;
+  return `[playbooks] Your turn ended without a report for step "${stepId}". If your work is done, call report_step_result now; it is available again even if it was "not found" before. If you are still waiting for something, keep waiting in this turn with a bounded foreground poll (not a Monitor, background command or timer), then call report_step_result.`;
 }
 
 /** Sent into a running step agent's turn when it went silent or its timeout is close. */
