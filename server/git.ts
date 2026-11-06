@@ -62,6 +62,24 @@ export async function defaultBranch(cwd: string): Promise<string | null> {
   return currentRef(cwd);
 }
 
+/**
+ * The ref to branch a new worktree off for `branch`: `origin/<branch>`, fetched first, when
+ * origin has it (a local branch of the same name may be far behind); else `branch` itself.
+ */
+export async function freshRef(cwd: string, branch: string): Promise<string> {
+  try {
+    await git(cwd, ["fetch", "--quiet", "origin", branch]);
+  } catch {
+    // Offline or no origin: whatever the remote-tracking ref already holds, if any.
+  }
+  try {
+    await git(cwd, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]);
+    return `origin/${branch}`;
+  } catch {
+    return branch;
+  }
+}
+
 /** Best effort: fetches `branch` from origin and fast-forwards the checkout to it. Never fails. */
 export async function fastForward(cwd: string, branch: string): Promise<void> {
   try {

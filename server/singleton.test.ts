@@ -15,7 +15,8 @@ afterEach(async () => {
 });
 
 /** Just enough of the daemon API: idle agents, recorded prompts, and worktrees that share the test folder. */
-function fakePaseo(dir: string) {
+function fakePaseo(dir: string, pipelineDir = dir) {
+  const archivedWorkspaces: string[] = [];
   const sent: Array<{ agentId: string; text: string }> = [];
   const created: Array<{ title: string; source: unknown }> = [];
   const archived: string[] = [];
@@ -30,18 +31,18 @@ function fakePaseo(dir: string) {
     const id = `mgr${++agents}`;
     return { id, send: async (text: string) => void sent.push({ agentId: id, text }) };
   };
-  const workspace = (id: string) => ({ id, projectId: "p", workspaceDirectory: dir });
+  const workspace = (id: string) => ({ id, projectId: "p", workspaceDirectory: id.startsWith("wt") ? pipelineDir : dir });
   const paseo = {
     agents: { ref },
     workspaces: {
-      ref: (id: string) => ({ refresh: async () => workspace(id), agents: { create: createAgent } }),
+      ref: (id: string) => ({ refresh: async () => workspace(id), agents: { create: createAgent }, archive: async () => void archivedWorkspaces.push(id) }),
       create: async (input: { title: string; source: unknown }) => {
         created.push(input);
         return { id: `wt${created.length}`, agents: { create: createAgent } };
       },
     },
   };
-  return { paseo, sent, created, archived };
+  return { paseo, sent, created, archived, archivedWorkspaces };
 }
 
 const APPLY = `
@@ -74,7 +75,7 @@ steps:
       rejected: fail
 `;
 
-async function setup(files: Record<string, string> = { "apply.yaml": APPLY, "pr.yaml": PR }) {
+async function setup(files: Record<string, string> = { "apply.yaml": APPLY, "pr.yaml": PR }, pipelineDir?: string) {
   const dir = await mkdtemp(path.join(tmpdir(), "singleton-"));
   temps.push(dir);
   const root = path.join(dir, ".paseo/plugins/playbooks");
@@ -83,7 +84,7 @@ async function setup(files: Record<string, string> = { "apply.yaml": APPLY, "pr.
   for (const [name, body] of Object.entries(files)) await writeFile(path.join(root, name), body);
   const store = new RunStore(path.join(dir, "runs"));
   await store.init();
-  const fake = fakePaseo(dir);
+  const fake = fakePaseo(dir, pipelineDir);
   const runtime = new Runtime(store);
   runtimes.push(runtime);
   await runtime.attach(fake.paseo as never);
@@ -264,6 +265,17 @@ describe("singleton pipelines: jobs through the stations", () => {
     const first = await decide(runtime, store, "dev", "approved");
     await until(() => trainAt(store, "dev") !== undefined && trainAt(store, "dev")!.id !== first.id);
     expect(archived).toContain(first.managerAgentId);
+  });
+
+  it("fail the hand-off and archive the new workspace when its branch has no such singleton", async () => {
+    const empty = await mkdtemp(path.join(tmpdir(), "singleton-branch-"));
+    temps.push(empty);
+    const { store, runtime, created, archivedWorkspaces } = await setup(undefined, empty);
+    const pr = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });
+    await until(() => store.get(pr.id)!.status === "failed");
+    expect(store.get(pr.id)!.steps.apply!.attempts.at(-1)!.report?.summary).toMatch(/no playbook "apply" on main/);
+    expect(created).toHaveLength(1);
+    expect(archivedWorkspaces).toEqual(["wt1"]);
   });
 
   it("tell the handing-off run when its train waits for a human, and when that is decided", async () => {

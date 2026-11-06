@@ -23,7 +23,7 @@ import {
 } from "../shared/types";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
-import { checkoutSnapshot, currentRef, defaultBranch, fastForward, snapshotDiff } from "./git";
+import { checkoutSnapshot, currentRef, defaultBranch, fastForward, freshRef, snapshotDiff } from "./git";
 import { loadPlaybooks } from "./loader";
 import { managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt } from "./prompts";
 import type { RunStore } from "./store";
@@ -591,7 +591,9 @@ export class Runtime {
 
   /** Creates the singleton's shared workspace from its branch, and its pipeline run there. */
   private async createPipeline(playbook: Playbook, projectId: string, sourceDir: string): Promise<Run> {
-    const ref = playbook.singleton?.branch ?? (await defaultBranch(sourceDir)) ?? undefined;
+    const base = playbook.singleton?.branch ?? (await defaultBranch(sourceDir)) ?? undefined;
+    // Branch off origin's copy: the source checkout's local branch may be far behind.
+    const ref = base ? await freshRef(sourceDir, base) : undefined;
     const id = shortId();
     const branch = `playbooks/${playbook.id}-${id}`;
     const created = await this.api().workspaces.create({
@@ -601,7 +603,11 @@ export class Runtime {
     const workspace = await this.api().workspaces.ref(created.id).refresh();
     const workspaceDir = workspace?.workspaceDirectory ?? sourceDir;
     const entry = (await loadPlaybooks(workspaceDir)).entries.find((candidate) => candidate.id === playbook.id);
-    if (!entry?.playbook?.singleton) throw new UserError(entry ? `playbook "${playbook.id}" is not a valid singleton on ${ref ?? "its branch"}: ${entry.errors[0] ?? ""}` : `no playbook "${playbook.id}" on ${ref ?? "its branch"}`);
+    if (!entry?.playbook?.singleton) {
+      // Nothing will run there: do not leave an empty workspace behind.
+      await this.api().workspaces.ref(created.id).archive().catch((error) => console.error(`[playbooks] could not archive workspace ${created.id}:`, errorText(error)));
+      throw new UserError(entry ? `playbook "${playbook.id}" is not a valid singleton on ${ref ?? "its branch"}: ${entry.errors[0] ?? ""}` : `no playbook "${playbook.id}" on ${ref ?? "its branch"}`);
+    }
     const run = engine.newPipelineRun({ id: `run_${id}`, playbook: entry.playbook, workspaceId: created.id, workspaceDir, projectId, branch, now: nowIso() });
     await this.store.create(run);
     return run;
