@@ -1,4 +1,4 @@
-# Step kind fields: grouped under the kind keyword
+# Step kind fields grouped under the kind keyword; block form first
 
 Status: Accepted
 
@@ -62,17 +62,25 @@ version, so it is cheapest now.
   - a flat moved field: `` `poll` moved under `script:`: write `script: { run: wait_ci, poll: 30s }` ``;
   - the same for `prompt`, `silence`, `archive_agents`, `agent` and `choices`, and for
     `silence` and `archive_agents` in the defaults file.
+- The same rule applies to every new element of the format: a feature's options go in one
+  block under a key named for the feature, never as flat siblings, even when it has a single
+  option today. A field stays flat only when it describes its parent itself (`id`, `title`,
+  `hidden`, `needs`) or is shared by several step kinds. A default mirrors the block it
+  defaults. `.agents/skills/extend-playbook-format/SKILL.md` describes how to add one, and
+  `AGENTS.md` points to it.
 - Only the YAML changes: the loaded `Step` and `Playbook` types, the run state and the
   agent tools stay as they are.
 
 ## Consequences
 
 - Every playbook, `defaults/main.yaml` that sets `silence` or `archive_agents`, the examples
-  and this repository's own `.paseo/plugins/playbooks/`, the README and the website
-  reference and examples must be rewritten. The pull request carries `breaking-change` and
-  the migration.
+  and this repository's own `.paseo/plugins/playbooks/`, the README, the website reference
+  and examples, and `skills/paseo-playbooks/SKILL.md` must be rewritten. The pull request
+  carries `breaking-change` and the migration.
 - Run files are unaffected, so runs started before the upgrade keep going.
 - Kind-only options are grouped by shape, but the step still has shared fields beside the
   block, and `on` transitions keep the flat keyword style.
 - The common agent step is one level deeper (`role: { name: …, prompt: … }`, usually written
   as a nested map).
+- Existing flat forms outside step kinds (`on` transitions such as `{ ask, goto, choices }`)
+  are not changed by this ADR; a later change to them follows the block rule.

@@ -1,5 +1,11 @@
 # Agent instructions
 
+## Playbook format
+
+Before adding or changing anything in the playbook YAML format (playbook, step, after-task,
+transition, role or defaults fields), read `.agents/skills/extend-playbook-format/SKILL.md`.
+New options go in a block under the key they belong to, not as flat fields.
+
 ## Architecture Decision Records (ADRs)
 
 Every significant decision gets its own ADR in `docs/adrs/`, added in the same pull request
