@@ -33,16 +33,16 @@ outputs:
   pr_url: {}
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outputs: { plan: {} }
   - id: implement
-    role: implementer
+    role: { name: implementer }
     needs: [investigate]
     inputs: [request, plan, base_branch]
     outputs: { pr_url: {} }
   - id: babysit
-    role: babysitter
+    role: { name: babysitter }
     needs: [implement]
     inputs: [pr_url]
     outcomes: [ready, changes_requested]
@@ -57,7 +57,7 @@ outputs:
   env_url: {}
 steps:
   - id: deploy
-    role: reviewer
+    role: { name: reviewer }
     inputs: [pr_url]
     outputs: { env_url: {} }
 `;
@@ -69,15 +69,15 @@ outputs:
   env_url: {}
 steps:
   - id: pr
-    playbook: pr
+    playbook: { name: pr }
   - id: approve
     needs: [pr]
-    gate: Ship it?
+    gate: { question: Ship it? }
     on:
       rejected: { goto: pr }
   - id: release
     needs: [approve]
-    playbook: release
+    playbook: { name: release }
 `;
 
 describe("sub-playbooks", () => {
@@ -134,11 +134,11 @@ describe("sub-playbooks", () => {
 
   it("refuses self-inclusion, unknown playbooks and unknown block inputs", async () => {
     const dir = await folder({
-      "a.yaml": "steps:\n  - id: b\n    playbook: b\n",
-      "b.yaml": "steps:\n  - id: a\n    playbook: a\n",
-      "c.yaml": "steps:\n  - id: x\n    playbook: nope\n",
+      "a.yaml": "steps:\n  - id: b\n    playbook: { name: b }\n",
+      "b.yaml": "steps:\n  - id: a\n    playbook: { name: a }\n",
+      "c.yaml": "steps:\n  - id: x\n    playbook: { name: nope }\n",
       "pr.yaml": PR,
-      "d.yaml": "steps:\n  - id: pr\n    playbook: pr\n    inputs: { colour: blue }\n",
+      "d.yaml": "steps:\n  - id: pr\n    playbook: { name: pr }\n    inputs: { colour: blue }\n",
     });
     const entries = new Map((await loadPlaybooks(dir)).entries.map((entry) => [entry.id, entry]));
     expect(entries.get("a")!.errors.join("\n")).toMatch(/includes itself|is invalid/);
@@ -159,24 +159,24 @@ outputs:
   verdict: {}
 steps:
   - id: triage
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outcomes: [deep, trivial]
     on:
       trivial: end
   - id: deep
-    role: reviewer
+    role: { name: reviewer }
     needs: [triage]
     outputs: { verdict: {} }
     outcomes: [success, enough]
     on:
       enough: end
   - id: side
-    role: reviewer
+    role: { name: reviewer }
     needs: [triage]
   - id: wrap
     needs: [deep, side]
-    gate: Looks right?
+    gate: { question: Looks right? }
     on:
       rejected: end
 `;
@@ -186,9 +186,9 @@ inputs:
   request: { required: true }
 steps:
   - id: check
-    playbook: check
+    playbook: { name: check }
   - id: tail
-    role: reviewer
+    role: { name: reviewer }
     needs: [check]
 `;
 const PARENT = `
@@ -198,10 +198,10 @@ outputs:
   verdict: {}
 steps:
   - id: check
-    playbook: check
+    playbook: { name: check }
   - id: after
     needs: [check]
-    gate: Done?
+    gate: { question: Done? }
     on:
       rejected: { goto: check }
 `;
@@ -210,9 +210,9 @@ inputs:
   request: { required: true }
 steps:
   - id: outer
-    playbook: outer
+    playbook: { name: outer }
   - id: last
-    role: reviewer
+    role: { name: reviewer }
     needs: [outer]
 `;
 

@@ -28,14 +28,14 @@ const PB = (on: string) => `
 inputs: { request: { required: true } }
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outcomes: [success, needs_input]
     outputs: { plan: {} }
     on:
       needs_input: ${on}
   - id: implement
-    role: implementer
+    role: { name: implementer }
     needs: [investigate]
     inputs: [request, plan]
     outputs: { pr_url: {} }
@@ -89,11 +89,11 @@ describe("on.<outcome>.ask", () => {
 inputs: { request: { required: true } }
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outputs: { plan: {} }
   - id: implement
-    role: implementer
+    role: { name: implementer }
     needs: [investigate]
     inputs: [request, plan]
     outcomes: [success, needs_input]
@@ -132,7 +132,7 @@ steps:
     const gateStep = `
 steps:
   - id: g
-    gate: ok?
+    gate: { question: ok? }
     on:
       rejected: { ask: "why?" }
 `;
@@ -150,11 +150,11 @@ steps:
 inputs: { request: { required: true } }
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outputs: { plan: {} }
   - id: implement
-    role: implementer
+    role: { name: implementer }
     needs: [investigate]
     inputs: [request, plan]
     outcomes: [success, blocked]
@@ -220,7 +220,7 @@ steps:
 inputs: { request: { required: true } }
 steps:
   - id: qa
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outcomes: [success, unverified, stop]
     outputs: { report: {}, passed: { type: boolean }, accepted: {} }
@@ -233,7 +233,7 @@ steps:
           answered: {}
           stop: { outcome: stop, comment: none }
   - id: next
-    role: implementer
+    role: { name: implementer }
     needs: [qa]
     inputs: [report, accepted]
     outputs: { pr_url: {} }
@@ -289,7 +289,7 @@ steps:
     const pb = (choice: string, extra = "") => `
 steps:
   - id: qa
-    role: investigator
+    role: { name: investigator }
     outcomes: [success, unverified${extra}]
     outputs: { report: {} }
     on:
@@ -316,7 +316,7 @@ steps:
 
   it("works inside a sub-playbook (target is prefixed)", async () => {
     const { playbook, errors } = await load(
-      { "pr.yaml": PB(ASK), "cap.yaml": "inputs: { request: { required: true } }\nsteps:\n  - id: pr\n    playbook: pr\n" },
+      { "pr.yaml": PB(ASK), "cap.yaml": "inputs: { request: { required: true } }\nsteps:\n  - id: pr\n    playbook: { name: pr }\n" },
       "cap",
     );
     expect(errors).toEqual([]);
@@ -325,7 +325,7 @@ steps:
 
   it("prefixes ask choice targets inside a sub-playbook", async () => {
     const pr = PB('{ ask: "q", choices: { answered: {}, other: { comment: optional } } }');
-    const { playbook, errors } = await load({ "pr.yaml": pr, "cap.yaml": "inputs: { request: { required: true } }\nsteps:\n  - id: pr\n    playbook: pr\n" }, "cap");
+    const { playbook, errors } = await load({ "pr.yaml": pr, "cap.yaml": "inputs: { request: { required: true } }\nsteps:\n  - id: pr\n    playbook: { name: pr }\n" }, "cap");
     expect(errors).toEqual([]);
     const on = playbook!.steps.find((step) => step.id === "pr.investigate")!.on.needs_input!;
     expect(on.kind === "ask" && on.choices!.map((choice) => choice.target)).toEqual(["pr.investigate", "pr.investigate"]);

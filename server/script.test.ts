@@ -62,14 +62,13 @@ inputs:
   pr: { type: string }
 steps:
   - id: wait_merge
-    script: wait.sh
-    poll: 1s
+    script: { run: wait.sh, poll: 1s }
     timeout: 1m
     inputs: [pr]
     outputs: { merged_sha: {} }
   - id: deploy
     needs: [wait_merge]
-    role: implementer
+    role: { name: implementer }
     inputs: [merged_sha]
 `;
 
@@ -88,31 +87,36 @@ describe("script steps", () => {
     expect(step).toMatchObject({ kind: "script", script: ".paseo/plugins/playbooks/scripts/wait.sh", pollMs: 1000, timeoutMs: 60_000 });
   });
 
-  it("are refused when the script is missing, not executable, a path, or given agent fields", async () => {
+  it("are refused when the script is missing, not executable, a path, or poll is misplaced", async () => {
     const bad = `
 title: Wait
 steps:
   - id: a
-    script: missing.sh
+    script: { run: missing.sh }
   - id: b
-    script: ../escape.sh
+    script: { run: ../escape.sh }
   - id: c
-    script: plain.sh
-  - id: d
-    script: wait.sh
-    prompt: hi
+    script: { run: plain.sh }
   - id: e
-    role: implementer
+    role: { name: implementer }
+    poll: 1m
+  - id: f
+    script: wait.sh
+    poll: 1m
+  - id: g
+    script: { run: wait.sh }
     poll: 1m
 `;
     const { dir } = await setup(bad, { "wait.sh": WAIT_SH });
     await writeFile(path.join(dir, ".paseo/plugins/playbooks/scripts/plain.sh"), "#!/bin/sh\n");
     const entry = (await loadPlaybooks(dir)).entries.find((candidate) => candidate.id === "wait")!;
-    expect(entry.errors.join("\n")).toMatch(/step "a": script: scripts\/missing.sh not found/);
-    expect(entry.errors.join("\n")).toMatch(/step "b": script: "..\/escape.sh" must be a file name/);
-    expect(entry.errors.join("\n")).toMatch(/step "c": script: scripts\/plain.sh is not executable/);
-    expect(entry.errors.join("\n")).toMatch(/step "d": `prompt` does not apply to a script step/);
-    expect(entry.errors.join("\n")).toMatch(/step "e": `poll` only applies to a script step/);
+    const errors = entry.errors.join("\n");
+    expect(errors).toMatch(/step "a": script.run: scripts\/missing.sh not found/);
+    expect(errors).toMatch(/step "b": script.run: "..\/escape.sh" must be a file name/);
+    expect(errors).toMatch(/step "c": script.run: scripts\/plain.sh is not executable/);
+    expect(errors).toContain('step "e": `poll` only applies to a script step (under `script:`)');
+    expect(errors).toContain('step "f": script: write `script: { run: wait.sh, poll: 1m }`');
+    expect(errors).toContain('step "g": `poll` moved under `script:`: write `script: { run: wait.sh, poll: 1m }`');
   });
 
   it("run by themselves, poll until done, complete, and wake the manager with what is ready", async () => {
@@ -139,7 +143,7 @@ steps:
 title: Wait
 steps:
   - id: check
-    script: fail.sh
+    script: { run: fail.sh }
     retries: 1
 `;
     const { loaded, store, runtime, sent } = await setup(playbook, { "fail.sh": "#!/bin/sh\necho 'gh: not logged in' >&2\nexit 3\n" });
@@ -161,8 +165,7 @@ steps:
 title: Wait
 steps:
   - id: check
-    script: never.sh
-    poll: 1s
+    script: { run: never.sh, poll: 1s }
     timeout: 1s
 `;
     const { loaded, store, runtime } = await setup(playbook, { "never.sh": "#!/bin/sh\nexit 75\n" });
@@ -178,8 +181,7 @@ steps:
 title: Wait
 steps:
   - id: check
-    script: never.sh
-    poll: 1s
+    script: { run: never.sh, poll: 1s }
 `;
     const { loaded, store, runtime } = await setup(playbook, { "never.sh": "#!/bin/sh\nexit 75\n" });
     const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, loaded.playbook!);

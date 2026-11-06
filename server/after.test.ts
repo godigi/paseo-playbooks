@@ -32,17 +32,16 @@ inputs:
   run_status: {}
 steps:
   - id: reflect
-    role: reviewer
+    role: { name: reviewer, prompt: "Reflect on run {{ inputs.run_id }} ({{ inputs.run_status }})." }
     inputs: [run_id, run_status]
     outputs: { notes: {} }
-    prompt: "Reflect on run {{ inputs.run_id }} ({{ inputs.run_status }})."
   - id: propose
-    role: reviewer
+    role: { name: reviewer }
     needs: [reflect]
     inputs: [notes]
 after:
   - id: nested_after
-    role: reviewer
+    role: { name: reviewer }
 `;
 
 const MAIN = `
@@ -53,11 +52,11 @@ outputs:
   plan: {}
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outputs: { plan: {} }
   - id: implement
-    role: implementer
+    role: { name: implementer }
     needs: [investigate]
     inputs: [plan]
     outcomes: [success, give_up]
@@ -65,12 +64,12 @@ steps:
       give_up: fail
 after:
   - id: retro
-    playbook: retro
+    playbook: { name: retro }
     inputs:
       run_id: "{{ run.id }}"
       run_status: "{{ run.status }}"
   - id: notify
-    role: reviewer
+    role: { name: reviewer, prompt: "The run is {{ run.status }}. {{ inputs.status }}" }
     trigger: manual
     inputs:
       plan: ~
@@ -80,7 +79,6 @@ after:
     outcomes: [success, failure, stop]
     on:
       stop: end
-    prompt: "The run is {{ run.status }}. {{ inputs.status }}"
 `;
 
 async function load(files: Record<string, string>): Promise<Map<string, ReturnType<typeof Object>>> {
@@ -136,12 +134,12 @@ describe("after-tasks: loader", () => {
 
   it("refuses needs on an after-task, trigger on a step, run.status in a main step, and clashing ids", async () => {
     const entries = await load({
-      "a.yaml": "steps:\n  - id: x\n    role: reviewer\nafter:\n  - id: y\n    role: reviewer\n    needs: [x]\n",
-      "b.yaml": "steps:\n  - id: x\n    role: reviewer\n    trigger: manual\n",
-      "c.yaml": 'steps:\n  - id: x\n    role: reviewer\n    prompt: "{{ run.status }}"\n',
-      "d.yaml": "steps:\n  - id: x\n    role: reviewer\nafter:\n  - id: x\n    role: reviewer\n",
-      "e.yaml": "steps:\n  - id: x\n    role: reviewer\n    needs: [y]\nafter:\n  - id: y\n    role: reviewer\n",
-      "f.yaml": 'steps:\n  - id: x\n    role: reviewer\n    inputs: { id: "{{ run.id }}" }\n',
+      "a.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\nafter:\n  - id: y\n    role: { name: reviewer }\n    needs: [x]\n",
+      "b.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\n    trigger: manual\n",
+      "c.yaml": 'steps:\n  - id: x\n    role: { name: reviewer, prompt: "{{ run.status }}" }\n',
+      "d.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\nafter:\n  - id: x\n    role: { name: reviewer }\n",
+      "e.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\n    needs: [y]\nafter:\n  - id: y\n    role: { name: reviewer }\n",
+      "f.yaml": 'steps:\n  - id: x\n    role: { name: reviewer }\n    inputs: { id: "{{ run.id }}" }\n',
     });
     const errors = (id: string) => (entries.get(id) as { errors: string[] }).errors.join("\n");
     expect(errors("a")).toMatch(/after "y": `needs` does not apply/);
@@ -154,8 +152,8 @@ describe("after-tasks: loader", () => {
 
   it("applies the parallel-edit rule between after-tasks, not between an after-task and a main step", async () => {
     const entries = await load({
-      "ok.yaml": "steps:\n  - id: x\n    role: implementer\nafter:\n  - id: y\n    role: implementer\n",
-      "bad.yaml": "steps:\n  - id: x\n    role: reviewer\nafter:\n  - id: y\n    role: implementer\n  - id: z\n    role: implementer\n",
+      "ok.yaml": "steps:\n  - id: x\n    role: { name: implementer }\nafter:\n  - id: y\n    role: { name: implementer }\n",
+      "bad.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\nafter:\n  - id: y\n    role: { name: implementer }\n  - id: z\n    role: { name: implementer }\n",
     });
     expect((entries.get("ok") as { errors: string[] }).errors).toEqual([]);
     expect((entries.get("bad") as { errors: string[] }).errors.join("\n")).toMatch(/"y" and "z" can run at the same time/);
@@ -267,7 +265,7 @@ describe("after-tasks: engine", () => {
 
   it("a rejected gate inside an after-task fails the task only", async () => {
     const entries = await load({
-      "g.yaml": "steps:\n  - id: x\n    role: reviewer\nafter:\n  - id: check\n    gate: Was it good?\n",
+      "g.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\nafter:\n  - id: check\n    gate: { question: Was it good? }\n",
     });
     const playbook = (entries.get("g") as { playbook: Playbook }).playbook;
     const run = newRun({ id: "run_g", playbook, workspaceId: "ws", workspaceDir: "/tmp", projectId: "p", branch: null, managerAgentId: "m", inputs: {}, now: now() });
@@ -283,7 +281,7 @@ describe("after-tasks: engine", () => {
   it("does not match run_id, run_status or run_failure by name; says how to map them", async () => {
     const entries = await load({
       "retro.yaml": RETRO,
-      "m.yaml": "steps:\n  - id: x\n    role: reviewer\nafter:\n  - id: retro\n    playbook: retro\n  - id: note\n    role: reviewer\n    inputs: [run_failure]\n",
+      "m.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\nafter:\n  - id: retro\n    playbook: { name: retro }\n  - id: note\n    role: { name: reviewer }\n    inputs: [run_failure]\n",
     });
     const errors = (entries.get("m") as { errors: string[] }).errors.join("\n");
     expect(errors).toContain('after "retro": input "run_id" has no source');
@@ -294,12 +292,12 @@ describe("after-tasks: engine", () => {
   });
 
   it("end in an after-task's sub-playbook: at its top level ends the task; in a nested block ends only that block", async () => {
-    const inner = "inputs:\n  run_id: {}\nsteps:\n  - id: look\n    role: reviewer\n    outcomes: [success, enough]\n    on:\n      enough: end\n  - id: more\n    role: reviewer\n    needs: [look]\n";
-    const outer = "steps:\n  - id: deep\n    playbook: inner\n  - id: wrap\n    role: reviewer\n    needs: [deep]\n    outcomes: [success, done]\n    on:\n      done: end\n  - id: tail\n    role: reviewer\n    needs: [wrap]\n";
+    const inner = "inputs:\n  run_id: {}\nsteps:\n  - id: look\n    role: { name: reviewer }\n    outcomes: [success, enough]\n    on:\n      enough: end\n  - id: more\n    role: { name: reviewer }\n    needs: [look]\n";
+    const outer = "steps:\n  - id: deep\n    playbook: { name: inner }\n  - id: wrap\n    role: { name: reviewer }\n    needs: [deep]\n    outcomes: [success, done]\n    on:\n      done: end\n  - id: tail\n    role: { name: reviewer }\n    needs: [wrap]\n";
     const entries = await load({
       "inner.yaml": inner,
       "outer.yaml": outer,
-      "m.yaml": "steps:\n  - id: x\n    role: reviewer\nafter:\n  - id: retro\n    playbook: outer\n",
+      "m.yaml": "steps:\n  - id: x\n    role: { name: reviewer }\nafter:\n  - id: retro\n    playbook: { name: outer }\n",
     });
     const entry = entries.get("m") as { errors: string[]; playbook: Playbook };
     expect(entry.errors).toEqual([]);

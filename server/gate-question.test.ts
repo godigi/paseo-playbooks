@@ -19,10 +19,11 @@ const MAIN = `
 title: Main
 steps:
   - id: approve
-    gate: Ship it?
-    choices:
-      approved: { label: Ship }
-      rejected: { label: Request changes, comment: required, color: danger }
+    gate:
+      question: Ship it?
+      choices:
+        approved: { label: Ship }
+        rejected: { label: Request changes, comment: required, color: danger }
     on:
       rejected: fail
 `;

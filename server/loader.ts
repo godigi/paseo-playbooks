@@ -77,34 +77,39 @@ const RawTransitionSchema = z.union([
   z.object({ goto: z.string(), max_loops: z.number().int().positive().optional() }),
 ]);
 
-const RawStepSchema = z.object({
-    id: z.string(),
-    /** Full name (details panel, graph); on a playbook step, the block's frame. Default: the id, capitalised. */
-    title: z.string().min(1).optional(),
-    /** Name in the Playbooks screen columns. Default: the title. */
-    short_title: z.string().min(1).optional(),
-    needs: z.array(z.string()).default([]),
-    role: z.string().optional(),
-    gate: z.string().optional(),
-    /** A sub-playbook from the same folder, run in place of this step. */
-    playbook: z.string().optional(),
-    /** An executable in the folder's scripts/, run by the plugin itself. */
-    script: z.string().optional(),
-    /** Script steps: rerun the script this often while it exits with SCRIPT_NOT_YET (`30s`, `1m`). */
-    poll: z.string().optional(),
+/**
+ * A step kind's block. A plain string (the form before blocks) passes through as a string so
+ * the loader can refuse it with what to write instead; anything else must match the block.
+ */
+function kindBlock<T extends z.ZodType>(block: T) {
+  return z.unknown().transform((value, ctx): string | z.output<T> => {
+    if (typeof value === "string") return value;
+    const parsed = block.safeParse(value);
+    if (parsed.success) return parsed.data;
+    for (const issue of parsed.error.issues) ctx.addIssue({ ...issue } as Parameters<typeof ctx.addIssue>[0]);
+    return z.NEVER;
+  });
+}
+
+/** An agent step: the role and the options that only apply to its agent. */
+const RawRoleStepSchema = z
+  .object({
+    /** A role in the folder's roles/. */
+    name: z.string().min(1),
     prompt: z.string().optional(),
-    inputs: z.union([z.array(z.string()), z.record(z.string(), z.string().nullable())]).optional(),
-    outputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
-    outcomes: z.array(z.string()).min(1).optional(),
-    retries: z.number().int().min(0).default(0),
-    timeout: z.string().optional(),
-    /** Agent steps: remind the agent after this long without activity (`30m`), or `off`. */
+    /** Remind the agent after this long without activity (`30m`), or `off`. */
     silence: z.string().optional(),
-    /** Agent steps: archive the step's agents once it completes or its flow ends, and each attempt's once the next starts. Default true. */
+    /** Archive the step's agents once it completes or its flow ends, and each attempt's once the next starts. Default true. */
     archive_agents: z.boolean().optional(),
     agent: AgentSettingsSchema.optional(),
-    on: z.record(z.string(), RawTransitionSchema).optional(),
-    /** Gates only: the buttons, in order. Keys are the outcomes; the first one continues by default. */
+  })
+  .strict();
+
+/** A human gate: the question and its buttons. */
+const RawGateStepSchema = z
+  .object({
+    question: z.string().min(1),
+    /** The buttons, in order. Keys are the outcomes; the first one continues by default. */
     choices: z
       .record(
         z.string(),
@@ -117,6 +122,49 @@ const RawStepSchema = z.object({
           .nullable(),
       )
       .optional(),
+  })
+  .strict();
+
+/** A script step: an executable in the folder's scripts/, run by the plugin itself. */
+const RawScriptStepSchema = z
+  .object({
+    run: z.string().min(1),
+    /** Rerun the script this often while it exits with SCRIPT_NOT_YET (`30s`, `1m`). */
+    poll: z.string().optional(),
+  })
+  .strict();
+
+/** A sub-playbook from the same folder, run in place of this step. */
+const RawPlaybookStepSchema = z.object({ name: z.string().min(1) }).strict();
+
+/** Fields that moved into a kind's block; read flat only to refuse them with the new form. */
+const MOVED_FIELDS = { prompt: "role", silence: "role", archive_agents: "role", agent: "role", choices: "gate", poll: "script" } as const;
+type MovedField = keyof typeof MOVED_FIELDS;
+
+const RawStepSchema = z.object({
+    id: z.string(),
+    /** Full name (details panel, graph); on a playbook step, the block's frame. Default: the id, capitalised. */
+    title: z.string().min(1).optional(),
+    /** Name in the Playbooks screen columns. Default: the title. */
+    short_title: z.string().min(1).optional(),
+    needs: z.array(z.string()).default([]),
+    role: kindBlock(RawRoleStepSchema).optional(),
+    gate: kindBlock(RawGateStepSchema).optional(),
+    playbook: kindBlock(RawPlaybookStepSchema).optional(),
+    script: kindBlock(RawScriptStepSchema).optional(),
+    inputs: z.union([z.array(z.string()), z.record(z.string(), z.string().nullable())]).optional(),
+    outputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
+    outcomes: z.array(z.string()).min(1).optional(),
+    retries: z.number().int().min(0).default(0),
+    timeout: z.string().optional(),
+    on: z.record(z.string(), RawTransitionSchema).optional(),
+    /** Moved into the kind blocks (`role:`, `gate:`, `script:`); read here to refuse them. */
+    prompt: z.unknown().optional(),
+    silence: z.unknown().optional(),
+    archive_agents: z.unknown().optional(),
+    agent: z.unknown().optional(),
+    choices: z.unknown().optional(),
+    poll: z.unknown().optional(),
     /** Only on after-tasks; read here to refuse it on a step. */
     trigger: z.unknown().optional(),
   });
@@ -156,8 +204,19 @@ const RawDefaultsSchema = z.object({
     agent: AgentSettingsSchema.optional(),
     manager: AgentSettingsSchema.optional(),
     timeout: z.string().optional(),
-    silence: z.string().optional(),
-    archive_agents: z.boolean().optional(),
+    /** Defaults for agent steps, in the shape of a step's `role:` block. */
+    role: z
+      .object({
+        /** Remind an agent after this long without activity (`30m`), or `off`. */
+        silence: z.string().optional(),
+        /** Archive a step's agents once it is done. Default true. */
+        archive_agents: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    /** Moved under `role:`; read here to refuse them. */
+    silence: z.unknown().optional(),
+    archive_agents: z.unknown().optional(),
   });
 type RawDefaults = z.infer<typeof RawDefaultsSchema>;
 
@@ -258,13 +317,44 @@ async function loadDefaults(root: string, relDir: string): Promise<{ defaults: R
   const parsed = RawDefaultsSchema.safeParse(raw.value);
   if (!parsed.success) return { defaults: {}, errors: formatZodError(rel, parsed.error) };
   const errors: string[] = [];
+  const flat = (["silence", "archive_agents"] as const).filter((field) => parsed.data[field] !== undefined);
+  if (flat.length > 0) {
+    const block = flowMap({ ...parsed.data.role, ...Object.fromEntries(flat.map((field) => [field, parsed.data[field]])) });
+    errors.push(`${rel}: ${codeList(flat)} moved under \`role:\`: write \`role: ${block}\``);
+  }
   if (parsed.data.timeout && parseDuration(parsed.data.timeout) === null) {
     errors.push(`${rel}: timeout: expected a duration such as 30m or 2h`);
   }
-  if (parsed.data.silence && parseSilence(parsed.data.silence) === null) {
-    errors.push(`${rel}: silence: expected a duration such as 30m, or off`);
+  if (parsed.data.role?.silence && parseSilence(parsed.data.role.silence) === null) {
+    errors.push(`${rel}: role.silence: expected a duration such as 30m, or off`);
   }
   return { defaults: parsed.data, errors };
+}
+
+/** A value written as YAML flow, for error messages: short scalars as they are, the rest as `…`. */
+function flowValue(value: unknown): string {
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "string") {
+    if (value.includes("\n") || value.length > 40) return "…";
+    return /^[\w./-][\w ./?-]*$/.test(value) && !/^(true|false|null|~)$/.test(value) ? value : JSON.stringify(value);
+  }
+  if (value === null) return "~";
+  if (value instanceof Placeholder) return value.text;
+  if (Array.isArray(value)) return "[ … ]";
+  if (typeof value === "object") return flowMap(value as Record<string, unknown>);
+  return "…";
+}
+
+/** `a`, `b` and `c`. */
+function codeList(names: readonly string[]): string {
+  const quoted = names.map((name) => `\`${name}\``);
+  return quoted.length > 1 ? `${quoted.slice(0, -1).join(", ")} and ${quoted.at(-1)}` : quoted[0] ?? "";
+}
+
+/** A map written as one-line YAML flow, for error messages. */
+function flowMap(fields: Record<string, unknown>): string {
+  const entries = Object.entries(fields).filter(([, value]) => value !== undefined);
+  return `{ ${entries.map(([key, value]) => `${key}: ${flowValue(value)}`).join(", ")} }`;
 }
 
 // ------------------------------------------------------------------ playbooks
@@ -394,7 +484,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   entry.hidden = pb.hidden;
   const errors: string[] = [];
   const err = (message: string) => errors.push(`${file}: ${message}`);
-  if (pb.next !== undefined) err("`next` was removed; include the other playbook as a sub-playbook step (`playbook: <id>`) instead");
+  if (pb.next !== undefined) err("`next` was removed; include the other playbook as a sub-playbook step (`playbook: { name: <id> }`) instead");
 
   // Playbook inputs.
   const inputs: Record<string, VarDef> = {};
@@ -418,7 +508,6 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   };
 
   // Main steps, then after-tasks as steps of their own (no needs), marked with their task id.
-  type RawStep = z.infer<typeof RawStepSchema>;
   const rawAll: Array<{ raw: RawStep; task: string | undefined }> = [
     ...pb.steps.map((raw) => ({ raw, task: undefined })),
     ...(pb.after ?? []).map((raw) => ({ raw: { ...raw, needs: [] } as RawStep, task: raw.id })),
@@ -428,7 +517,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
 
   // Roles used by agent steps.
   const roles: Record<string, Role> = {};
-  for (const roleId of new Set(rawAll.flatMap(({ raw: step }) => (step.role ? [step.role] : [])))) {
+  for (const roleId of new Set(rawAll.flatMap(({ raw: step }) => kindBlocks(step).role?.name ?? []))) {
     const loaded = await role(roleId);
     if (loaded.role) roles[roleId] = loaded.role;
     else errors.push(...loaded.errors.map((message) => `${file}: role "${roleId}": ${message}`));
@@ -439,7 +528,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   const steps: Step[] = [];
   const blocks = new Map<string, Playbook>();
   const defaultTimeout = defaults.timeout ? parseDuration(defaults.timeout) ?? undefined : undefined;
-  const defaultSilence = defaults.silence ? parseSilence(defaults.silence) ?? undefined : undefined;
+  const defaultSilence = defaults.role?.silence ? parseSilence(defaults.role.silence) ?? undefined : undefined;
   for (const { raw: rawStep, task } of rawAll) {
     const where = task ? `after "${rawStep.id}"` : `step "${rawStep.id}"`;
     const afterTask = task ? { afterTask: task } : {};
@@ -447,19 +536,20 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (RESERVED_STEP_IDS.has(rawStep.id)) err(`${where}: "${rawStep.id}" is reserved`);
     if (seen.has(rawStep.id)) err(`${where}: duplicate id`);
     seen.add(rawStep.id);
-    const isGate = rawStep.gate !== undefined;
-    const isBlock = rawStep.playbook !== undefined;
-    const isScript = rawStep.script !== undefined;
-    if ([rawStep.role, rawStep.gate, rawStep.playbook, rawStep.script].filter((value) => value !== undefined).length !== 1) {
+    const { role: roleStep, gate: gateStep, script: scriptStep, playbook: playbookStep } = kindBlocks(rawStep);
+    const isGate = gateStep !== undefined;
+    const isBlock = playbookStep !== undefined;
+    const isScript = scriptStep !== undefined;
+    if ([roleStep, gateStep, playbookStep, scriptStep].filter((value) => value !== undefined).length !== 1) {
       err(`${where}: set exactly one of \`role\`, \`gate\`, \`playbook\` or \`script\``);
     }
-    if (!isScript && rawStep.poll !== undefined) err(`${where}: \`poll\` only applies to a script step`);
+    refuseFlatForms(where, rawStep, err);
     if (isBlock) {
-      for (const field of ["prompt", "outputs", "outcomes", "timeout", "silence", "archive_agents", "agent", "choices"] as const) {
+      for (const field of ["outputs", "outcomes", "timeout"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a playbook step (the sub-playbook defines it)`);
       }
       if (rawStep.short_title !== undefined) err(`${where}: \`short_title\` does not apply to a playbook step (its steps are the columns)`);
-      const subId = rawStep.playbook!;
+      const subId = playbookStep.name;
       let sub: Playbook | null = null;
       if (subId === id || stack.includes(subId)) {
         err(`${where}: playbook "${subId}" includes itself (${[...stack, id, subId].join(" → ")})`);
@@ -508,32 +598,28 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       continue;
     }
     if (isGate) {
-      for (const field of ["prompt", "inputs", "outputs", "outcomes", "timeout", "silence", "archive_agents", "agent"] as const) {
+      for (const field of ["inputs", "outputs", "outcomes", "timeout"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a gate`);
       }
     }
-    if (!isGate && rawStep.choices !== undefined) err(`${where}: \`choices\` only applies to a gate`);
     let script: string | undefined;
     let pollMs: number | undefined;
-    if (isScript) {
-      for (const field of ["prompt", "silence", "archive_agents", "agent"] as const) {
-        if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a script step`);
-      }
-      const checked = await checkScript(root, rawStep.script!);
-      if ("error" in checked) err(`${where}: script: ${checked.error}`);
+    if (scriptStep) {
+      const checked = await checkScript(root, scriptStep.run);
+      if ("error" in checked) err(`${where}: script.run: ${checked.error}`);
       else script = `${folder.relDir}/scripts/${checked.name}`;
-      if (rawStep.poll !== undefined) {
-        pollMs = parseDuration(rawStep.poll) ?? undefined;
-        if (pollMs === undefined) err(`${where}: poll: expected a duration such as 30s or 1m`);
+      if (scriptStep.poll !== undefined) {
+        pollMs = parseDuration(scriptStep.poll) ?? undefined;
+        if (pollMs === undefined) err(`${where}: script.poll: expected a duration such as 30s or 1m`);
       }
     }
-    const choices: GateChoice[] = Object.entries(isGate ? rawStep.choices ?? {} : {}).map(([id, raw]) => {
-      if (!ID.test(id)) err(`${where}: choices.${id}: invalid name (lowercase letters, digits, - and _)`);
+    const choices: GateChoice[] = Object.entries(gateStep?.choices ?? {}).map(([id, raw]) => {
+      if (!ID.test(id)) err(`${where}: gate.choices.${id}: invalid name (lowercase letters, digits, - and _)`);
       const choice: GateChoice = { id, label: raw?.label ?? stepLabel(id.replace(/[_-]+/g, " ")), comment: raw?.comment ?? "none" };
       if (raw?.color) choice.color = raw.color;
       return choice;
     });
-    if (isGate && rawStep.choices !== undefined && choices.length === 0) err(`${where}: choices: declare at least one choice`);
+    if (gateStep?.choices !== undefined && choices.length === 0) err(`${where}: gate.choices: declare at least one choice`);
     const outcomes = isGate ? (choices.length > 0 ? choices.map((choice) => choice.id) : GATE_OUTCOMES) : rawStep.outcomes ?? AGENT_OUTCOMES;
     const on: Record<string, Transition> = {};
     for (const [outcome, transition] of Object.entries(rawStep.on ?? {})) {
@@ -623,35 +709,35 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       if (timeoutMs === undefined) err(`${where}: timeout: expected a duration such as 30m or 2h`);
     }
     let silenceMs = defaultSilence;
-    if (rawStep.silence !== undefined) {
-      silenceMs = parseSilence(rawStep.silence) ?? undefined;
-      if (silenceMs === undefined) err(`${where}: silence: expected a duration such as 30m, or off`);
+    if (roleStep?.silence !== undefined) {
+      silenceMs = parseSilence(roleStep.silence) ?? undefined;
+      if (silenceMs === undefined) err(`${where}: role.silence: expected a duration such as 30m, or off`);
     }
-    const stepRole = rawStep.role ? roles[rawStep.role] : undefined;
+    const stepRole = roleStep ? roles[roleStep.name] : undefined;
     const step: Step = {
       id: rawStep.id,
       kind: isGate ? "gate" : isScript ? "script" : "agent",
       needs: rawStep.needs,
-      prompt: rawStep.prompt ?? "",
+      prompt: roleStep?.prompt ?? "",
       inputs: {},
       outputs,
       outcomes,
       retries: rawStep.retries,
-      agent: isGate || isScript ? {} : mergeAgent(defaults.agent, pb.agent, stepRole?.agent, rawStep.agent),
+      agent: isGate || isScript ? {} : mergeAgent(defaults.agent, pb.agent, stepRole?.agent, roleStep?.agent),
       on,
       choices,
       ...afterTask,
     };
     if (rawStep.title !== undefined) step.title = rawStep.title;
     if (rawStep.short_title !== undefined) step.shortTitle = rawStep.short_title;
-    if (rawStep.role) step.role = rawStep.role;
-    if (rawStep.gate !== undefined) step.gate = rawStep.gate;
+    if (roleStep) step.role = roleStep.name;
+    if (gateStep) step.gate = gateStep.question;
     if (script !== undefined) step.script = script;
     if (pollMs !== undefined) step.pollMs = pollMs;
     if (timeoutMs !== undefined && !isGate) step.timeoutMs = timeoutMs;
     if (timeoutTemplate !== undefined && !isGate) step.timeout = timeoutTemplate;
     if (silenceMs !== undefined && !isGate && !isScript) step.silenceMs = silenceMs;
-    const archiveAgents = rawStep.archive_agents ?? defaults.archive_agents;
+    const archiveAgents = roleStep?.archive_agents ?? defaults.role?.archive_agents;
     if (archiveAgents !== undefined && !isGate && !isScript) step.archiveAgents = archiveAgents;
     steps.push(step);
   }
@@ -760,6 +846,62 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   };
   if (pb.concurrency !== undefined) entry.playbook.concurrency = pb.concurrency;
   return { entry };
+}
+
+type RawStep = z.infer<typeof RawStepSchema>;
+type KindBlocks = {
+  role?: z.output<typeof RawRoleStepSchema>;
+  gate?: z.output<typeof RawGateStepSchema>;
+  script?: z.output<typeof RawScriptStepSchema>;
+  playbook?: z.output<typeof RawPlaybookStepSchema>;
+};
+type Kind = keyof KindBlocks;
+const KINDS: Kind[] = ["role", "gate", "script", "playbook"];
+/** The required field of each kind's block: what the plain-string form held. */
+const KIND_MAIN = { role: "name", gate: "question", script: "run", playbook: "name" } as const;
+const KIND_NAMES = { role: "an agent step", gate: "a gate", script: "a script step", playbook: "a playbook step" } as const;
+
+/** A step's kind blocks, with a plain-string kind (refused by refuseFlatForms) read as its block's main field. */
+function kindBlocks(raw: RawStep): KindBlocks {
+  const blocks: KindBlocks = {};
+  for (const kind of KINDS) {
+    const value = raw[kind];
+    if (value === undefined) continue;
+    (blocks as Record<Kind, unknown>)[kind] = typeof value === "string" ? { [KIND_MAIN[kind]]: value } : value;
+  }
+  return blocks;
+}
+
+/** Text placed as-is in a flow map of an error message. */
+class Placeholder {
+  constructor(readonly text: string) {}
+}
+
+/**
+ * Refuses the forms from before kind blocks, saying what to write: a plain-string kind
+ * (`role: reviewer`), or a kind's field written flat on the step (`poll: 30s`).
+ */
+function refuseFlatForms(where: string, raw: RawStep, err: (message: string) => void): void {
+  const kinds = KINDS.filter((kind) => raw[kind] !== undefined);
+  const moved = (Object.keys(MOVED_FIELDS) as MovedField[]).filter((field) => raw[field] !== undefined);
+  const flat = (fields: MovedField[]) => Object.fromEntries(fields.map((field) => [field, raw[field]]));
+  const reported = new Set<MovedField>();
+  for (const kind of kinds) {
+    const value = raw[kind];
+    if (typeof value !== "string") continue;
+    const own = moved.filter((field) => MOVED_FIELDS[field] === kind);
+    for (const field of own) reported.add(field);
+    err(`${where}: ${kind}: write \`${kind}: ${flowMap({ [KIND_MAIN[kind]]: value, ...flat(own) })}\``);
+  }
+  const misplaced = moved.filter((field) => !reported.has(field) && kinds.length > 0 && !kinds.includes(MOVED_FIELDS[field]));
+  for (const field of misplaced) err(`${where}: \`${field}\` only applies to ${KIND_NAMES[MOVED_FIELDS[field]]} (under \`${MOVED_FIELDS[field]}:\`)`);
+  for (const kind of new Set(moved.filter((field) => !reported.has(field) && !misplaced.includes(field)).map((field) => MOVED_FIELDS[field]))) {
+    const own = moved.filter((field) => MOVED_FIELDS[field] === kind);
+    const block = (raw[kind] ?? {}) as Record<string, unknown>;
+    const main = KIND_MAIN[kind];
+    const placeholder = new Placeholder(kind === "gate" ? '"…"' : `<${kind === "role" ? "role" : "script"}>`);
+    err(`${where}: ${codeList(own)} moved under \`${kind}:\`: write \`${kind}: ${flowMap({ [main]: block[main] ?? placeholder, ...block, ...flat(own) })}\``);
+  }
 }
 
 /** What an ask choice's `outputs` may read besides `inputs.<name>` and `report.outputs.<name>`. */

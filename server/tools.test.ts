@@ -36,16 +36,16 @@ inputs:
   request: { required: true }
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator }
     inputs: [request]
     outputs: { plan: {} }
   - id: implement
-    role: implementer
+    role: { name: implementer }
     needs: [investigate]
     inputs: [plan]
 after:
   - id: retro
-    role: reviewer
+    role: { name: reviewer }
     trigger: manual
 `;
 

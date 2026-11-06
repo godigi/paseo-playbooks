@@ -33,13 +33,13 @@ function fakePaseo(state: { activity: string | null; stepStatus?: string }) {
   return { paseo: { agents: { ref } }, sent };
 }
 
-async function setup(options: { step?: string; startedAgo: number; activity?: string | null; stepStatus?: string }) {
+async function setup(options: { step?: string; role?: string; startedAgo: number; activity?: string | null; stepStatus?: string }) {
   const dir = await mkdtemp(path.join(tmpdir(), "silence-"));
   temps.push(dir);
   const root = path.join(dir, ".paseo/playbooks");
   await mkdir(root, { recursive: true });
   await cp(path.join(EXAMPLES, ".paseo/plugins/playbooks/roles"), path.join(root, "roles"), { recursive: true });
-  await writeFile(path.join(root, "release.yaml"), `steps:\n  - id: release\n    role: implementer\n    outputs: { pr: {} }\n${options.step ?? ""}`);
+  await writeFile(path.join(root, "release.yaml"), `steps:\n  - id: release\n    role: { name: implementer${options.role ?? ""} }\n    outputs: { pr: {} }\n${options.step ?? ""}`);
   const playbook = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "release")!.playbook!;
   const store = new RunStore(path.join(dir, "runs"));
   await store.init();
@@ -78,7 +78,7 @@ describe("a running step that goes silent", () => {
     expect(active.sent).toEqual([]);
     expect(active.store.get("run_x")!.steps.release!.attempts[0]!.silenceReminded).toBe(false);
 
-    const off = await setup({ step: "    silence: off\n", startedAgo: 5 * 60 * MIN, activity: null });
+    const off = await setup({ role: ", silence: off", startedAgo: 5 * 60 * MIN, activity: null });
     await off.runtime.checkSilence("run_x", "release", "step-1");
     expect(off.sent).toEqual([]);
   });

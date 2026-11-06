@@ -67,16 +67,17 @@ inputs:
 
 steps:
   - id: write
-    role: writer
-    agent: { mode: acceptEdits }
+    role:
+      name: writer
+      agent: { mode: acceptEdits }
+      prompt: "Add a short NOTES.md section about {{ inputs.topic }}."
     inputs: [topic]
     outputs:
       changes: { type: string }
-    prompt: "Add a short NOTES.md section about {{ inputs.topic }}."
 
   - id: approve
     needs: [write]
-    gate: Approve the note, or reject it with a comment to send it back.
+    gate: { question: "Approve the note, or reject it with a comment to send it back." }
     on:
       rejected: { goto: write }</code></pre>
 <p>The <a href="reference.html">reference</a> lists every field, and the <a href="examples.html">examples</a> page has a full pull-request playbook.</p>

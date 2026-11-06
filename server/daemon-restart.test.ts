@@ -47,7 +47,7 @@ async function restarted(prepare: (run: ReturnType<typeof newRun>) => void, agen
   await cp(path.join(EXAMPLES, ".paseo/plugins/playbooks/roles"), path.join(root, "roles"), { recursive: true });
   await writeFile(
     path.join(root, "two.yaml"),
-    "steps:\n  - id: investigate\n    role: investigator\n    outputs: { plan: {} }\n  - id: implement\n    role: implementer\n    needs: [investigate]\n    outputs: { pr: {} }\n",
+    "steps:\n  - id: investigate\n    role: { name: investigator }\n    outputs: { plan: {} }\n  - id: implement\n    role: { name: implementer }\n    needs: [investigate]\n    outputs: { pr: {} }\n",
   );
   const playbook = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "two")!.playbook!;
   const store = new RunStore(path.join(dir, "runs"));

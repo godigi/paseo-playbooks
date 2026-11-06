@@ -95,7 +95,7 @@ export function scriptResult(
   }
   const why =
     exit.code === SCRIPT_NOT_YET
-      ? `exit ${SCRIPT_NOT_YET} ("not yet"), but the step has no \`poll\``
+      ? `exit ${SCRIPT_NOT_YET} ("not yet"), but the step has no \`script.poll\``
       : exit.code !== null
         ? `exit ${exit.code}`
         : `killed by ${exit.signal ?? "a signal"}`;
