@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import { Pressable, Text, View } from "react-native";
 import { isTerminal, type Run } from "../shared/types";
 import type { Theme } from "./theme";
@@ -14,10 +15,14 @@ export function trainName(run: Run): string {
   return `${cut === -1 ? (run.train?.station ?? title) : title.slice(cut + 3)} train`;
 }
 
+/** "1 job", "3 jobs". */
+function jobsLabel(count: number): string {
+  return `${count} ${count === 1 ? "job" : "jobs"}`;
+}
+
 /** Jobs not ended yet, on a pipeline: "1 job", "3 jobs". */
 export function openJobsLabel(pipeline: Run): string {
-  const count = pipeline.jobs.filter((job) => job.status === "open").length;
-  return `${count} ${count === 1 ? "job" : "jobs"}`;
+  return jobsLabel(pipeline.jobs.filter((job) => job.status === "open").length);
 }
 
 /**
@@ -29,7 +34,8 @@ export function Stations(props: { theme: Theme; pipeline: Run; runs: readonly Ru
   const stations = pipeline.playbook.singleton?.stations ?? [];
   const trains = trainsOf(pipeline, props.runs);
   return (
-    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+    // The stations share the row's width, with an arrow between each one and the next.
+    <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
       {stations.map((station, index) => {
         const waiting = pipeline.jobs
           .filter((job) => job.status === "open" && job.waiting.some((place) => place.station === station.id))
@@ -38,43 +44,48 @@ export function Stations(props: { theme: Theme; pipeline: Run; runs: readonly Ru
         const last = trains.find((candidate) => candidate.train!.station === station.id && isTerminal(candidate.status));
         const riding = train ? train.jobs.filter((job) => job.status === "open").length : 0;
         return (
-          <View
-            key={station.id}
-            accessibilityLabel={`Station ${station.title}: ${waiting.length} job(s) waiting, ${train ? `train ${train.id} running with ${riding} job(s)` : "no train running"}`}
-            style={{ width: 240, borderRadius: 10, borderWidth: 1, borderColor: train ? theme.colors.accent : theme.colors.border, backgroundColor: theme.colors.surface1, padding: 10, gap: 6 }}
-          >
-            <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }}>
-              {index > 0 ? "→ " : ""}
-              {station.title}
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "400" }}> · {station.mode}</Text>
-            </Text>
-            <View style={{ gap: 2 }}>
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Waiting list</Text>
-              {waiting.length === 0 ? (
-                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>empty</Text>
-              ) : (
-                waiting.map((job) => (
-                  <Text key={job.id} numberOfLines={1} style={{ color: theme.colors.statusWarning, fontSize: 12 }}>
-                    {job.label}
+          <Fragment key={station.id}>
+            {index > 0 ? (
+              <Text accessibilityElementsHidden importantForAccessibility="no" style={{ color: theme.colors.foregroundMuted, fontSize: 14 }}>
+                →
+              </Text>
+            ) : null}
+            <View
+              accessibilityLabel={`Station ${station.title}: ${jobsLabel(waiting.length)} waiting, ${train ? `train ${train.id} running with ${jobsLabel(riding)}` : "no train running"}`}
+              style={{ flexGrow: 1, flexBasis: 0, minWidth: 200, alignSelf: "stretch", borderRadius: 10, borderWidth: 1, borderColor: train ? theme.colors.accent : theme.colors.border, backgroundColor: theme.colors.surface1, padding: 10, gap: 6 }}
+            >
+              <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }}>
+                {station.title}
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "400" }}> · {station.mode}</Text>
+              </Text>
+              <View style={{ gap: 2 }}>
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Waiting list</Text>
+                {waiting.length === 0 ? (
+                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>empty</Text>
+                ) : (
+                  waiting.map((job) => (
+                    <Text key={job.id} numberOfLines={1} style={{ color: theme.colors.statusWarning, fontSize: 12 }}>
+                      {job.label}
+                    </Text>
+                  ))
+                )}
+              </View>
+              <View style={{ gap: 2 }}>
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Train</Text>
+                {train ? (
+                  <Pressable accessibilityRole="button" accessibilityLabel={`Open train ${train.id}`} disabled={!props.onOpenTrain} onPress={() => props.onOpenTrain?.(train)}>
+                    <Text numberOfLines={2} style={{ color: theme.colors.accent, fontSize: 12 }}>
+                      {train.id.replace(/^run_/, "")} · {jobsLabel(riding)} · {train.status === "waiting_gate" ? "waiting for a human" : "running"}
+                    </Text>
+                  </Pressable>
+                ) : (
+                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>
+                    {last ? `None running · last ${last.id.replace(/^run_/, "")} ${last.status}` : "None yet"}
                   </Text>
-                ))
-              )}
+                )}
+              </View>
             </View>
-            <View style={{ gap: 2 }}>
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Train</Text>
-              {train ? (
-                <Pressable accessibilityRole="button" accessibilityLabel={`Open train ${train.id}`} disabled={!props.onOpenTrain} onPress={() => props.onOpenTrain?.(train)}>
-                  <Text numberOfLines={2} style={{ color: theme.colors.accent, fontSize: 12 }}>
-                    {train.id.replace(/^run_/, "")} · {riding} job(s) · {train.status === "waiting_gate" ? "waiting for a human" : "running"}
-                  </Text>
-                </Pressable>
-              ) : (
-                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>
-                  none{last ? ` (last: ${last.id.replace(/^run_/, "")}, ${last.status})` : ""}
-                </Text>
-              )}
-            </View>
-          </View>
+          </Fragment>
         );
       })}
     </View>
