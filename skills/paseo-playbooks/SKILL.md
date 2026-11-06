@@ -352,6 +352,10 @@ A **hand-off step** gives a singleton a job and waits until the job leaves the p
 - The plugin starts it and completes it; the manager never calls `start_step` or
   `complete_step` for it. Canceling the run, or a `goto` that resets the step, withdraws the
   job. While the run is paused, a result waits for the resume.
+- When a train carrying the job waits for a human (a gate or an ask), the manager is told, and
+  told again once it is decided, so it can pass it on where it reports (a chat or a thread). The
+  decision is made in the Playbooks panel, on the singleton's card: the gate belongs to the
+  train, not to the handing-off run.
 - A hand-off that leads back to its own playbook is refused.
 
 ### Sub-playbooks
