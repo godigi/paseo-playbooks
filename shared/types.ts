@@ -414,6 +414,8 @@ export const RunSchema = z.object({
   projectId: z.string(),
   branch: z.string().nullable(),
   managerAgentId: z.string(),
+  /** A short name the Playbook Manager gave the run (e.g. "login-redirect-fix"): its tab label. */
+  name: z.string().nullable().default(null),
   inputs: z.record(z.string(), VarValueSchema),
   outputs: z.record(z.string(), VarValueSchema).nullable(),
   status: RunStatusSchema,
