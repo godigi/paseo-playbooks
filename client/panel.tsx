@@ -506,6 +506,7 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             <>
             <View style={{ paddingHorizontal: 10, paddingTop: 6, gap: 4 }}>
               {[
+                ["Run", run.id],
                 ["Branch", run.branch ?? "(unknown)"],
                 ["Started", new Date(run.createdAt).toLocaleString()],
               ].map(([label, value]) => (
@@ -673,10 +674,21 @@ function ErrorCallout(props: { theme: Theme; file: string; errors: string[] }) {
   );
 }
 
-/** A run's tab label: its short id, after the train's name for a train. */
+/** Longest tab label made from an input, before it is cut with an ellipsis. */
+const INPUT_LABEL_MAX = 24;
+
+/**
+ * A run's tab label: the name its manager gave it, else its first text input's first line,
+ * else its short id. A train: its station's name and short id.
+ */
 function runLabel(run: Run): string {
   const id = run.id.replace(/^run_/, "");
-  return run.train ? `${trainName(run)} · ${id}` : id;
+  if (run.train) return `${trainName(run)} · ${id}`;
+  if (run.name) return run.name;
+  const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
+  if (!text) return id;
+  const line = text.trim().split("\n")[0]!.trim();
+  return line.length > INPUT_LABEL_MAX ? `${line.slice(0, INPUT_LABEL_MAX - 1).trimEnd()}…` : line;
 }
 
 function toneColor(theme: Theme, tone: RunTone): string {

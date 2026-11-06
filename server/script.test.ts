@@ -121,7 +121,7 @@ steps:
 
   it("run by themselves, poll until done, complete, and wake the manager with what is ready", async () => {
     const { loaded, store, runtime, sent } = await setup(POLLING, { "wait.sh": WAIT_SH });
-    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", { pr: "https://x/pull/7" }, loaded.playbook!);
+    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", { pr: "https://x/pull/7" }, { playbook: loaded.playbook! });
     expect(store.get(run.id)!.steps.wait_merge!.status).toBe("running");
     await expect(runtime.startStep("m", run.id, "wait_merge", "")).rejects.toThrow(/script step: the plugin runs it by itself/);
     await until(() => store.get(run.id)!.steps.wait_merge!.status === "completed");
@@ -147,7 +147,7 @@ steps:
     retries: 1
 `;
     const { loaded, store, runtime, sent } = await setup(playbook, { "fail.sh": "#!/bin/sh\necho 'gh: not logged in' >&2\nexit 3\n" });
-    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, loaded.playbook!);
+    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, { playbook: loaded.playbook! });
     await until(() => store.get(run.id)!.status === "failed");
     // The manager is told just after the run fails, asynchronously.
     await until(() => sent.some((entry) => entry.agentId === "m"));
@@ -169,7 +169,7 @@ steps:
     timeout: 1s
 `;
     const { loaded, store, runtime } = await setup(playbook, { "never.sh": "#!/bin/sh\nexit 75\n" });
-    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, loaded.playbook!);
+    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, { playbook: loaded.playbook! });
     await until(() => store.get(run.id)!.status === "failed");
     const attempt = store.get(run.id)!.steps.check!.attempts[0]!;
     expect(attempt.turnEnd).toBe("timeout");
@@ -184,7 +184,7 @@ steps:
     script: { run: never.sh, poll: 1s }
 `;
     const { loaded, store, runtime } = await setup(playbook, { "never.sh": "#!/bin/sh\nexit 75\n" });
-    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, loaded.playbook!);
+    const run = await runtime.startPlaybook({ id: "m", workspaceId: "ws", cwd: "/" }, "wait", {}, { playbook: loaded.playbook! });
     await until(() => store.get(run.id)!.steps.check!.attempts[0]!.checks >= 1);
     await runtime.cancelRun(run.id, "no longer needed", null);
     const checks = store.get(run.id)!.steps.check!.attempts[0]!.checks;

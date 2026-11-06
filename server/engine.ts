@@ -67,6 +67,7 @@ export interface NewRunInput {
   projectId: string;
   branch: string | null;
   managerAgentId: string;
+  name?: string | null;
   inputs: Record<string, unknown>;
   now: string;
 }
@@ -146,6 +147,7 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, kind: "
     projectId: input.projectId,
     branch: input.branch,
     managerAgentId: input.managerAgentId,
+    name: input.name ?? null,
     inputs,
     outputs: null,
     status: "running",

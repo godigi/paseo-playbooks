@@ -69,6 +69,15 @@ function shortId(): string {
   return randomBytes(3).toString("hex");
 }
 
+/** Longest run name kept: it labels a tab. */
+const RUN_NAME_MAX = 32;
+
+/** The manager's name for a run, on one line and cut to fit a tab; none when blank. */
+export function runName(name: string | undefined): string | null {
+  const line = (name ?? "").replace(/\s+/g, " ").trim();
+  return line ? line.slice(0, RUN_NAME_MAX).trim() : null;
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -426,7 +435,7 @@ export class Runtime {
     manager: { id: string; workspaceId: string | null; cwd: string },
     playbookId: string,
     inputs: Record<string, unknown>,
-    preloaded?: Playbook,
+    options: { playbook?: Playbook; name?: string } = {},
   ): Promise<Run> {
     if (!manager.workspaceId) throw new UserError("this agent has no workspace");
     const workspace = await this.api().workspaces.ref(manager.workspaceId).refresh();
@@ -435,7 +444,7 @@ export class Runtime {
     if (active) throw new UserError(`this workspace already has an active run (${active.id}); one active run per workspace`);
     const workspaceDir = workspace.workspaceDirectory ?? manager.cwd;
     const reservation = this.reservations.get(workspace.id);
-    let playbook: Playbook | null = preloaded ?? (reservation && reservation.playbook.id === playbookId ? reservation.playbook : null);
+    let playbook: Playbook | null = options.playbook ?? (reservation && reservation.playbook.id === playbookId ? reservation.playbook : null);
     if (!playbook) {
       const loaded = await loadPlaybooks(workspaceDir);
       const entry = loaded.entries.find((candidate) => candidate.id === playbookId);
@@ -453,6 +462,7 @@ export class Runtime {
       projectId: workspace.projectId,
       branch: reservation?.branch ?? (await currentRef(workspaceDir)),
       managerAgentId: manager.id,
+      name: runName(options.name),
       inputs,
       now: nowIso(),
     });
@@ -1689,7 +1699,7 @@ export class Runtime {
     if (agent.labels?.[STEP_LABEL]) throw new UserError("a step agent cannot manage a run");
     const managing = this.activeRunOfManager(agentId);
     if (managing) throw new UserError(`that agent already manages run ${managing.id}`);
-    const run = await this.startPlaybook({ id: agentId, workspaceId, cwd: agent.cwd }, playbook.id, inputs, playbook);
+    const run = await this.startPlaybook({ id: agentId, workspaceId, cwd: agent.cwd }, playbook.id, inputs, { playbook });
     // A busy agent is never interrupted: the kickoff waits for the end of its current turn.
     if (agent.status === "running" || this.busyManagers.has(agentId)) {
       this.pendingHandoffs.set(agentId, run.id);

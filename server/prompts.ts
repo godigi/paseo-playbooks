@@ -9,7 +9,8 @@ the rules: it refuses any step or transition the playbook does not allow.
 How to run a playbook:
 1. list_playbooks shows the playbooks of this workspace, their inputs and steps.
 2. start_playbook creates the run in your workspace (one active run per workspace). It
-   returns the ready steps.
+   returns the ready steps. Give it a name: 2 to 4 words saying what this run is about
+   (e.g. "login-redirect-fix"), so humans can tell runs apart in the panel.
 3. For each ready agent step, call start_step with a short brief: what matters from the
    request and earlier results that the step prompt does not already say. The plugin
    renders the step's prompt and inputs; do not repeat them. Start every ready step;

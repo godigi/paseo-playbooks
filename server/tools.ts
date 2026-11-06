@@ -247,12 +247,16 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
       input: z.object({
         playbook: z.string().describe("Playbook id (its file name without .yaml)"),
         inputs: z.record(z.string(), VarValueSchema).default({}).describe("Playbook inputs by name"),
+        name: z
+          .string()
+          .optional()
+          .describe('A short name for the run, 2 to 4 words saying what this run is about (e.g. "login-redirect-fix", "PROJ-412 retry"); it labels the run in the panel. At most 32 characters'),
         newWorkspace: z
           .boolean()
           .default(false)
           .describe("Start it in a new workspace (branched off this one's current branch) with a new Playbook Manager; you do not manage it"),
       }),
-      execute: ({ playbook, inputs, newWorkspace }, { agent }) =>
+      execute: ({ playbook, inputs, name, newWorkspace }, { agent }) =>
         guard(async () => {
           if (newWorkspace) {
             const started = await runtime.startPlaybookElsewhere(agent, playbook, inputs);
@@ -261,7 +265,7 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
               started,
             );
           }
-          const run = await runtime.startPlaybook(agent, playbook, inputs);
+          const run = await runtime.startPlaybook(agent, playbook, inputs, { name });
           if (run.playbook.singleton) {
             return ok(
               `"${playbook}" is a singleton: its pipeline is run ${run.id}, in its own workspace. Hand-off steps give it jobs; each station's trains get their own Playbook Manager there. You do not manage it.`,
