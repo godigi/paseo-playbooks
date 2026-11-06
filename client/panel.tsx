@@ -10,7 +10,7 @@ import { useAgentEvents } from "./events";
 import { Graph, useReduceMotion } from "./graph";
 import { Button, StepSheet } from "./sheet";
 import { StartForm, type StartTarget } from "./start-form";
-import { Stations } from "./stations";
+import { openJobsLabel, Stations, trainName } from "./stations";
 import { splitError } from "../shared/errors";
 import { runStatusColor, runStatusLabel, withAlpha, type Theme } from "./theme";
 
@@ -178,12 +178,15 @@ function PlaybookCard(props: {
   const [sheet, setSheet] = useState<string | null>(null);
   const [highlighted, setHighlighted] = useState<string | null>(null);
   const [starting, setStarting] = useState<StartTarget | null>(null);
+  // A singleton's pipeline is not a tab: its stations stay on top, and its trains are the tabs.
+  const pipeline = card.runs.find((candidate) => isPipeline(candidate) && !isTerminal(candidate.status)) ?? card.runs.find(isPipeline);
+  const tabs = card.runs.filter((candidate) => !isPipeline(candidate));
   // A selected run that disappeared (archived) falls back to the default tab.
-  const current = selected === "definition" || card.runs.some((candidate) => candidate.id === selected) ? selected : null;
-  const runId = current ?? active?.id ?? card.runs[0]?.id ?? "definition";
-  const run = runId === "definition" ? null : card.runs.find((candidate) => candidate.id === runId) ?? null;
+  const current = selected === "definition" || tabs.some((candidate) => candidate.id === selected) ? selected : null;
+  const runId = current ?? tabs.find((candidate) => isActive(candidate))?.id ?? tabs[0]?.id ?? "definition";
+  const run = runId === "definition" ? null : tabs.find((candidate) => candidate.id === runId) ?? null;
   const playbook: Playbook | null = run?.playbook ?? card.entry?.playbook ?? null;
-  const title = playbook?.title ?? card.entry?.title ?? card.id;
+  const title = pipeline?.playbook.title ?? playbook?.title ?? card.entry?.title ?? card.id;
   const errors = card.entry?.errors ?? [];
 
   return (
@@ -225,7 +228,25 @@ function PlaybookCard(props: {
         // Full-width rule between the title row and the run tabs (the card has CARD_PAD padding).
         <View style={{ height: 1, marginTop: 4, marginHorizontal: -CARD_PAD, backgroundColor: theme.colors.border }} />
       ) : null}
-      {expanded && card.runs.length > 0 ? (
+      {expanded && pipeline ? (
+        <View style={{ gap: 6, zIndex: 16 }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, zIndex: 16 }}>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>Stations</Text>
+            <RunChip
+              theme={theme}
+              run={pipeline}
+              label={`Pipeline · ${openJobsLabel(pipeline)}`}
+              selected={false}
+              read
+              onSelect={() => undefined}
+              onCanceled={() => void queryClient.invalidateQueries({ queryKey: ["playbooks"] })}
+              onOpenManager={() => undefined}
+            />
+          </View>
+          <Stations theme={theme} pipeline={pipeline} runs={card.runs} onOpenTrain={(train) => setSelected(train.id)} />
+        </View>
+      ) : null}
+      {expanded && (tabs.length > 0 || pipeline) ? (
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, zIndex: 15 }}>
           {card.entry?.playbook ? (
             <Pressable
@@ -244,11 +265,12 @@ function PlaybookCard(props: {
               <Text style={{ color: runId === "definition" ? theme.colors.surface1 : theme.colors.foregroundMuted, fontSize: 11 }}>Definition</Text>
             </Pressable>
           ) : null}
-          {card.runs.map((candidate) => (
+          {tabs.map((candidate) => (
             <RunChip
               key={candidate.id}
               theme={theme}
               run={candidate}
+              label={candidate.train ? `${trainName(candidate)} · ${candidate.id.replace(/^run_/, "")}` : undefined}
               selected={candidate.id === runId}
               read={props.readRuns.includes(candidate.id)}
               onSelect={() => {
@@ -262,14 +284,7 @@ function PlaybookCard(props: {
         </View>
       ) : null}
       {expanded && run ? <RunBar theme={theme} run={run} hostLabel={props.hostLabel} /> : null}
-      {expanded && run && isPipeline(run) ? (
-        <Stations
-          theme={theme}
-          pipeline={run}
-          runs={card.runs}
-          onOpenTrain={(train) => setSelected(train.id)}
-        />
-      ) : expanded && playbook ? (
+      {expanded && playbook ? (
         <Graph
           playbook={playbook}
           run={run}
@@ -406,7 +421,7 @@ function StartButton(props: { theme: Theme; title: string; onStart(target: Start
 }
 
 /** A run tab with a chevron menu: the run's details (branch, start, inputs, manager), then Pause/Resume and Cancel for active runs. */
-function RunChip(props: { theme: Theme; run: Run; selected: boolean; read: boolean; onSelect(): void; onCanceled(): void; onOpenManager(): void }) {
+function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; selected: boolean; read: boolean; onSelect(): void; onCanceled(): void; onOpenManager(): void }) {
   const { theme, run, selected } = props;
   const cancel = useRpc(cancelRunRpc);
   const archive = useRpc(archiveRunRpc);
@@ -428,7 +443,8 @@ function RunChip(props: { theme: Theme; run: Run; selected: boolean; read: boole
       <View style={{ flexDirection: "row", borderRadius: 10, borderWidth: 1, borderColor: border, backgroundColor: selected ? color : "transparent", overflow: "hidden" }}>
         <Pressable accessibilityRole="tab" accessibilityState={{ selected }} onPress={props.onSelect} style={{ paddingLeft: 8, paddingRight: 6, paddingVertical: 2 }}>
           <Text style={{ color: text, fontSize: 11 }}>
-            {run.id.replace(/^run_/, "")} · {runStatusLabel(run.status)}
+            {props.label ?? run.id.replace(/^run_/, "")}
+            {props.label && isPipeline(run) ? "" : ` · ${runStatusLabel(run.status)}`}
             {wrapping ? " · wrapping up" : ""}
             {paused ? " · paused" : ""}
           </Text>

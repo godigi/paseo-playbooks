@@ -10,7 +10,7 @@ import { useReduceMotion } from "./graph";
 import { LABEL_WIDTH, labelLayout, ROW_HEIGHT } from "./layout";
 import { useOverview, type OverviewStore } from "./overview-store";
 import { GateActions } from "./sheet";
-import { Stations } from "./stations";
+import { openJobsLabel, Stations, trainName } from "./stations";
 import { stepShortTitle, stepTitle, stepTitleOf, withAlpha, type Theme } from "./theme";
 
 /** Id of the Playbooks screen, opened from the sidebar row. */
@@ -142,8 +142,9 @@ function useWorkspaces(): WorkspaceInfo[] {
 }
 
 /** Main-graph steps in declared order: the columns of a playbook's progression line. */
+/** The steps on a run's line: not after-tasks, nor steps its `when` skipped (a dev train has no prd go). */
 function mainSteps(run: Run): Step[] {
-  return run.playbook.steps.filter((step) => !step.afterTask);
+  return run.playbook.steps.filter((step) => !step.afterTask && !(step.when && run.steps[step.id]?.status === "skipped"));
 }
 
 function pendingGates(run: Run): Gate[] {
@@ -152,7 +153,7 @@ function pendingGates(run: Run): Gate[] {
 
 /** A run's name in lists: its first text input (the request), else its id; a train's station and jobs. */
 function runTitle(run: Run): string {
-  if (run.train) return `${run.playbook.title} train · ${run.jobs.length} job(s)`;
+  if (run.train) return `${trainName(run)} · ${run.jobs.length} ${run.jobs.length === 1 ? "job" : "jobs"}`;
   const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
   return text ? text.trim().split("\n")[0]! : run.id;
 }
@@ -515,7 +516,7 @@ function Chip(props: { theme: Theme; label: string; selected: boolean; onPress()
   );
 }
 
-function SectionTitle(props: { theme: Theme; title: string; count: number; icon?: string; iconColor?: string; description?: string; extra?: string; extraColor?: string }) {
+function SectionTitle(props: { theme: Theme; title: string; count?: number; icon?: string; iconColor?: string; description?: string; extra?: string; extraColor?: string }) {
   const { theme } = props;
   return (
     <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
@@ -523,7 +524,7 @@ function SectionTitle(props: { theme: Theme; title: string; count: number; icon?
       <Text accessibilityRole="header" style={{ color: theme.colors.foreground, fontSize: 15, fontWeight: "700" }}>
         {props.title}
       </Text>
-      <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13 }}>{props.count}</Text>
+      {props.count === undefined ? null : <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13 }}>{props.count}</Text>}
       {props.description ? (
         <Text numberOfLines={1} style={{ flexShrink: 1, color: theme.colors.foregroundMuted, fontSize: 13 }}>
           {props.description}
@@ -626,14 +627,14 @@ function sortRuns(runs: Run[], key: SortKey): Run[] {
 }
 
 /** "Runs" with the sort of this playbook's rows: a button that opens the choices below it. */
-function SortHeading(props: { theme: Theme; value: SortKey; onChange(key: SortKey): void }) {
+function SortHeading(props: { theme: Theme; label?: string; value: SortKey; onChange(key: SortKey): void }) {
   const { theme, value } = props;
   const [open, setOpen] = useState(false);
   const [hover, setHover] = useState<SortKey | null>(null);
   const current = SORTS.find((sort) => sort.key === value)!;
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 8, zIndex: 10 }}>
-      <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>Runs</Text>
+      <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>{props.label ?? "Runs"}</Text>
       <View>
         <Pressable
           accessibilityRole="button"
@@ -718,9 +719,15 @@ function PlaybookGroup(props: {
       <SectionTitle
         theme={theme}
         title={playbook.title}
-        count={runs.length}
+        count={props.pipeline ? undefined : runs.length}
         description={compact ? undefined : playbook.description}
-        extra={working > 0 ? `${working} working` : undefined}
+        extra={
+          props.pipeline
+            ? `${openJobsLabel(props.pipeline)} · ${working} ${working === 1 ? "train" : "trains"} running`
+            : working > 0
+              ? `${working} working`
+              : undefined
+        }
         extraColor={theme.colors.accent}
       />
       {props.pipeline ? <Stations theme={theme} pipeline={props.pipeline} runs={props.allRuns} /> : null}
@@ -729,7 +736,7 @@ function PlaybookGroup(props: {
       <View style={{ borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
         <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: theme.colors.border, zIndex: 10 }}>
           <View style={{ width: compact ? undefined : TITLE_WIDTH, flex: compact ? 1 : undefined }}>
-            <SortHeading theme={theme} value={sort} onChange={setSort} />
+            <SortHeading theme={theme} label={props.pipeline ? "Trains" : undefined} value={sort} onChange={setSort} />
           </View>
           {compact ? null : (
             <>

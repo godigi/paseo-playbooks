@@ -7,6 +7,19 @@ export function trainsOf(pipeline: Run, runs: readonly Run[]): Run[] {
   return runs.filter((run) => run.train?.pipelineId === pipeline.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+/** A train's name, from its station: "Dev train". */
+export function trainName(run: Run): string {
+  const title = run.playbook.title;
+  const cut = title.lastIndexOf(" · ");
+  return `${cut === -1 ? (run.train?.station ?? title) : title.slice(cut + 3)} train`;
+}
+
+/** Jobs not ended yet, on a pipeline: "1 job", "3 jobs". */
+export function openJobsLabel(pipeline: Run): string {
+  const count = pipeline.jobs.filter((job) => job.status === "open").length;
+  return `${count} ${count === 1 ? "job" : "jobs"}`;
+}
+
 /**
  * A singleton pipeline's stations, in `needs` order: each one's waiting list (the jobs waiting
  * there, oldest first) and its current train.
@@ -28,7 +41,7 @@ export function Stations(props: { theme: Theme; pipeline: Run; runs: readonly Ru
           <View
             key={station.id}
             accessibilityLabel={`Station ${station.title}: ${waiting.length} job(s) waiting, ${train ? `train ${train.id} running with ${riding} job(s)` : "no train running"}`}
-            style={{ minWidth: 150, flexGrow: 1, flexBasis: 150, borderRadius: 10, borderWidth: 1, borderColor: train ? theme.colors.accent : theme.colors.border, backgroundColor: theme.colors.surface1, padding: 10, gap: 6 }}
+            style={{ width: 240, borderRadius: 10, borderWidth: 1, borderColor: train ? theme.colors.accent : theme.colors.border, backgroundColor: theme.colors.surface1, padding: 10, gap: 6 }}
           >
             <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }}>
               {index > 0 ? "→ " : ""}

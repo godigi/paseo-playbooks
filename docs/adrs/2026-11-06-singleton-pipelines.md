@@ -163,4 +163,4 @@ steps:
   version. Run files from v0.30.0 with boarding runs are failed on load, their jobs with them.
 - `when` (`2026-11-06-conditional-steps.md`) is unchanged; inside a station's block it reads
   the constants the station passes.
-- The UI is decided in `2026-11-06-pipeline-ui.md`.
+- The UI is decided in `2026-11-06-pipeline-card-layout.md` (which superseded `2026-11-06-pipeline-ui.md`).
