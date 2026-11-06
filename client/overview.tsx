@@ -335,7 +335,8 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   }, [runs]);
   const counts = {
     needsYou: needs.length,
-    working: runs.filter((run) => isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length,
+    // A live pipeline stays running while it exists, idle or not: only its trains count.
+    working: runs.filter((run) => !isPipeline(run) && isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length,
     paused: runs.filter((run) => isPaused(run)).length,
     // Counted even when hidden, so new done runs are not missed.
     done: inScope.filter(isDone).length,
