@@ -409,13 +409,15 @@ describe("hand-offs to a singleton", () => {
 
   it("time out a hand-off still waiting: its job is withdrawn and the step fails", async () => {
     const { store, runtime, created } = await setup({ "apply.yaml": APPLY, "pr.yaml": PR.replace("    on:", "    timeout: 1s\n    on:") });
-    await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "https://x/pull/1" });
+    const first = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "https://x/pull/1" });
     await until(() => created.length === 1);
     const waiting = await runtime.startPlaybook({ id: "m2", workspaceId: "ws2", cwd: "/" }, "pr", { pr_url: "https://x/pull/2" });
     expect(store.list().some((run) => run.status === "boarding")).toBe(true);
     await until(() => store.get(waiting.id)!.status === "failed", 4000);
     expect(store.get(waiting.id)!.failure).toMatch(/apply_dev/);
     expect(store.list().some((run) => run.status === "boarding")).toBe(false);
+    // The first run's hand-off times out too: wait for it, so nothing writes after the test.
+    await until(() => store.get(first.id)!.status === "failed", 4000);
   });
 
   it("withdraw a job when its run is canceled, dropping a boarding run left empty", async () => {
