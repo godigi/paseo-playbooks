@@ -287,7 +287,7 @@ export function StepSheet(props: {
   const [message, setMessage] = useState("");
   const active = run !== null && isStepLive(run, stepId);
   // A script step has no agent to talk to.
-  const canNudge = active && step.kind !== "script" && (state?.status === "running" || state?.status === "reported");
+  const canNudge = active && step.kind !== "script" && step.kind !== "handoff" && (state?.status === "running" || state?.status === "reported");
   const canRestart = run !== null && restartBlocker(run, stepId) === null;
   // Retry goes through the manager, which a paused run does not wake.
   const canRetry = active && !isPaused(run) && state?.status === "reported" && (latest?.report?.outcome === "failure" || latest?.report === null);
@@ -297,7 +297,7 @@ export function StepSheet(props: {
   const timeoutText = timeoutMs ? ` · timeout ${Math.round(timeoutMs / 60000)} min` : step.timeout ? ` · timeout ${step.timeout}` : "";
 
   return (
-    <Modal title={`${stepTitle(step)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : step.kind === "script" ? " · Script" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>
+    <Modal title={`${stepTitle(step)}${role ? ` · ${role.title}` : step.kind === "gate" ? " · Gate" : step.kind === "script" ? " · Script" : step.kind === "handoff" ? " · Hand-off" : ""}`} open onOpenChange={(open) => !open && props.onClose()}>
       <Modal.Content>
         {state ? <Line theme={theme}>Status: {state.status}{latest ? ` · attempt ${latest.n}` : ""}</Line> : null}
         {step.kind === "agent" ? (
@@ -322,6 +322,30 @@ export function StepSheet(props: {
                 {latest.checks} check(s){latest.nextCheckAt && state?.status === "running" ? ` · next at ${new Date(latest.nextCheckAt).toLocaleTimeString()}` : ""}
               </Line>
             ) : null}
+          </Section>
+        ) : null}
+        {step.kind === "handoff" ? (
+          <Section theme={theme} title="Hand-off">
+            <Line theme={theme} muted>
+              Hands a job to the singleton playbook "{step.handoff}" and waits for its result
+              {timeoutText}
+              {step.retries ? ` · retries ${step.retries}` : ""}
+            </Line>
+            {latest?.job ? (
+              <Line theme={theme} muted>
+                Job {latest.job.jobId} · run {latest.job.runId}
+              </Line>
+            ) : null}
+            {latest?.lastMessage && !latest.report ? <Line theme={theme}>{latest.lastMessage}</Line> : null}
+          </Section>
+        ) : null}
+        {step.when?.length ? (
+          <Section theme={theme} title="Runs only when">
+            {step.when.map((when) => (
+              <Line key={when.input} theme={theme} muted>
+                {when.input} is {when.values.join(" or ")}
+              </Line>
+            ))}
           </Section>
         ) : null}
         {Object.keys(step.inputs).length > 0 ? (
@@ -359,7 +383,7 @@ export function StepSheet(props: {
               {latest.lastMessage}
             </Line>
           </Section>
-        ) : !latest?.report && latest?.lastMessage ? (
+        ) : step.kind !== "handoff" && !latest?.report && latest?.lastMessage ? (
           <Section theme={theme} title="Ended without a report · last message">
             <Line theme={theme}>{latest.lastMessage}</Line>
           </Section>
@@ -382,10 +406,11 @@ export function StepSheet(props: {
         ))}
         {attempts.length > 0 ? (
           <Section theme={theme} title="Attempts">
-            {step.kind === "script"
+            {step.kind === "script" || step.kind === "handoff"
               ? attempts.map((attempt) => (
                   <Line key={attempt.n} theme={theme} muted>
-                    #{attempt.n} · {attempt.outcome ?? attempt.report?.outcome ?? attempt.turnEnd ?? "running"} · {attempt.checks} check(s)
+                    #{attempt.n} · {attempt.outcome ?? attempt.report?.outcome ?? attempt.turnEnd ?? "running"}
+                    {step.kind === "script" ? ` · ${attempt.checks} check(s)` : attempt.job ? ` · job ${attempt.job.jobId}` : ""}
                   </Line>
                 ))
               : attempts.map((attempt) => (

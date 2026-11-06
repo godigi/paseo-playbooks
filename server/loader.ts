@@ -17,9 +17,11 @@ import type {
   Transition,
   VarDef,
   VarType,
+  VarValue,
+  When,
 } from "../shared/types";
 import { AgentSettingsSchema, VarTypeSchema, VarValueSchema } from "../shared/types";
-import { parseDuration, replaceRefs, singleRef, templateRefs, typeCompatible } from "../shared/vars";
+import { coerceValue, parseDuration, replaceRefs, singleRef, templateRefs, typeCompatible } from "../shared/vars";
 
 /** Folders searched for playbooks, relative to the workspace. Each folder is self-contained. */
 export const PLAYBOOKS_DIRS = [".paseo/plugins/playbooks", ".paseo/playbooks"] as const;
@@ -40,6 +42,8 @@ const RawVarDefSchema = z.object({
   });
 
 const RawOutputSchema = RawVarDefSchema.extend({ value: z.string().optional() });
+
+const RawScalarSchema = z.union([z.string(), z.number(), z.boolean()]);
 
 const RawTransitionSchema = z.union([
   z.enum(["complete", "end", "fail"]),
@@ -137,6 +141,9 @@ const RawScriptStepSchema = z
 /** A sub-playbook from the same folder, run in place of this step. */
 const RawPlaybookStepSchema = z.object({ name: z.string().min(1) }).strict();
 
+/** A hand-off: a singleton playbook from the same folder, given a job; the step waits for its result. */
+const RawHandoffStepSchema = z.object({ name: z.string().min(1) }).strict();
+
 /** Fields that moved into a kind's block; read flat only to refuse them with the new form. */
 const MOVED_FIELDS = { prompt: "role", silence: "role", archive_agents: "role", agent: "role", choices: "gate", poll: "script" } as const;
 type MovedField = keyof typeof MOVED_FIELDS;
@@ -152,6 +159,9 @@ const RawStepSchema = z.object({
     gate: kindBlock(RawGateStepSchema).optional(),
     playbook: kindBlock(RawPlaybookStepSchema).optional(),
     script: kindBlock(RawScriptStepSchema).optional(),
+    handoff: kindBlock(RawHandoffStepSchema).optional(),
+    /** Runs the step only for these input values (one value or a list per input); otherwise it is skipped. */
+    when: z.record(z.string(), z.union([RawScalarSchema, z.array(RawScalarSchema).min(1)])).optional(),
     inputs: z.union([z.array(z.string()), z.record(z.string(), z.string().nullable())]).optional(),
     outputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
     outcomes: z.array(z.string()).min(1).optional(),
@@ -187,6 +197,27 @@ const RawPlaybookSchema = z.object({
     /** Removed: playbooks compose only as sub-playbook steps. Kept here to refuse it clearly. */
     next: z.unknown().optional(),
     concurrency: z.number().int().positive().optional(),
+    /** Takes jobs from hand-off steps; `{}` for the defaults. A boolean is read only to refuse it. */
+    singleton: z
+      .union([
+        z.boolean(),
+        z
+          .object({
+            /** Branch its runs branch off; default: the project's default branch. */
+            branch: z.string().min(1).optional(),
+            concurrency: z
+              .object({
+                /** Inputs that are each run's; the others are each job's. */
+                key: z.array(z.string()).default([]),
+                /** Running runs per key value; default: no limit. */
+                limit: z.number().int().positive().optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict(),
+      ])
+      .optional(),
     /** How the playbook can end, for a parent that uses it as a sub-playbook. The first is a normal finish. */
     outcomes: z.array(z.string()).min(1).optional(),
     steps: z.array(RawStepSchema).min(1),
@@ -494,6 +525,45 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     checkVarDef(`${file}: inputs.${name}`, inputs[name]!, errors);
   }
 
+  // Singleton: takes jobs from hand-off steps; its key inputs are each run's, the others each job's.
+  let singleton: Playbook["singleton"];
+  if (typeof pb.singleton === "boolean") err(`singleton: a feature is a block: write \`singleton: {}\` for the defaults, or leave it out`);
+  if (pb.singleton !== undefined && typeof pb.singleton !== "boolean") {
+    const raw = pb.singleton;
+    singleton = { key: raw.concurrency?.key ?? [] };
+    if (raw.branch !== undefined) singleton.branch = raw.branch;
+    if (raw.concurrency?.limit !== undefined) singleton.limit = raw.concurrency.limit;
+    if (pb.concurrency !== undefined) err("`concurrency` does not apply to a singleton playbook; set `singleton.concurrency` (key and limit) instead");
+    for (const name of singleton.key) if (!inputs[name]) err(`singleton.concurrency.key: "${name}" is not an input of this playbook`);
+    if (new Set(singleton.key).size !== singleton.key.length) err("singleton.concurrency.key: duplicate input");
+  }
+  const keyInputs = new Set(singleton?.key ?? []);
+
+  /** A step's `when`: each input must exist (a key input on a singleton) and each value fit its type. */
+  const parseWhen = (where: string, raw: Record<string, VarValue | VarValue[]> | undefined): When[] | undefined => {
+    if (raw === undefined) return undefined;
+    const conditions: When[] = [];
+    for (const [name, given] of Object.entries(raw)) {
+      const def = inputs[name];
+      if (!def) {
+        err(`${where}: when.${name}: not an input of this playbook${Object.keys(inputs).length ? ` (${Object.keys(inputs).join(", ")})` : ""}`);
+        continue;
+      }
+      if (singleton && !keyInputs.has(name)) {
+        err(`${where}: when.${name}: on a singleton playbook, \`when\` may only use the run's inputs (singleton.concurrency.key: ${[...keyInputs].join(", ") || "none"}), not each job's`);
+        continue;
+      }
+      const values: string[] = [];
+      for (const value of Array.isArray(given) ? given : [given]) {
+        const coerced = coerceValue(def, value);
+        if (coerced.ok) values.push(String(coerced.value));
+        else err(`${where}: when.${name}: ${JSON.stringify(value)}: ${coerced.error}`);
+      }
+      conditions.push({ input: name, source: `{{ playbook.inputs.${name} }}`, values });
+    }
+    return conditions.length > 0 ? conditions : undefined;
+  };
+
   // Playbook outcomes: the first is a normal finish, `{ end: <outcome> }` picks another.
   const playbookOutcomes = pb.outcomes ?? ["success"];
   for (const outcome of playbookOutcomes) if (!ID.test(outcome)) err(`outcomes.${outcome}: invalid name (lowercase letters, digits, - and _)`);
@@ -527,6 +597,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   const seen = new Set<string>();
   const steps: Step[] = [];
   const blocks = new Map<string, Playbook>();
+  const handoffs = new Map<string, Playbook>();
   const defaultTimeout = defaults.timeout ? parseDuration(defaults.timeout) ?? undefined : undefined;
   const defaultSilence = defaults.role?.silence ? parseSilence(defaults.role.silence) ?? undefined : undefined;
   for (const { raw: rawStep, task } of rawAll) {
@@ -540,10 +611,15 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     const isGate = gateStep !== undefined;
     const isBlock = playbookStep !== undefined;
     const isScript = scriptStep !== undefined;
-    if ([roleStep, gateStep, playbookStep, scriptStep].filter((value) => value !== undefined).length !== 1) {
-      err(`${where}: set exactly one of \`role\`, \`gate\`, \`playbook\` or \`script\``);
+    const isHandoff = rawStep.handoff !== undefined;
+    if ([roleStep, gateStep, playbookStep, scriptStep, rawStep.handoff].filter((value) => value !== undefined).length !== 1) {
+      err(`${where}: set exactly one of \`role\`, \`gate\`, \`playbook\`, \`script\` or \`handoff\``);
     }
     refuseFlatForms(where, rawStep, err);
+    if (typeof rawStep.handoff === "string") err(`${where}: handoff: write \`handoff: { name: ${rawStep.handoff} }\``);
+    if (task && rawStep.when !== undefined) err(`${where}: \`when\` does not apply to an after-task`);
+    const when = task ? undefined : parseWhen(where, rawStep.when);
+    const conditional = when ? { when } : {};
     if (isBlock) {
       for (const field of ["outputs", "outcomes", "timeout"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a playbook step (the sub-playbook defines it)`);
@@ -559,6 +635,10 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         const loaded = await folder.load(subId, [...stack, id]);
         sub = loaded.entry.playbook;
         if (!sub) err(`${where}: playbook "${subId}" is invalid: ${loaded.entry.errors[0] ?? "see that file"}`);
+        else if (sub.singleton) {
+          err(`${where}: playbook "${subId}" is a singleton: its runs only come from hand-offs and Start, so it cannot be ${task ? "an after-task" : "a sub-playbook"}; use \`handoff: { name: ${subId} }\``);
+          sub = null;
+        }
       }
       if (sub) blocks.set(rawStep.id, sub);
       // `on` maps the sub-playbook's outcomes; the first one (a normal finish) continues by default.
@@ -593,7 +673,66 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         on,
         choices: [],
         ...(rawStep.title !== undefined ? { title: rawStep.title } : {}),
+        ...conditional,
         ...afterTask,
+      });
+      continue;
+    }
+    if (isHandoff) {
+      // Hands a job to a singleton playbook of the folder and waits for its result.
+      for (const field of ["prompt", "outputs", "outcomes", "silence", "archive_agents", "agent", "choices", "poll"] as const) {
+        if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a hand-off step (the singleton playbook defines it)`);
+      }
+      if (task) err(`${where}: a hand-off cannot be an after-task`);
+      const targetId = typeof rawStep.handoff === "string" ? rawStep.handoff : rawStep.handoff!.name;
+      let target: Playbook | null = null;
+      if (targetId === id || stack.includes(targetId)) {
+        err(`${where}: handoff: "${targetId}" leads back to this playbook (${[...stack, id, targetId].join(" → ")}); the runs would wait on each other`);
+      } else if (!folder.ids.has(targetId)) {
+        err(`${where}: handoff: playbook "${targetId}" not found in ${folder.relDir}/`);
+      } else {
+        const loaded = await folder.load(targetId, [...stack, id]);
+        target = loaded.entry.playbook;
+        if (!target) err(`${where}: handoff: playbook "${targetId}" is invalid: ${loaded.entry.errors[0] ?? "see that file"}`);
+        else if (!target.singleton) err(`${where}: handoff: playbook "${targetId}" is not a singleton (add \`singleton: {}\` to it)`);
+      }
+      if (target?.singleton) handoffs.set(rawStep.id, target);
+      const outcomes = target ? (target.outcomes.includes("failure") ? target.outcomes : [...target.outcomes, "failure"]) : ["success", "failure"];
+      const on: Record<string, Transition> = {};
+      for (const [outcome, transition] of Object.entries(rawStep.on ?? {})) {
+        if (target && !outcomes.includes(outcome)) err(`${where}: on.${outcome}: not an outcome of playbook "${targetId}" (${target.outcomes.join(", ")})`);
+        if (typeof transition === "string") on[outcome] = { kind: transition };
+        else if ("ask" in transition) err(`${where}: on.${outcome}: \`ask\` does not apply to a hand-off step`);
+        else if ("end" in transition) on[outcome] = endTransition(`${where}: on.${outcome}`, transition.end);
+        else on[outcome] = transition.max_loops !== undefined ? { kind: "goto", target: transition.goto, maxLoops: transition.max_loops } : { kind: "goto", target: transition.goto };
+      }
+      if (target) {
+        for (const outcome of target.outcomes.slice(1)) {
+          if (outcome !== "failure" && !on[outcome]) err(`${where}: outcome "${outcome}" of playbook "${targetId}" needs an \`on\` entry (complete, end, fail or goto)`);
+        }
+      }
+      let timeoutMs = defaultTimeout;
+      if (rawStep.timeout !== undefined) {
+        timeoutMs = parseDuration(rawStep.timeout) ?? undefined;
+        if (timeoutMs === undefined) err(`${where}: timeout: expected a duration such as 30m or 2h`);
+      }
+      steps.push({
+        id: rawStep.id,
+        kind: "handoff",
+        handoff: targetId,
+        needs: rawStep.needs,
+        prompt: "",
+        inputs: {},
+        outputs: Object.fromEntries(Object.entries(target?.outputs ?? {}).map(([name, def]) => [name, { type: def.type, ...(def.values ? { values: def.values } : {}) }])),
+        outcomes,
+        retries: rawStep.retries,
+        agent: {},
+        on,
+        choices: [],
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(rawStep.title !== undefined ? { title: rawStep.title } : {}),
+        ...(rawStep.short_title !== undefined ? { shortTitle: rawStep.short_title } : {}),
+        ...conditional,
       });
       continue;
     }
@@ -726,6 +865,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       agent: isGate || isScript ? {} : mergeAgent(defaults.agent, pb.agent, stepRole?.agent, roleStep?.agent),
       on,
       choices,
+      ...conditional,
       ...afterTask,
     };
     if (rawStep.title !== undefined) step.title = rawStep.title;
@@ -778,7 +918,9 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       const def = toVarDef(rawOutput);
       checkVarDef(`${file}: outputs.${name}`, def, errors);
       const resolved = resolveOutputSource(name, def.type, rawOutput?.value, mainSteps, inputs);
-      if ("error" in resolved) err(`outputs.${name}: ${resolved.error}`);
+      // A singleton's outputs are each job's: settle_job gives them, so they need no source.
+      if ("error" in resolved && singleton && rawOutput?.value === undefined) outputs[name] = { ...def, source: "", auto: false, label: "settle_job" };
+      else if ("error" in resolved) err(`outputs.${name}: ${resolved.error}`);
       else outputs[name] = { ...def, ...resolved };
     }
   }
@@ -791,7 +933,9 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       const sub = blocks.get(step.id);
       const ancestors = ancestorsOf(steps, step.id);
       const after = step.afterTask ? afterContext : undefined;
+      const target = handoffs.get(step.id);
       if (sub) wireBlock(step, raw, sub, steps, ancestors, inputs, err, after);
+      else if (target) wireBlock(step, raw, target, steps, ancestors, inputs, err, after);
       else wireStep(step, raw, steps, ancestors, inputs, err, new Set(), undefined, after);
     }
   }
@@ -823,6 +967,20 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     }
   }
 
+  if (errors.length === 0 && singleton) {
+    // Each job's inputs have one value per job: steps read them through {{ run.jobs }}.
+    for (const step of finalSteps) {
+      for (const [name, wired] of Object.entries(step.inputs)) {
+        for (const ref of templateRefs(wired.source)) {
+          const input = /^playbook\.inputs\.([A-Za-z_][\w-]*)$/.exec(ref)?.[1];
+          if (input !== undefined && !keyInputs.has(input)) {
+            err(`step "${step.id}": inputs.${name}: "${input}" is each job's input (not in singleton.concurrency.key), with one value per job; read it through {{ run.jobs }} in the prompt`);
+          }
+        }
+      }
+    }
+  }
+
   if (errors.length > 0) return fail(errors);
   const manager = mergeAgent(defaults.agent?.provider ? { provider: defaults.agent.provider, model: defaults.agent.model } : undefined, defaults.manager);
   entry.playbook = {
@@ -844,7 +1002,8 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       steps: finalSteps.filter((step) => step.afterTask === raw.id).map((step) => step.id),
     })),
   };
-  if (pb.concurrency !== undefined) entry.playbook.concurrency = pb.concurrency;
+  if (pb.concurrency !== undefined && !singleton) entry.playbook.concurrency = pb.concurrency;
+  if (singleton) entry.playbook.singleton = singleton;
   return { entry };
 }
 
@@ -907,7 +1066,7 @@ function refuseFlatForms(where: string, raw: RawStep, err: (message: string) => 
 /** What an ask choice's `outputs` may read besides `inputs.<name>` and `report.outputs.<name>`. */
 const ASK_OUTPUT_REFS = /^(gate\.comment|gate\.choice|report\.summary)$/;
 
-const PROMPT_REFS = /^(inputs\.[A-Za-z_][\w-]*|run\.id|run\.status|run\.failure|attempt)$/;
+const PROMPT_REFS = /^(inputs\.[A-Za-z_][\w-]*|run\.id|run\.status|run\.failure|run\.jobs|attempt)$/;
 
 /** The run field to suggest when an after-task input has no source. */
 function runExample(name: string): string {
@@ -1000,6 +1159,9 @@ function wireStep(
           } else if (!byId.get(source.step)!.outputs[source.output]) {
             err(`${where}: inputs.${name}: step "${source.step}" has no output "${source.output}"`);
             ok = false;
+          } else if (!sameWhen(byId.get(source.step)!, step)) {
+            err(`${where}: inputs.${name}: step "${source.step}" has a \`when\` and may be skipped (its outputs unset); read it only from a step with the same \`when\``);
+            ok = false;
           }
         }
       }
@@ -1022,6 +1184,8 @@ function wireStep(
     const candidates = [...ancestors].filter((id) => byId.get(id)?.outputs[name]);
     if (candidates.length > 1) {
       err(`${where}: input "${name}" matches outputs of several steps (${candidates.sort().join(", ")}); map it explicitly`);
+    } else if (candidates.length === 1 && !sameWhen(byId.get(candidates[0]!)!, step)) {
+      err(`${where}: input "${name}" matches an output of step "${candidates[0]}", which has a \`when\` and may be skipped (its outputs unset); read it only from a step with the same \`when\``);
     } else if (candidates.length === 1) {
       const source = candidates[0]!;
       step.inputs[name] = wiring(`{{ steps.${source}.outputs.${name} }}`, true, `${source}.${name}`, byId.get(source)!.outputs[name]!.type);
@@ -1036,7 +1200,7 @@ function wireStep(
     }
   }
   for (const ref of templateRefs(step.prompt)) {
-    if (!PROMPT_REFS.test(ref)) err(`${where}: prompt uses "{{ ${ref} }}"; prompts may only use inputs.<name>, run.id, attempt${after ? ", run.status and run.failure" : ""}${promptHint(ref)}`);
+    if (!PROMPT_REFS.test(ref)) err(`${where}: prompt uses "{{ ${ref} }}"; prompts may only use inputs.<name>, run.id, run.jobs, attempt${after ? ", run.status and run.failure" : ""}${promptHint(ref)}`);
     else if (!after && (ref === "run.status" || ref === "run.failure")) {
       err(`${where}: prompt uses "{{ ${ref} }}", which only after-tasks can use (the run is still running in its own steps)`);
     }
@@ -1181,18 +1345,28 @@ function expandBlocks(
           return [name, { ...wired, source, label }];
         }),
       );
+      // The block's own `when` holds for each of its steps, before theirs (read through the parent's wiring).
+      const when = [...(step.when ?? []), ...(innerStep.when ?? []).map((condition) => ({ ...condition, source: inner(step.id, sub, condition.source) }))];
+      const { when: _innerWhen, ...rest } = innerStep;
       result.push({
-        ...innerStep,
+        ...rest,
         id: `${step.id}.${innerStep.id}`,
         needs: innerStep.needs.length === 0 ? mapNeeds(step.needs) : innerStep.needs.map((need) => `${step.id}.${need}`),
         inputs,
         on,
+        ...(when.length > 0 ? { when } : {}),
         ...(step.afterTask ? { afterTask: step.afterTask } : {}),
       });
     }
   }
   for (const [name, output] of Object.entries(outputs)) outputs[name] = { ...output, source: outer(output.source) };
   return { steps: result, blocks: info };
+}
+
+/** Whether a step may read the outputs of `source`: it has no `when`, or the reader has the same one. */
+function sameWhen(source: Step, reader: Step): boolean {
+  if (!source.when) return true;
+  return JSON.stringify(source.when) === JSON.stringify(reader.when ?? []);
 }
 
 function wiring(source: string, auto: boolean, label: string, type: VarType | undefined): InputWiring {

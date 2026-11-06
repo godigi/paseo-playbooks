@@ -5,8 +5,9 @@
 import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
 import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
-import type { AfterTask, AskChoice, Attempt, Gate, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
-import { isActive, isPaused, isScriptAttempt, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
+import { stringify as toYaml } from "yaml";
+import type { AfterTask, AskChoice, Attempt, Gate, Job, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
+import { isActive, isAgentlessAttempt, isPaused, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, parseDuration, renderTemplate, replaceRefs, resolveValue, templateRefs } from "../shared/vars";
 
 export class EngineError extends Error {}
@@ -93,9 +94,47 @@ export function resolveRunInputs(
   return errors.length > 0 ? { ok: false, errors } : { ok: true, inputs };
 }
 
+/** A singleton playbook's inputs split: those in its key are each run's, the others each job's. */
+export function splitInputs(playbook: Playbook): { run: Playbook["inputs"]; job: Playbook["inputs"] } {
+  const key = new Set(playbook.singleton?.key ?? []);
+  const entries = Object.entries(playbook.inputs);
+  return {
+    run: Object.fromEntries(entries.filter(([name]) => key.has(name))),
+    job: Object.fromEntries(entries.filter(([name]) => !key.has(name))),
+  };
+}
+
+/** Validates the run's (key) inputs of a singleton playbook; job inputs given here are ignored. */
+export function resolveKeyInputs(playbook: Playbook, given: Record<string, unknown>) {
+  const { run } = splitInputs(playbook);
+  const keyGiven = Object.fromEntries(Object.entries(given).filter(([name]) => name in run));
+  return resolveRunInputs({ ...playbook, inputs: run }, keyGiven);
+}
+
+/** Validates one job's inputs against a singleton playbook (its non-key inputs). */
+export function resolveJobInputs(playbook: Playbook, given: Record<string, unknown>) {
+  const { job } = splitInputs(playbook);
+  const jobGiven = Object.fromEntries(Object.entries(given).filter(([name]) => !(playbook.singleton?.key ?? []).includes(name)));
+  return resolveRunInputs({ ...playbook, inputs: job }, jobGiven);
+}
+
 export function newRun(input: NewRunInput): Run {
   const resolved = resolveRunInputs(input.playbook, input.inputs);
   if (!resolved.ok) throw new EngineError(resolved.errors.join("; "));
+  return createRun(input, resolved.inputs, "running");
+}
+
+/**
+ * A singleton run gathering jobs: no worktree, manager or step yet. `workspaceDir` is a
+ * checkout of the project its worktree will branch from when it departs.
+ */
+export function newBoardingRun(input: Omit<NewRunInput, "workspaceId" | "managerAgentId" | "branch">): Run {
+  const resolved = resolveKeyInputs(input.playbook, input.inputs);
+  if (!resolved.ok) throw new EngineError(resolved.errors.join("; "));
+  return createRun({ ...input, workspaceId: "", managerAgentId: "", branch: null }, resolved.inputs, "boarding");
+}
+
+function createRun(input: NewRunInput, inputs: Record<string, VarValue>, status: "running" | "boarding"): Run {
   const run: Run = {
     version: 1,
     id: input.id,
@@ -105,9 +144,9 @@ export function newRun(input: NewRunInput): Run {
     projectId: input.projectId,
     branch: input.branch,
     managerAgentId: input.managerAgentId,
-    inputs: resolved.inputs,
+    inputs,
     outputs: null,
-    status: "running",
+    status,
     failure: null,
     createdAt: input.now,
     updatedAt: input.now,
@@ -127,9 +166,15 @@ export function newRun(input: NewRunInput): Run {
       input.playbook.after.map((task) => [task.id, { status: "pending", startedAt: null, endedAt: null, detail: null }]),
     ),
     inbox: [],
+    jobs: [],
+    departEmpty: false,
     history: [],
     seq: 0,
   };
+  if (status === "boarding") {
+    log(run, input.now, "run_boarding", null, `playbook ${input.playbook.id}`);
+    return run;
+  }
   // A templated timeout that only depends on the run's inputs is checked now, not at its step.
   for (const step of input.playbook.steps) {
     if (step.timeout === undefined) continue;
@@ -151,7 +196,24 @@ export function newRun(input: NewRunInput): Run {
 export function refreshReady(run: Run, now: string): { ready: string[]; queued: string[] } {
   const ready: string[] = [];
   const queued: string[] = [];
+  if (run.status === "boarding") return { ready, queued };
   const limited = Object.entries(run.playbook.blocks).filter(([, block]) => block.concurrency !== undefined);
+  // A skipped step (its `when` did not match) counts as done, so the steps after it may move too.
+  let skipped = true;
+  while (skipped) {
+    skipped = false;
+    for (const step of run.playbook.steps) {
+      const state = run.steps[step.id]!;
+      if (state.status !== "pending" || !step.when || !isStepLive(run, step.id)) continue;
+      if (!step.needs.every((need) => isStepDone(run.steps[need]?.status ?? "pending"))) continue;
+      const missed = unmetWhen(run, step);
+      if (missed === null) continue;
+      state.status = "skipped";
+      state.completedSeq = null;
+      log(run, now, "step_skipped", step.id, missed);
+      skipped = true;
+    }
+  }
   for (const step of run.playbook.steps) {
     const state = run.steps[step.id]!;
     if (state.status !== "pending" || !isStepLive(run, step.id)) continue;
@@ -168,6 +230,16 @@ export function refreshReady(run: Run, now: string): { ready: string[]; queued: 
     }
   }
   return { ready, queued };
+}
+
+/** Why a step's `when` does not hold now (e.g. `when env is dev, not prd`), or null when it does. */
+export function unmetWhen(run: Run, step: Step): string | null {
+  const context = templateContext(run);
+  for (const condition of step.when ?? []) {
+    const value = formatValue(resolveValue(condition.source, context));
+    if (!condition.values.includes(value)) return `when: ${condition.input} is ${value}, not ${condition.values.join(" or ")}`;
+  }
+  return null;
 }
 
 /** Steps waiting for a free `concurrency` slot of their block. */
@@ -198,7 +270,14 @@ function queueNote(run: Run, queued: string[]): string {
  */
 export function readySteps(run: Run): string[] {
   return run.playbook.steps
-    .filter((step) => step.kind !== "script" && run.steps[step.id]!.status === "ready" && isStepLive(run, step.id))
+    .filter((step) => step.kind !== "script" && step.kind !== "handoff" && run.steps[step.id]!.status === "ready" && isStepLive(run, step.id))
+    .map((step) => step.id);
+}
+
+/** Ready hand-off steps, which the plugin starts on its own. */
+export function readyHandoffs(run: Run): string[] {
+  return run.playbook.steps
+    .filter((step) => step.kind === "handoff" && run.steps[step.id]!.status === "ready" && isStepLive(run, step.id))
     .map((step) => step.id);
 }
 
@@ -310,10 +389,11 @@ export function startAttempt(
     timeoutMs: timeout.timeoutMs ?? null,
     checks: 0,
     nextCheckAt: null,
+    job: null,
   };
   const context = {
     inputs: Object.fromEntries(Object.entries(values).map(([name, entry]) => [name, entry.value])),
-    run: { id: run.id, status: run.status, failure: run.failure },
+    run: { id: run.id, status: run.status, failure: run.failure, jobs: jobsText(run) },
     attempt: n,
   };
   const sections: string[] = [];
@@ -490,6 +570,7 @@ function finish(run: Run, status: "completed" | "failed" | "canceled", detail: s
 function outputsFrom(run: Run, context: Record<string, unknown>): Record<string, VarValue> {
   const outputs: Record<string, VarValue> = {};
   for (const [name, def] of Object.entries(run.playbook.outputs)) {
+    if (def.source === "") continue;
     const value = resolveValue(def.source, context);
     if (value === undefined) continue;
     const coerced = coerceValue(def, value);
@@ -619,7 +700,7 @@ function setCompleted(run: Run, stepId: string, now: string, fx: Effects): void 
 /** A completed step's agents are no longer needed. */
 function archiveDone(run: Run, stepId: string, fx: Effects): void {
   if (stepDef(run, stepId).archiveAgents === false) return;
-  fx.archiveAgents.push(...run.steps[stepId]!.attempts.map((attempt) => attempt.agentId).filter((agentId) => !isScriptAttempt(agentId)));
+  fx.archiveAgents.push(...run.steps[stepId]!.attempts.map((attempt) => attempt.agentId).filter((agentId) => !isAgentlessAttempt(agentId)));
 }
 
 /**
@@ -643,6 +724,12 @@ function advance(run: Run, stepId: string, now: string, fx: Effects): void {
     return;
   }
   const { ready, queued } = refreshReady(run, now);
+  // Skipped steps (`when`) may have finished the flow.
+  if (flow.every((step) => isStepDone(run.steps[step.id]!.status))) {
+    if (task) finishTask(run, task, "completed", "", now, fx);
+    else completeRun(run, now, fx);
+    return;
+  }
   if (ready.length > 0) fx.notes.push(`Ready: ${ready.join(", ")}.`);
   if (queued.length > 0) fx.notes.push(queueNote(run, queued));
 }
@@ -1150,4 +1237,135 @@ export function replaceManager(run: Run, managerAgentId: string, reason: string,
   const previous = run.managerAgentId;
   run.managerAgentId = managerAgentId;
   log(run, now, "manager_replaced", null, `${previous} → ${managerAgentId}: ${reason}`);
+}
+
+// ---------------------------------------------------------------- singleton runs and jobs
+
+/** A run's open jobs, as steps read them: `{{ run.jobs }}` (YAML), `PLAYBOOK_JOBS` (JSON). */
+export function openJobs(run: Run): Array<{ id: string; from: string; inputs: Record<string, VarValue>; outputs: Record<string, VarValue> }> {
+  return run.jobs
+    .filter((job) => job.status === "open")
+    .map((job) => ({ id: job.id, from: job.label, inputs: job.inputs, outputs: job.outputs }));
+}
+
+export function jobsText(run: Run): string {
+  const jobs = openJobs(run);
+  return jobs.length === 0 ? "" : toYaml(jobs).trimEnd();
+}
+
+/** Adds a job to a boarding run. */
+export function addJob(run: Run, job: Job, now: string): void {
+  if (run.status !== "boarding") throw new EngineError(`run ${run.id} is ${run.status}; jobs only board a boarding run`);
+  run.jobs.push(job);
+  log(run, now, "job_boarded", null, `${job.id} from ${job.fromRunId}/${job.fromStepId}`);
+}
+
+/** The boarding run departs: it gets its worktree, manager and playbook, and its first steps become ready. */
+export function departRun(
+  run: Run,
+  input: { workspaceId: string; workspaceDir: string; branch: string | null; managerAgentId: string; playbook: Playbook; now: string },
+): { ready: string[]; refused: Array<{ job: Job; reason: string }> } {
+  if (run.status !== "boarding") throw new EngineError(`run ${run.id} is ${run.status}, not boarding`);
+  run.playbook = input.playbook;
+  run.workspaceId = input.workspaceId;
+  run.workspaceDir = input.workspaceDir;
+  run.branch = input.branch;
+  run.managerAgentId = input.managerAgentId;
+  run.status = "running";
+  run.steps = Object.fromEntries(
+    input.playbook.steps.map((step) => [step.id, run.steps[step.id] ?? { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, completedSeq: null, queuedAt: null }]),
+  );
+  run.after = Object.fromEntries(input.playbook.after.map((task) => [task.id, run.after[task.id] ?? { status: "pending", startedAt: null, endedAt: null, detail: null }]));
+  // The run's own copy of the playbook is the one that counts: jobs that do not fit it fail.
+  const refused: Array<{ job: Job; reason: string }> = [];
+  for (const job of run.jobs) {
+    if (job.status !== "open") continue;
+    const checked = resolveJobInputs(input.playbook, job.inputs);
+    if (checked.ok) job.inputs = checked.inputs;
+    else refused.push({ job, reason: `its inputs do not fit "${input.playbook.id}" on ${input.branch ?? "its branch"}: ${checked.errors.join("; ")}` });
+  }
+  for (const { job, reason } of refused) endJob(run, job, "failed", null, reason, {}, input.now);
+  log(run, input.now, "run_departed", null, `${run.jobs.filter((job) => job.status === "open").length} job(s), manager ${input.managerAgentId}`);
+  const { ready } = refreshReady(run, input.now);
+  updateStatus(run);
+  return { ready, refused };
+}
+
+function endJob(run: Run, job: Job, status: Job["status"], outcome: string | null, summary: string, outputs: Record<string, VarValue>, now: string): void {
+  job.status = status;
+  job.outcome = outcome;
+  job.summary = summary || null;
+  job.outputs = { ...job.outputs, ...outputs };
+  job.endedAt = now;
+  log(run, now, `job_${status}`, null, `${job.id}${outcome ? `: ${outcome}` : ""}${summary ? ` (${summary.slice(0, 200)})` : ""}`);
+}
+
+/** The run's manager settles one job: an outcome of the playbook, and its outputs (all of them for the first outcome). */
+export function settleJob(run: Run, jobId: string, input: { outcome: string; summary: string; outputs: Record<string, unknown>; now: string }): Job {
+  const job = run.jobs.find((candidate) => candidate.id === jobId);
+  if (!job) throw new EngineError(`no job "${jobId}" in run ${run.id} (jobs: ${run.jobs.map((candidate) => candidate.id).join(", ") || "none"})`);
+  if (job.status !== "open") throw new EngineError(`job ${jobId} is already ${job.status}${job.outcome ? ` (${job.outcome})` : ""}`);
+  if (isTerminal(run.status) || run.status === "boarding") throw new EngineError(`run ${run.id} is ${run.status}; only a running run settles its jobs`);
+  if (!run.playbook.outcomes.includes(input.outcome)) {
+    throw new EngineError(`outcome "${input.outcome}" is not an outcome of "${run.playbook.id}"; use one of: ${run.playbook.outcomes.join(", ")}`);
+  }
+  const outputs: Record<string, VarValue> = {};
+  const errors: string[] = [];
+  const merged = { ...job.outputs, ...input.outputs };
+  for (const [name, def] of Object.entries(run.playbook.outputs)) {
+    const raw = merged[name];
+    if (raw === undefined || raw === null || raw === "") {
+      if (input.outcome === run.playbook.outcomes[0]) errors.push(`missing output "${name}" (${def.type})`);
+      continue;
+    }
+    const coerced = coerceValue(def, raw);
+    if (coerced.ok) outputs[name] = coerced.value;
+    else errors.push(`output "${name}": ${coerced.error}`);
+  }
+  for (const name of Object.keys(input.outputs)) {
+    if (!run.playbook.outputs[name]) errors.push(`unknown output "${name}" (declared: ${Object.keys(run.playbook.outputs).join(", ") || "none"})`);
+  }
+  if (errors.length > 0) throw new EngineError(`cannot settle job ${jobId}: ${errors.join("; ")}`);
+  endJob(run, job, "settled", input.outcome, input.summary, outputs, input.now);
+  return job;
+}
+
+/**
+ * The jobs still open when the run ended: settled with the run's outcome and outputs when it
+ * completed, failed when it failed or was canceled. Returns them; the runtime tells their runs.
+ */
+export function endOpenJobs(run: Run, now: string): Job[] {
+  if (!isTerminal(run.status)) return [];
+  const open = run.jobs.filter((job) => job.status === "open");
+  const outcome = [...run.history].reverse().find((event) => event.type === "run_outcome")?.detail ?? run.playbook.outcomes[0]!;
+  for (const job of open) {
+    if (run.status === "completed") endJob(run, job, "settled", outcome, `run ${run.id} completed`, run.outputs ?? {}, now);
+    else endJob(run, job, "failed", null, `run ${run.id} ${run.status}${run.failure ? `: ${run.failure}` : ""}`, {}, now);
+  }
+  return open;
+}
+
+/** A hand-off was canceled or reset: its job leaves the run. Returns it if it was still open. */
+export function withdrawJob(run: Run, jobId: string, reason: string, now: string): Job | null {
+  const job = run.jobs.find((candidate) => candidate.id === jobId);
+  if (!job || job.status !== "open") return null;
+  endJob(run, job, "withdrawn", null, reason, {}, now);
+  return job;
+}
+
+/**
+ * The result of a hand-off reaches its step: recorded as the attempt's report, and the step
+ * moves to reported (the runtime then completes it, or waits while the run is paused).
+ */
+export function receiveJobResult(run: Run, stepId: string, attemptId: string, result: { outcome: string; summary: string; outputs: Record<string, unknown> }, now: string): boolean {
+  const state = run.steps[stepId];
+  const attempt = state?.attempts.at(-1);
+  if (!state || attempt?.agentId !== attemptId || state.status !== "running") return false;
+  try {
+    recordReport(run, attemptId, result, now);
+  } catch (error) {
+    recordReport(run, attemptId, { outcome: "failure", summary: `${result.summary} (result refused: ${(error as Error).message})`, outputs: {} }, now);
+  }
+  endTurn(run, attemptId, { turnEnd: "completed", lastMessage: attempt.lastMessage, now });
+  return true;
 }

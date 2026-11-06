@@ -5,13 +5,27 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 
 /** The daemon API handed to plugin handlers (typed via the SDK, so the build needs no @getpaseo/client). */
 type PaseoApi = PluginHandlerContext["paseo"];
-import type { Attempt, Playbook, Run, Step, VarValue } from "../shared/types";
-import { SCRIPT_NOT_YET, attemptTimeoutMs, isActive, isPaused, isScriptAttempt, isStepLive, isTerminal, restartBlocker, scriptAttemptId } from "../shared/types";
+import type { Attempt, Job, Playbook, Run, Step, VarValue } from "../shared/types";
+import {
+  SCRIPT_NOT_YET,
+  attemptTimeoutMs,
+  handoffAttemptId,
+  isActive,
+  isAgentlessAttempt,
+  isBoarding,
+  isHandoffAttempt,
+  isPaused,
+  isScriptAttempt,
+  isStepLive,
+  isTerminal,
+  restartBlocker,
+  scriptAttemptId,
+} from "../shared/types";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
-import { checkoutSnapshot, currentRef, snapshotDiff } from "./git";
+import { checkoutSnapshot, currentRef, defaultBranch, snapshotDiff } from "./git";
 import { loadPlaybooks } from "./loader";
-import { managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, stepSystemPrompt } from "./prompts";
+import { managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt } from "./prompts";
 import type { RunStore } from "./store";
 import { holdsBlock, planAdmissions, slotHolders } from "../shared/slots";
 
@@ -31,6 +45,7 @@ export const MANAGER_TOOL_NAMES = [
   "cancel_run",
   "restart_run",
   "validate_playbooks",
+  "settle_job",
 ];
 export const STEP_TOOL_NAMES = ["report_step_result"];
 
@@ -114,6 +129,8 @@ function scriptEnv(run: Run, stepId: string, attempt: Run["steps"][string]["atte
     PLAYBOOK_WORKSPACE: run.workspaceDir,
   };
   if (feedback) env.PLAYBOOK_FEEDBACK = feedback;
+  // A singleton run's open jobs, as {{ run.jobs }} gives them to prompts.
+  if (run.playbook.singleton) env.PLAYBOOK_JOBS = JSON.stringify(engine.openJobs(run));
   for (const [name, input] of Object.entries(attempt.inputs)) {
     env[`PLAYBOOK_INPUT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] = input.value === "(none)" ? "" : input.value;
   }
@@ -151,6 +168,17 @@ function silenceDue(step: Step, attempt: Attempt, activeAt: number): number | nu
   return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
+/** " (env: dev)" for a singleton run's key values; empty without a key. */
+function describeKey(inputs: Record<string, VarValue>): string {
+  const entries = Object.entries(inputs);
+  return entries.length === 0 ? "" : ` (${entries.map(([name, value]) => `${name}: ${value}`).join(", ")})`;
+}
+
+function sameKey(a: Record<string, VarValue>, b: Record<string, VarValue>): boolean {
+  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
+  return keys.every((name) => a[name] === b[name]);
+}
+
 export class Runtime {
   private paseo: PaseoApi | null = null;
   private reconciled: Promise<void> | null = null;
@@ -166,6 +194,11 @@ export class Runtime {
   private readonly scripts = new Map<string, { child: ChildProcess | null; next: ReturnType<typeof setTimeout> | null }>();
   /** Feedback a script attempt started with (after a goto), passed to each of its checks. */
   private readonly scriptFeedback = new Map<string, string>();
+  /** Boarding runs being given their worktree and manager. */
+  private readonly departing = new Set<string>();
+  /** The plugin's own work (scripts, hand-offs, departures) runs one pass at a time; a call during a pass asks for another. */
+  private ticking = false;
+  private tickAgain = false;
 
   constructor(private readonly store: RunStore) {}
 
@@ -196,7 +229,7 @@ export class Runtime {
    */
   private async reconcile(): Promise<void> {
     for (const run of this.store.list()) {
-      if (!isActive(run)) continue;
+      if (!isActive(run) || isBoarding(run)) continue;
       const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
       if (!manager || manager.agent.archivedAt) {
         await this.failRun(run.id, "manager lost");
@@ -210,6 +243,11 @@ export class Runtime {
           // Checks are idempotent: the one cut by the restart runs again.
           this.armTimeout(run, stepId);
           this.runCheck(run.id, stepId, attempt.agentId);
+          continue;
+        }
+        if (isHandoffAttempt(attempt.agentId)) {
+          // Its job waits in run state: only its timeout needs arming again.
+          this.armTimeout(run, stepId);
           continue;
         }
         const agent = await this.api().agents.ref(attempt.agentId).refresh().catch(() => null);
@@ -347,6 +385,10 @@ export class Runtime {
         this.stopScript(agentId);
         continue;
       }
+      if (isHandoffAttempt(agentId)) {
+        await this.withdrawHandoff(runId, agentId, "its hand-off step was canceled or reset");
+        continue;
+      }
       await this.api()
         .agents.ref(agentId)
         .reload()
@@ -390,6 +432,7 @@ export class Runtime {
       if (!entry.playbook) throw new UserError(`playbook "${playbookId}" is invalid:\n${entry.errors.join("\n")}`);
       playbook = entry.playbook;
     }
+    if (playbook.singleton) return this.boardFromStart(workspaceDir, workspace.projectId, playbook, inputs);
     this.checkConcurrency(playbook, workspace.projectId);
     const run = engine.newRun({
       id: reservation?.runId ?? `run_${shortId()}`,
@@ -434,8 +477,237 @@ export class Runtime {
       await this.enqueue(runId, [`A concurrency slot is free: ${toStart.join(", ")} ${toStart.length === 1 ? "is" : "are"} now ready. Start ${toStart.length === 1 ? "it" : "them"} with start_step.`]);
       await this.deliver(runId);
     }
-    // Every place that may make steps ready ends here, so ready script steps start here too.
-    await this.startScripts();
+    // Every place that may make steps ready ends here, so the plugin's own work starts here too.
+    await this.tick();
+  }
+
+  /** Starts ready script and hand-off steps, ends the jobs of ended singleton runs, and departs boarding runs. */
+  private async tick(): Promise<void> {
+    if (this.ticking) {
+      this.tickAgain = true;
+      return;
+    }
+    this.ticking = true;
+    try {
+      do {
+        this.tickAgain = false;
+        await this.startScripts();
+        await this.startHandoffs();
+        await this.endCarriedJobs();
+        await this.departBoarding();
+      } while (this.tickAgain);
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  // ---------------------------------------------------------------- hand-offs and singleton runs
+
+  /** Starts the ready hand-off steps of every active, unpaused run: each hands a job to a boarding run of its singleton. */
+  private async startHandoffs(): Promise<void> {
+    for (const run of this.store.list()) {
+      if (!isActive(run) || isPaused(run) || isBoarding(run)) continue;
+      for (const stepId of engine.readyHandoffs(run)) {
+        const attemptId = await this.store.mutate(run.id, (current) => {
+          if (current.steps[stepId]!.status !== "ready" || isPaused(current)) return null;
+          const id = handoffAttemptId(current.id, stepId, current.steps[stepId]!.attempts.length + 1);
+          engine.startAttempt(current, stepId, { agentId: id, brief: "", now: nowIso(), readonlySnapshot: null });
+          return id;
+        });
+        if (!attemptId) continue;
+        this.armTimeout(this.store.get(run.id)!, stepId);
+        const boarded = await this.board(run.id, stepId, attemptId).catch((error: unknown) => errorText(error));
+        if (typeof boarded === "string") await this.finishHandoff(run.id, stepId, attemptId, { outcome: "failure", summary: `could not hand off: ${boarded}`, outputs: {} });
+      }
+    }
+  }
+
+  /** Puts the hand-off's job on the boarding run of its singleton and key (created if needed). */
+  private async board(runId: string, stepId: string, attemptId: string): Promise<true> {
+    const run = this.store.get(runId)!;
+    const step = engine.stepDef(run, stepId);
+    const loaded = await loadPlaybooks(run.workspaceDir);
+    const entry = loaded.entries.find((candidate) => candidate.id === step.handoff);
+    if (!entry?.playbook) throw new UserError(entry ? `playbook "${step.handoff}" is invalid: ${entry.errors[0] ?? ""}` : `no playbook "${step.handoff}" in ${run.workspaceDir}`);
+    const target = entry.playbook;
+    if (!target.singleton) throw new UserError(`playbook "${target.id}" is not a singleton`);
+    const values = Object.fromEntries(
+      Object.entries(engine.stepInputs(run, step)).flatMap(([name, entry]) => (entry.value === undefined ? [] : [[name, entry.value]])),
+    );
+    const key = engine.resolveKeyInputs(target, values);
+    const inputs = engine.resolveJobInputs(target, values);
+    const problems = [...(key.ok ? [] : key.errors), ...(inputs.ok ? [] : inputs.errors)];
+    if (!key.ok || !inputs.ok) throw new UserError(problems.join("; "));
+    const carrier = await this.boardingRun(target, run.projectId, run.workspaceDir, key.inputs);
+    const job: Job = {
+      id: `job_${shortId()}`,
+      fromRunId: run.id,
+      fromStepId: stepId,
+      attempt: run.steps[stepId]!.attempts.length,
+      label: `${run.playbook.title} · ${run.id}`,
+      inputs: inputs.inputs,
+      status: "open",
+      outcome: null,
+      summary: null,
+      outputs: {},
+      createdAt: nowIso(),
+      endedAt: null,
+    };
+    await this.store.mutate(carrier.id, (current) => engine.addJob(current, job, nowIso()));
+    await this.store.mutate(run.id, (current) => {
+      const attempt = current.steps[stepId]!.attempts.at(-1)!;
+      if (attempt.agentId !== attemptId) return;
+      attempt.job = { runId: carrier.id, jobId: job.id };
+      attempt.lastMessage = `Boarding run ${carrier.id} of "${target.id}"${describeKey(key.inputs)}.`;
+    });
+    this.tickAgain = true;
+    return true;
+  }
+
+  /** The boarding run of a singleton for these key values, created when there is none. */
+  private async boardingRun(playbook: Playbook, projectId: string, sourceDir: string, key: Record<string, VarValue>): Promise<Run> {
+    const existing = this.store
+      .list()
+      .filter((run) => isBoarding(run) && run.projectId === projectId && run.playbook.id === playbook.id && sameKey(run.inputs, key))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+    if (existing) return existing;
+    const run = engine.newBoardingRun({ id: `run_${shortId()}`, playbook, workspaceDir: sourceDir, projectId, inputs: key, now: nowIso() });
+    await this.store.create(run);
+    return run;
+  }
+
+  /** Start (panel) or start_playbook on a singleton: joins or creates its boarding run, which departs even without a job. */
+  private async boardFromStart(sourceDir: string, projectId: string, playbook: Playbook, inputs: Record<string, unknown>): Promise<Run> {
+    const key = engine.resolveKeyInputs(playbook, inputs);
+    if (!key.ok) throw new UserError(key.errors.join("; "));
+    const run = await this.boardingRun(playbook, projectId, sourceDir, key.inputs);
+    await this.store.mutate(run.id, (current) => {
+      current.departEmpty = true;
+    });
+    await this.tick();
+    return this.store.get(run.id)!;
+  }
+
+  /** Departs the boarding runs whose key has a free slot (oldest first): each gets its worktree and its own manager. */
+  private async departBoarding(): Promise<void> {
+    const boarding = this.store
+      .list()
+      .filter((run) => isBoarding(run) && !this.departing.has(run.id))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    for (const run of boarding) {
+      const limit = run.playbook.singleton?.limit;
+      const running = this.store
+        .list()
+        .filter((other) => other.projectId === run.projectId && other.playbook.id === run.playbook.id && !isTerminal(other.status) && !isBoarding(other) && sameKey(other.inputs, run.inputs));
+      if (limit !== undefined && running.length >= limit) continue;
+      if (!run.departEmpty && !run.jobs.some((job) => job.status === "open")) continue;
+      this.departing.add(run.id);
+      try {
+        await this.depart(run.id);
+      } catch (error) {
+        console.error(`[playbooks] run ${run.id} could not depart:`, errorText(error));
+        const effects = await this.store.mutate(run.id, (current) => engine.failRun(current, `could not depart: ${errorText(error)}`, nowIso()));
+        await this.applyEffects(run.id, effects);
+        this.tickAgain = true;
+      } finally {
+        this.departing.delete(run.id);
+      }
+    }
+  }
+
+  /** Gives a boarding run its worktree (from the singleton's branch), reads the playbook there, and starts its manager. */
+  private async depart(runId: string): Promise<void> {
+    const run = this.store.get(runId)!;
+    const playbook = run.playbook;
+    const ref = playbook.singleton?.branch ?? (await defaultBranch(run.workspaceDir)) ?? undefined;
+    const branch = `playbooks/${playbook.id}-${run.id.replace(/^run_/, "")}`;
+    const created = await this.api().workspaces.create({
+      title: `${playbook.title}${describeKey(run.inputs)}`,
+      source: { kind: "worktree", cwd: run.workspaceDir, action: "branch-off", branchName: branch, ...(ref ? { refName: ref } : {}) },
+    });
+    const workspace = await this.api().workspaces.ref(created.id).refresh();
+    const workspaceDir = workspace?.workspaceDirectory ?? run.workspaceDir;
+    // The run's own copy of the playbook, on the singleton's branch, is the one that counts.
+    const entry = (await loadPlaybooks(workspaceDir)).entries.find((candidate) => candidate.id === playbook.id);
+    if (!entry?.playbook) throw new UserError(entry ? `playbook "${playbook.id}" is invalid on ${ref ?? "its branch"}: ${entry.errors[0] ?? ""}` : `no playbook "${playbook.id}" on ${ref ?? "its branch"}`);
+    if (!entry.playbook.singleton) throw new UserError(`playbook "${playbook.id}" is not a singleton on ${ref ?? "its branch"}`);
+    const manager = await created.agents.create({
+      config: this.managerConfig(entry.playbook),
+      title: `Playbook Manager · ${playbook.title}${describeKey(run.inputs)}`,
+      labels: { [MANAGER_LABEL]: "true" },
+    });
+    const departed = await this.store.mutate(runId, (current) =>
+      engine.departRun(current, { workspaceId: created.id, workspaceDir, branch, managerAgentId: manager.id, playbook: entry.playbook!, now: nowIso() }),
+    );
+    for (const { job, reason } of departed.refused) await this.deliverJob(job, { outcome: "failure", summary: `job refused by run ${runId}: ${reason}`, outputs: {} });
+    const current = this.store.get(runId)!;
+    const open = current.jobs.filter((job) => job.status === "open");
+    // The handing-off steps show where their job is now.
+    for (const job of open) {
+      if (!this.store.get(job.fromRunId)) continue;
+      const attemptId = handoffAttemptId(job.fromRunId, job.fromStepId, job.attempt);
+      await this.store.mutate(job.fromRunId, (from) => {
+        const attempt = from.steps[job.fromStepId]?.attempts.at(-1);
+        if (attempt?.agentId === attemptId) attempt.lastMessage = `On run ${runId} of "${playbook.id}"${describeKey(current.inputs)}, departed with ${open.length} job(s).`;
+      });
+    }
+    await manager.send(singletonKickoff(current, engine.readySteps(current)));
+    this.busyManagers.add(manager.id);
+    this.tickAgain = true;
+  }
+
+  /** Jobs still open in singleton runs that have ended: settled with the run's outcome, or failed; their hand-offs are told. */
+  private async endCarriedJobs(): Promise<void> {
+    for (const run of this.store.list()) {
+      if (!run.playbook.singleton || !isTerminal(run.status) || !run.jobs.some((job) => job.status === "open")) continue;
+      const ended = await this.store.mutate(run.id, (current) => engine.endOpenJobs(current, nowIso()));
+      for (const job of ended) {
+        const result = job.status === "settled" ? { outcome: job.outcome!, summary: job.summary ?? "", outputs: job.outputs } : { outcome: "failure", summary: job.summary ?? `run ${run.id} ${run.status}`, outputs: {} };
+        await this.deliverJob(job, result);
+      }
+    }
+  }
+
+  /** A job's result reaches the step that handed it off (which completes now, or on resume when its run is paused). */
+  private async deliverJob(job: Job, result: { outcome: string; summary: string; outputs: Record<string, unknown> }): Promise<void> {
+    if (!this.store.get(job.fromRunId)) return;
+    await this.finishHandoff(job.fromRunId, job.fromStepId, handoffAttemptId(job.fromRunId, job.fromStepId, job.attempt), result);
+  }
+
+  private async finishHandoff(runId: string, stepId: string, attemptId: string, result: { outcome: string; summary: string; outputs: Record<string, unknown> }): Promise<void> {
+    this.clearTimeout(attemptId);
+    const received = await this.store.mutate(runId, (current) => engine.receiveJobResult(current, stepId, attemptId, result, nowIso()));
+    if (received) await this.settleScripts(runId);
+  }
+
+  /** A hand-off step was canceled, reset or timed out: its job leaves its boarding run, or the run carrying it is told. */
+  private async withdrawHandoff(fromRunId: string, attemptId: string, reason: string): Promise<void> {
+    this.clearTimeout(attemptId);
+    const from = this.store.get(fromRunId);
+    const attempt = from && Object.values(from.steps).flatMap((state) => state.attempts).find((candidate) => candidate.agentId === attemptId);
+    if (!attempt?.job) return;
+    const carrier = this.store.get(attempt.job.runId);
+    if (!carrier) return;
+    const job = await this.store.mutate(carrier.id, (current) => engine.withdrawJob(current, attempt.job!.jobId, reason, nowIso()));
+    if (!job) return;
+    const after = this.store.get(carrier.id)!;
+    if (isBoarding(after) && !after.departEmpty && !after.jobs.some((candidate) => candidate.status === "open")) {
+      // A boarding run left with no job is dropped.
+      await this.store.delete(carrier.id);
+      return;
+    }
+    if (!isBoarding(after) && !isTerminal(after.status)) {
+      await this.enqueue(carrier.id, [`Job ${job.id} (from ${job.label}) was withdrawn: ${reason}. Leave it out of the rest of the run; it no longer needs settle_job.`]);
+      await this.deliver(carrier.id);
+    }
+  }
+
+  /** The run's manager settles one job; the step that handed it off is told at once. */
+  async settleJob(managerId: string, runId: string, jobId: string, input: { outcome: string; summary: string; outputs: Record<string, unknown> }): Promise<Run> {
+    const run = this.ownedRun(managerId, runId);
+    const job = await this.store.mutate(run.id, (current) => engine.settleJob(current, jobId, { ...input, now: nowIso() }));
+    await this.deliverJob(job, { outcome: job.outcome!, summary: job.summary ?? "", outputs: job.outputs });
+    return this.store.get(run.id)!;
   }
 
   // ---------------------------------------------------------------- script steps
@@ -559,9 +831,10 @@ export class Runtime {
     if (!run || isPaused(run)) return;
     for (const step of run.playbook.steps) {
       const state = this.store.get(runId)!.steps[step.id]!;
-      if (step.kind !== "script" || state.status !== "reported" || !isStepLive(this.store.get(runId)!, step.id)) continue;
+      if ((step.kind !== "script" && step.kind !== "handoff") || state.status !== "reported" || !isStepLive(this.store.get(runId)!, step.id)) continue;
       const attempt = state.attempts.at(-1)!;
-      const report = attempt.report ?? { outcome: "failure", summary: `${step.script} ended without a result`, outputs: {} };
+      const kind = step.kind === "script" ? "script step" : "hand-off step";
+      const report = attempt.report ?? { outcome: "failure", summary: `${step.script ?? step.handoff} ended without a result`, outputs: {} };
       let effects: engine.Effects;
       try {
         effects = await this.store.mutate(runId, (current) =>
@@ -569,7 +842,7 @@ export class Runtime {
         );
       } catch (error) {
         // Left reported: the manager decides with complete_step.
-        await this.enqueue(runId, [`script step "${step.id}" attempt ${attempt.n} ended ${report.outcome} but could not be completed (${errorText(error)}). Call complete_step for it.`]);
+        await this.enqueue(runId, [`${kind} "${step.id}" attempt ${attempt.n} ended ${report.outcome} but could not be completed (${errorText(error)}). Call complete_step for it.`]);
         continue;
       }
       await this.applyEffects(runId, effects);
@@ -580,7 +853,7 @@ export class Runtime {
       if ((again.status === "running" || again.status === "ready") && again.attempts.length > state.attempts.length) continue;
       const ready = engine.readySteps(after);
       await this.enqueue(runId, [
-        `script step "${step.id}" attempt ${attempt.n} ended ${report.outcome} after ${attempt.checks} check(s): ${report.summary}${Object.keys(report.outputs).length ? ` Outputs: ${JSON.stringify(report.outputs)}.` : ""}`,
+        `${kind} "${step.id}" attempt ${attempt.n} ended ${report.outcome}${step.kind === "script" ? ` after ${attempt.checks} check(s)` : ` (job of "${step.handoff}")`}: ${report.summary}${Object.keys(report.outputs).length ? ` Outputs: ${JSON.stringify(report.outputs)}.` : ""}`,
         "The plugin completed it; do not call complete_step for it.",
         ...effects.notes,
         isActive(after) && ready.length > 0 ? `Ready: ${ready.join(", ")}. Start them with start_step (or request_gate for a gate).` : "",
@@ -604,6 +877,7 @@ export class Runtime {
     const run = this.ownedRun(managerId, runId);
     const step = engine.stepDef(run, stepId);
     if (step.kind === "script") throw new UserError(`step "${stepId}" is a script step: the plugin runs it by itself and wakes you with its result`);
+    if (step.kind === "handoff") throw new UserError(`step "${stepId}" is a hand-off step: the plugin hands its job to "${step.handoff}" and wakes you with the result`);
     if (step.kind !== "agent" || !step.role) throw new UserError(`step "${stepId}" is a gate; call request_gate`);
     if (run.steps[stepId]!.status !== "ready") {
       throw new UserError(`step "${stepId}" is ${run.steps[stepId]!.status}, not ready (ready now: ${engine.readySteps(run).join(", ") || "none"})`);
@@ -789,7 +1063,7 @@ export class Runtime {
     const state = run.steps[stepId];
     const attempt = state?.attempts.at(-1);
     if (!state || !attempt) throw new UserError(`step "${stepId}" has no attempt to nudge`);
-    if (isScriptAttempt(attempt.agentId)) throw new UserError(`step "${stepId}" is a script step: there is no agent to nudge`);
+    if (isAgentlessAttempt(attempt.agentId)) throw new UserError(`step "${stepId}" is a ${isScriptAttempt(attempt.agentId) ? "script" : "hand-off"} step: there is no agent to nudge`);
     if (!isStepLive(run, stepId)) throw new UserError(`step "${stepId}" can no longer change: run ${run.id} is ${run.status}`);
     if (state.status === "reported") {
       // The agent works again: its next turn end reports again (after a timeout, its report replaces the timeout failure).
@@ -1094,7 +1368,7 @@ export class Runtime {
   private armWatch(run: Run, stepId: string, activeAt: number, notBefore = 0): void {
     const step = engine.stepDef(run, stepId);
     const attempt = run.steps[stepId]!.attempts.at(-1);
-    if (!attempt || isScriptAttempt(attempt.agentId) || attempt.silenceReminded || run.steps[stepId]!.status !== "running") return;
+    if (!attempt || isAgentlessAttempt(attempt.agentId) || attempt.silenceReminded || run.steps[stepId]!.status !== "running") return;
     const due = silenceDue(step, attempt, activeAt);
     if (due === null) return;
     const existing = this.watches.get(attempt.agentId);
@@ -1165,6 +1439,11 @@ export class Runtime {
     const run = this.store.get(runId);
     const attempt = run?.steps[stepId]?.attempts.at(-1);
     if (!run || attempt?.agentId !== agentId || run.steps[stepId]!.status !== "running") return;
+    if (isHandoffAttempt(agentId)) {
+      await this.withdrawHandoff(runId, agentId, `its hand-off step timed out after ${Math.round(timeoutMs / 60000)} min`);
+      await this.finishHandoff(runId, stepId, agentId, { outcome: "failure", summary: `timed out after ${Math.round(timeoutMs / 60000)} min waiting for its job`, outputs: {} });
+      return;
+    }
     if (isScriptAttempt(agentId)) {
       const checks = attempt.checks;
       await this.finishScript(runId, stepId, agentId, { outcome: "failure", summary: `timed out after ${Math.round(timeoutMs / 60000)} min (${checks} check(s))`, outputs: {} }, "timeout");
@@ -1261,6 +1540,10 @@ export class Runtime {
     const entry = loaded.entries.find((candidate) => candidate.id === input.playbook);
     if (!entry?.playbook) throw new UserError(entry ? `playbook "${input.playbook}" is invalid:\n${entry.errors.join("\n")}` : `no playbook "${input.playbook}"`);
     const playbook = entry.playbook;
+    if (playbook.singleton) {
+      const run = await this.boardFromStart(workspaceDir, workspace.projectId, playbook, input.inputs);
+      return { status: "started" as const, workspaceId: run.workspaceId || workspace.id, managerAgentId: run.managerAgentId, runId: run.id, queued: isBoarding(run) };
+    }
     const resolved = engine.resolveRunInputs(playbook, input.inputs);
     if (!resolved.ok) throw new UserError(resolved.errors.join("; "));
     this.checkConcurrency(playbook, workspace.projectId);

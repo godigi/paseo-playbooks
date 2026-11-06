@@ -1,4 +1,5 @@
-import type { Playbook, Role, Step, VarValue } from "../shared/types";
+import type { Playbook, Role, Run, Step, VarValue } from "../shared/types";
+import { jobsText } from "./engine";
 
 /** How the manager works. Returned by list_playbooks and sent when Start creates a manager. */
 export const MANAGER_PROTOCOL = `You are the Playbook Manager. You run a playbook by starting each step as a subagent,
@@ -47,7 +48,10 @@ How to run a playbook:
    human clicks Start in the panel (you are woken with its ready steps) or asks you in chat:
    then call start_after_task and run its ready steps. A step that reviews the run (a retro)
    needs the whole run: get_run with view "full" gives it.
-9. Pause: a human may pause the run from the panel. While it is paused, start_step and
+9. Hand-off steps (\`handoff:\` instead of a role) are not yours either: the plugin hands
+   their job to a singleton playbook, which runs it in its own run, and wakes you with the
+   result (the step's outcome and outputs) and what is ready next.
+10. Pause: a human may pause the run from the panel. While it is paused, start_step and
    nudge_step are refused and you are not woken; running steps finish their turn. End your
    turn. On resume you are woken with the ready steps and the reports that came in meanwhile.
 
@@ -129,4 +133,24 @@ export function managerAfterRestart(ready: string[], reported: string[]): string
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+/** Kickoff for the manager of a singleton run that just departed with its jobs. */
+export function singletonKickoff(run: Run, ready: string[]): string {
+  const jobs = jobsText(run);
+  return `${MANAGER_PROTOCOL}
+
+You are the Playbook Manager of run ${run.id} (singleton playbook "${run.playbook.id}"), which the plugin
+just started in its own worktree. The run already exists: do not call start_playbook.
+Run inputs:
+${JSON.stringify(run.inputs, null, 2)}
+
+This run carries jobs, handed off by other runs that wait for them. Each job has its own inputs; the
+steps read them all through {{ run.jobs }}. Settle each job with settle_job (an outcome of the
+playbook, a summary and its outputs) as soon as its result is known: the run that handed it off is
+told at once, and may go on while this run carries on with the others. A job left open when the run
+completes takes the run's outcome and outputs; when the run fails or is canceled, its open jobs fail.
+${jobs ? `Jobs on this run:\n${jobs}` : "This run carries no job (it was started by hand)."}
+
+Ready now: ${ready.join(", ") || "none"}. Start them with start_step.`;
 }

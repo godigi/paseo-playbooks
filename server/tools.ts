@@ -2,7 +2,7 @@ import { defineAgentTool, type AgentToolDefinition, type AgentToolResult } from 
 import { askHumanText, choicesOfGate, GATE_SUMMARY_MAX } from "../shared/gates";
 import { z } from "zod";
 import type { PlaybookEntry, Run } from "../shared/types";
-import { isActive, isPaused, isScriptAttempt, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
+import { isActive, isAgentlessAttempt, isBoarding, isPaused, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
 import * as engine from "./engine";
 import { hasPlaybooks, loadPlaybooks } from "./loader";
 import { MANAGER_PROTOCOL } from "./prompts";
@@ -49,6 +49,17 @@ function compactGate(gate: Run["gates"][number]) {
   return { id: gate.id, kind: gate.kind, stepId: gate.stepId, status: gate.status, summary: gate.summary, comment: clip(gate.comment), decidedBy: gate.decidedBy };
 }
 
+/** A singleton run's jobs: id, where from, status and outcome (inputs with view "full"). */
+function jobStatus(run: Run, full = false) {
+  return run.jobs.map((job) => ({
+    id: job.id,
+    from: job.label,
+    status: job.status,
+    outcome: job.outcome,
+    ...(full ? { inputs: job.inputs, outputs: job.outputs, summary: job.summary } : { summary: clip(job.summary) }),
+  }));
+}
+
 function afterStatus(run: Run) {
   return run.playbook.after.map((task) => ({ id: task.id, trigger: task.trigger, status: run.after[task.id]?.status ?? "pending", detail: run.after[task.id]?.detail ?? null }));
 }
@@ -68,6 +79,7 @@ export function runChange(run: Run, stepId?: string) {
     running: runningSteps(run),
     gates: run.gates.filter((gate) => gate.status === "pending").map(compactGate),
     ...(isTerminal(run.status) ? { outputs: run.outputs } : {}),
+    ...(run.playbook.singleton ? { jobs: jobStatus(run) } : {}),
     after: afterStatus(run),
   };
 }
@@ -107,6 +119,7 @@ export function runCompact(run: Run, only?: string[]) {
     ),
     gates: run.gates.map(compactGate),
     loops: run.loops,
+    ...(run.playbook.singleton ? { jobs: jobStatus(run) } : {}),
     after: afterStatus(run),
   };
 }
@@ -142,7 +155,8 @@ export function runFull(run: Run, only?: string[]) {
             outcomes: step.outcomes,
             status: state.status,
             attempts: state.attempts.length,
-            agentId: attempt && !isScriptAttempt(attempt.agentId) ? attempt.agentId : null,
+            agentId: attempt && !isAgentlessAttempt(attempt.agentId) ? attempt.agentId : null,
+            ...(step.kind === "handoff" ? { handoff: step.handoff, job: attempt?.job ?? null } : {}),
             ...(step.kind === "script" ? { script: step.script, checks: attempt?.checks ?? 0, nextCheckAt: attempt?.nextCheckAt ?? null } : {}),
             report: attempt?.report ?? null,
             lastMessage: attempt?.report ? null : attempt?.lastMessage ?? null,
@@ -155,6 +169,7 @@ export function runFull(run: Run, only?: string[]) {
     ),
     gates: run.gates,
     loops: run.loops,
+    ...(run.playbook.singleton ? { jobs: jobStatus(run, true) } : {}),
     after: run.playbook.after.map((task) => ({ ...task, ...(run.after[task.id] ?? { status: "pending" }) })),
   };
 }
@@ -185,6 +200,7 @@ function describeEntry(entry: PlaybookEntry) {
     inputs: pb.inputs,
     outputs: Object.fromEntries(Object.entries(pb.outputs).map(([name, def]) => [name, { type: def.type, from: def.label }])),
     concurrency: pb.concurrency ?? null,
+    ...(pb.singleton ? { singleton: { branch: pb.singleton.branch ?? "(default branch)", key: pb.singleton.key, limit: pb.singleton.limit ?? null } } : {}),
     after: pb.after.map((task) => ({ id: task.id, title: task.title, trigger: task.trigger, steps: task.steps })),
     steps: pb.steps.map((step) => ({
       id: step.id,
@@ -192,6 +208,8 @@ function describeEntry(entry: PlaybookEntry) {
       role: step.role ? `${step.role} (${pb.roles[step.role]!.title}${pb.roles[step.role]!.readonly ? ", readonly" : ""})` : null,
       gate: step.gate ?? null,
       ...(step.kind === "script" ? { script: step.script, poll: step.pollMs ? `${step.pollMs / 1000}s` : null } : {}),
+      ...(step.kind === "handoff" ? { handoff: step.handoff } : {}),
+      ...(step.when ? { when: Object.fromEntries(step.when.map((condition) => [condition.input, condition.values])) } : {}),
       afterTask: step.afterTask ?? null,
       needs: step.needs,
       inputs: Object.fromEntries(Object.entries(step.inputs).map(([name, wiring]) => [name, `${wiring.label}${wiring.auto ? " (auto)" : ""}`])),
@@ -229,6 +247,14 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
       execute: ({ playbook, inputs }, { agent }) =>
         guard(async () => {
           const run = await runtime.startPlaybook(agent, playbook, inputs);
+          if (run.playbook.singleton) {
+            return ok(
+              isBoarding(run)
+                ? `"${playbook}" is a singleton: run ${run.id} is boarding and departs as soon as its key has a free slot, with its own worktree and Playbook Manager. You do not manage it.`
+                : `"${playbook}" is a singleton: run ${run.id} departed with its own worktree and Playbook Manager (agent ${run.managerAgentId}). You do not manage it.`,
+              { runId: run.id, status: run.status },
+            );
+          }
           return ok(
             `Run ${run.id} started on branch ${run.branch ?? "(unknown)"}. Ready: ${engine.readySteps(run).join(", ") || "none"}. Start them with start_step.${engine.queuedSteps(run).length ? ` Queued for a free concurrency slot of another run: ${engine.queuedSteps(run).join(", ")}; you are woken when they are ready.` : ""}`,
             runChange(run),
@@ -336,6 +362,24 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
           runtime.ownedRun(agent.id, runId);
           await runtime.nudgeStep(runId, stepId, message);
           return ok(`Sent to "${stepId}". End your turn; you will be woken when it finishes.`);
+        }),
+    }),
+    defineAgentTool({
+      name: "settle_job",
+      description:
+        "Singleton runs: settle one job the run carries (see get_run `jobs`, or {{ run.jobs }} in the step prompts) with an outcome of the playbook, a summary and its outputs (all of them for the first outcome). The run that handed it off is told at once; this run goes on with the others.",
+      input: z.object({
+        runId: IdArg,
+        jobId: z.string(),
+        outcome: z.string().describe("One of the playbook's outcomes"),
+        summary: z.string().describe("What happened to this job, for the run that handed it off"),
+        outputs: z.record(z.string(), VarValueSchema).default({}).describe("The playbook's outputs for this job"),
+      }),
+      execute: ({ runId, jobId, outcome, summary, outputs }, { agent }) =>
+        guard(async () => {
+          const run = await runtime.settleJob(agent.id, runId, jobId, { outcome, summary, outputs });
+          const open = run.jobs.filter((job) => job.status === "open").map((job) => job.id);
+          return ok(`Job ${jobId} settled with "${outcome}"; its run was told. Open jobs: ${open.join(", ") || "none"}.`, runChange(run));
         }),
     }),
     defineAgentTool({
