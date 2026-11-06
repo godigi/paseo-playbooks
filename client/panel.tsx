@@ -5,11 +5,12 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Pressable, Text, View } from "react-native";
 import { archiveRunRpc, cancelRunRpc, listPlaybooks, listRuns, pauseRunRpc, resumeRunRpc } from "../shared/contracts";
-import { isActive, isPaused, isTerminal, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
+import { isActive, isPaused, isPipeline, isTerminal, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
 import { useAgentEvents } from "./events";
 import { Graph, useReduceMotion } from "./graph";
 import { Button, StepSheet } from "./sheet";
 import { StartForm, type StartTarget } from "./start-form";
+import { Stations } from "./stations";
 import { splitError } from "../shared/errors";
 import { runStatusColor, runStatusLabel, withAlpha, type Theme } from "./theme";
 
@@ -50,14 +51,15 @@ export function PlaybooksPanel(props: PluginWorkspacePanelProps) {
     const toCard = (id: string): Card => ({
       id,
       entry: entries.find((entry) => entry.id === id) ?? null,
-      runs: allRuns.filter((run) => run.playbook.id === id),
+      // A singleton's trains are runs of its stations: they go under the singleton.
+      runs: allRuns.filter((run) => (run.train?.playbook ?? run.playbook.id) === id),
     });
     // Hidden playbooks (sub-playbooks or after-tasks only) go in the collapsed section at the
     // bottom, unless they have runs (a run may wait on a gate) or errors (so they are seen).
     const tucked = (entry: PlaybookEntry) =>
-      entry.hidden && entry.errors.length === 0 && !allRuns.some((run) => run.playbook.id === entry.id);
+      entry.hidden && entry.errors.length === 0 && !allRuns.some((run) => (run.train?.playbook ?? run.playbook.id) === entry.id);
     const listed = entries.filter((entry) => !tucked(entry));
-    const ids = [...new Set([...listed.map((entry) => entry.id), ...allRuns.map((run) => run.playbook.id)])];
+    const ids = [...new Set([...listed.map((entry) => entry.id), ...allRuns.map((run) => run.train?.playbook ?? run.playbook.id)])];
     return { cards: ids.map(toCard), hiddenCards: entries.filter(tucked).map((entry) => toCard(entry.id)) };
   }, [playbooks.data, runs.data]);
   const [showHidden, setShowHidden] = useTabState(props.tab, z.boolean(), false);
@@ -254,13 +256,20 @@ function PlaybookCard(props: {
                 if (candidate.status === "completed") props.onRead(candidate.id);
               }}
               onCanceled={() => void queryClient.invalidateQueries({ queryKey: ["playbooks"] })}
-              onOpenManager={() => props.onOpenAgent(candidate.managerAgentId)}
+              onOpenManager={() => candidate.managerAgentId && props.onOpenAgent(candidate.managerAgentId)}
             />
           ))}
         </View>
       ) : null}
       {expanded && run ? <RunBar theme={theme} run={run} hostLabel={props.hostLabel} /> : null}
-      {expanded && playbook ? (
+      {expanded && run && isPipeline(run) ? (
+        <Stations
+          theme={theme}
+          pipeline={run}
+          runs={card.runs}
+          onOpenTrain={(train) => setSelected(train.id)}
+        />
+      ) : expanded && playbook ? (
         <Graph
           playbook={playbook}
           run={run}

@@ -5,11 +5,12 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { Animated, Easing, Pressable, Text, View } from "react-native";
 import { markRunSeenRpc } from "../shared/contracts";
 import { gateText } from "../shared/gates";
-import { isActive, isPaused, type Gate, type Run, type Step } from "../shared/types";
+import { isActive, isPaused, isPipeline, isTerminal, type Gate, type Run, type Step } from "../shared/types";
 import { useReduceMotion } from "./graph";
 import { LABEL_WIDTH, labelLayout, ROW_HEIGHT } from "./layout";
 import { useOverview, type OverviewStore } from "./overview-store";
 import { GateActions } from "./sheet";
+import { Stations } from "./stations";
 import { stepShortTitle, stepTitle, stepTitleOf, withAlpha, type Theme } from "./theme";
 
 /** Id of the Playbooks screen, opened from the sidebar row. */
@@ -149,17 +150,9 @@ function pendingGates(run: Run): Gate[] {
   return run.gates.filter((gate) => gate.status === "pending");
 }
 
-/** A singleton run's key values, e.g. "env: dev"; empty without a key. */
-function keyText(run: Run): string {
-  return Object.entries(run.inputs).map(([name, value]) => `${name}: ${value}`).join(", ");
-}
-
-/** A run's name in lists: its first text input (the request), else its id; a singleton run's key and jobs. */
+/** A run's name in lists: its first text input (the request), else its id; a train's station and jobs. */
 function runTitle(run: Run): string {
-  if (run.playbook.singleton) {
-    const open = run.jobs.filter((job) => job.status === "open").length;
-    return `${keyText(run) || run.playbook.title} · ${run.jobs.length} job(s)${open !== run.jobs.length ? `, ${open} open` : ""}`;
-  }
+  if (run.train) return `${run.playbook.title} train · ${run.jobs.length} job(s)`;
   const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
   return text ? text.trim().split("\n")[0]! : run.id;
 }
@@ -230,10 +223,7 @@ const LIVE = new Set(["running", "waiting", "reported", "queued", "ready", "fail
 function progress(run: Run): { position: number; marks: number[]; tone: Tone; status: string } {
   const steps = mainSteps(run);
   const done = steps.length;
-  if (run.status === "boarding") {
-    const open = run.jobs.filter((job) => job.status === "open").length;
-    return { position: 0, marks: [0], tone: "waiting", status: `Waiting list: ${open} job(s), departs when the track is free` };
-  }
+
   if (run.status === "completed") {
     if (isActive(run)) return { position: done, marks: [done], tone: "running", status: "Done, wrapping up" };
     return { position: done, marks: [done], tone: run.seenAt ? "seen" : "done", status: "Done" };
@@ -336,8 +326,11 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   const needs = runs.flatMap((run) => pendingGates(run).map((gate) => ({ run, gate })));
   const groups = useMemo(() => {
     const byPlaybook = new Map<string, Run[]>();
-    for (const run of runs) byPlaybook.set(run.playbook.id, [...(byPlaybook.get(run.playbook.id) ?? []), run]);
-    return [...byPlaybook.entries()].map(([id, list]) => ({ id, runs: list, playbook: list[0]!.playbook }));
+    // A singleton's trains go under the singleton; its pipeline shows as its stations.
+    const key = (run: Run) => run.train?.playbook ?? run.playbook.id;
+    for (const run of runs) byPlaybook.set(key(run), [...(byPlaybook.get(key(run)) ?? []), run]);
+    const pipelines = overview.runs?.filter(isPipeline) ?? [];
+    return [...byPlaybook.entries()].map(([id, list]) => ({ id, runs: list, playbook: list[0]!.playbook, pipeline: pipelines.find((run) => run.playbook.id === id && !isTerminal(run.status)) }));
   }, [runs]);
   const counts = {
     needsYou: needs.length,
@@ -455,6 +448,8 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
             theme={theme}
             compact={layout.compact}
             runs={group.runs}
+            pipeline={group.pipeline}
+            allRuns={overview.runs ?? []}
             names={names}
             onOpenWorkspace={onOpenWorkspace}
             onOpenAgent={onOpenAgent}
@@ -700,17 +695,23 @@ function PlaybookGroup(props: {
   theme: Theme;
   compact: boolean;
   runs: Run[];
+  /** A singleton's active pipeline: shown as its stations, its trains as the rows. */
+  pipeline?: Run | undefined;
+  allRuns: Run[];
   names: Map<string, string>;
   onOpenWorkspace?: (workspaceId: string) => void;
   onOpenAgent?: (agentId: string) => void;
 }) {
-  const { theme, compact } = props;
   const [sort, setSort] = useState<SortKey>("updated");
+  // Trains of different stations have different steps: each row shows its own columns.
+  const compact = props.compact || Boolean(props.pipeline);
+  const theme = props.theme;
   // The most recently updated run's definition gives the columns (runs come in that order);
   // older runs of an edited playbook keep their own steps.
-  const playbook = props.runs[0]!.playbook;
-  const columns = [...mainSteps(props.runs[0]!).map(stepShortTitle), "Done"];
-  const runs = useMemo(() => sortRuns(props.runs, sort), [props.runs, sort]);
+  const playbook = props.pipeline?.playbook ?? props.runs[0]!.playbook;
+  const rows = useMemo(() => props.runs.filter((run) => !isPipeline(run)), [props.runs]);
+  const columns = rows[0] ? [...mainSteps(rows[0]).map(stepShortTitle), "Done"] : ["Done"];
+  const runs = useMemo(() => sortRuns(rows, sort), [rows, sort]);
   const working = runs.filter((run) => isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length;
   return (
     <View style={{ gap: 8, zIndex: props.zIndex }}>
@@ -722,8 +723,9 @@ function PlaybookGroup(props: {
         extra={working > 0 ? `${working} working` : undefined}
         extraColor={theme.colors.accent}
       />
-      {playbook.singleton ? <Lanes theme={theme} runs={props.runs} /> : null}
+      {props.pipeline ? <Stations theme={theme} pipeline={props.pipeline} runs={props.allRuns} /> : null}
       {/* No overflow clipping: the sort menu opens over the rows below. */}
+      {runs.length > 0 ? (
       <View style={{ borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
         <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: theme.colors.border, zIndex: 10 }}>
           <View style={{ width: compact ? undefined : TITLE_WIDTH, flex: compact ? 1 : undefined }}>
@@ -749,73 +751,7 @@ function PlaybookGroup(props: {
           />
         ))}
       </View>
-    </View>
-  );
-}
-
-/**
- * A singleton playbook's lanes, one per key value (every value of an enum key, else the values
- * seen), in order: its waiting list (the boarding run's jobs) and its running runs.
- */
-function Lanes(props: { theme: Theme; runs: Run[] }) {
-  const { theme } = props;
-  const playbook = props.runs[0]!.playbook;
-  const key = playbook.singleton?.key ?? [];
-  const lanes = useMemo(() => {
-    const seen = new Map<string, Record<string, string>>();
-    const only = key.length === 1 ? playbook.inputs[key[0]!] : undefined;
-    if (only?.type === "enum") for (const value of only.values ?? []) seen.set(JSON.stringify({ [key[0]!]: value }), { [key[0]!]: value });
-    for (const run of props.runs) {
-      const values = Object.fromEntries(key.map((name) => [name, String(run.inputs[name] ?? "")]));
-      seen.set(JSON.stringify(values), values);
-    }
-    if (seen.size === 0) seen.set("{}", {});
-    return [...seen.entries()];
-  }, [props.runs, playbook, key]);
-  return (
-    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-      {lanes.map(([id, values]) => {
-        const inLane = props.runs.filter((run) => key.every((name) => String(run.inputs[name] ?? "") === values[name]));
-        const waiting = inLane.filter((run) => run.status === "boarding").flatMap((run) => run.jobs.filter((job) => job.status === "open"));
-        const running = inLane.filter((run) => run.status !== "boarding" && isActive(run));
-        const label = Object.values(values).join(" · ") || playbook.title;
-        return (
-          <View
-            key={id}
-            accessibilityLabel={`Lane ${label}: ${waiting.length} job(s) waiting, ${running.length} running`}
-            style={{ minWidth: 150, flexGrow: 1, flexBasis: 150, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1, padding: 10, gap: 6 }}
-          >
-            <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }}>{label}</Text>
-            <View style={{ gap: 2 }}>
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Waiting list</Text>
-              {waiting.length === 0 ? (
-                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>empty</Text>
-              ) : (
-                waiting.map((job) => (
-                  <Text key={job.id} numberOfLines={1} style={{ color: theme.colors.statusWarning, fontSize: 12 }}>
-                    {job.label}
-                  </Text>
-                ))
-              )}
-            </View>
-            <View style={{ gap: 2 }}>
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Running</Text>
-              {running.length === 0 ? (
-                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>track free</Text>
-              ) : (
-                running.map((run) => {
-                  const state = progress(run);
-                  return (
-                    <Text key={run.id} numberOfLines={2} style={{ color: toneColor(theme, state.tone), fontSize: 12 }}>
-                      {shortId(run)} · {run.jobs.filter((job) => job.status === "open").length} open job(s) · {state.status}
-                    </Text>
-                  );
-                })
-              )}
-            </View>
-          </View>
-        );
-      })}
+      ) : null}
     </View>
   );
 }
@@ -881,7 +817,7 @@ function RunRow(props: {
       .then(refresh)
       .catch((error: unknown) => console.error("[playbooks] mark seen failed", error));
   };
-  // A boarding run has no workspace or manager yet.
+  // A pipeline has no manager.
   const openWorkspace = props.onOpenWorkspace && run.workspaceId
     ? () => {
         opened();

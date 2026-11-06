@@ -169,6 +169,21 @@ export const AfterTaskSchema = z.object({
 });
 export type AfterTask = z.infer<typeof AfterTaskSchema>;
 
+/** A top-level step of a singleton: a waiting list of jobs, and one train at a time. */
+export const StationSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  /** Stations a job must have passed before it waits here. */
+  needs: z.array(z.string()),
+  /** fifo: one job per train, oldest first; merge: every waiting job per train. */
+  mode: z.enum(["fifo", "merge"]),
+  /** Failed trains a job may ride again here before it fails. */
+  retries: z.number().int().min(0),
+  /** Its steps in `Playbook.steps` (one, or the expanded steps of its sub-playbook). */
+  steps: z.array(z.string()),
+});
+export type Station = z.infer<typeof StationSchema>;
+
 export const PlaybookSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -178,16 +193,15 @@ export const PlaybookSchema = z.object({
   outputs: z.record(z.string(), PlaybookOutputSchema),
   concurrency: z.number().int().positive().optional(),
   /**
-   * Set on a singleton playbook: it takes jobs from hand-off steps. Its inputs in `key` are each
-   * run's; the others are each job's. Per key value, at most one boarding run gathers jobs, and
-   * at most `limit` runs run at once (unset = no limit).
+   * Set on a singleton playbook: one long-lived pipeline per project, in one shared workspace.
+   * Its top-level steps are stations; its inputs, outputs and outcomes are each job's.
    */
   singleton: z
     .object({
-      /** Branch its runs branch off; unset = the project's default branch. */
+      /** Branch its workspace branches off; unset = the project's default branch. */
       branch: z.string().optional(),
-      key: z.array(z.string()),
-      limit: z.number().int().positive().optional(),
+      /** Its stations, in file order (unset on runs from before pipelines). */
+      stations: z.array(StationSchema).default([]),
     })
     .optional(),
   /**
@@ -333,7 +347,7 @@ export const GateSchema = z.object({
 });
 export type Gate = z.infer<typeof GateSchema>;
 
-/** "boarding": a singleton run gathering jobs, before it departs (no worktree, manager or step yet). */
+/** "boarding": runs from v0.30.0 only (removed); they are failed on load. */
 export const RunStatusSchema = z.enum(["boarding", "running", "waiting_gate", "completed", "failed", "canceled"]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
@@ -349,7 +363,7 @@ export const RunAfterTaskSchema = z.object({
 });
 export type RunAfterTask = z.infer<typeof RunAfterTaskSchema>;
 
-/** Work a hand-off step gave a singleton run: its inputs, and once settled its outcome and outputs. */
+/** Work a hand-off step gave a singleton pipeline: its inputs, where it is, and once ended its outcome and outputs. */
 export const JobSchema = z.object({
   id: z.string(),
   /** The handing-off run and step, and the attempt that handed it off. */
@@ -366,6 +380,14 @@ export const JobSchema = z.object({
   outputs: z.record(z.string(), VarValueSchema),
   createdAt: z.string(),
   endedAt: z.string().nullable(),
+  /** Pipelines: the stations it has passed. */
+  passed: z.array(z.string()).default([]),
+  /** Pipelines: the stations it waits at, and since when (orders the waiting list). */
+  waiting: z.array(z.object({ station: z.string(), since: z.string() })).default([]),
+  /** Pipelines: the trains (runs) carrying it now, by station. */
+  riding: z.array(z.object({ station: z.string(), runId: z.string(), since: z.string() })).default([]),
+  /** Pipelines: failed trains it rode, by station (capped by the station's `retries`). */
+  failedRides: z.record(z.string(), z.number().int()).default({}),
 });
 export type Job = z.infer<typeof JobSchema>;
 
@@ -406,10 +428,10 @@ export const RunSchema = z.object({
   /** State of each after-task, by id. Runs created before after-tasks have none. */
   after: z.record(z.string(), RunAfterTaskSchema).default({}),
   inbox: z.array(z.string()),
-  /** Singleton runs: the jobs handed to this run (open ones are its work). */
+  /** A pipeline: every job handed to it. A train: copies of the jobs it carries (its work). */
   jobs: z.array(JobSchema).default([]),
-  /** A boarding singleton run started from the panel: it departs even without a job. */
-  departEmpty: z.boolean().default(false),
+  /** Set on a train: the pipeline run and the station it runs for. */
+  train: z.object({ pipelineId: z.string(), playbook: z.string(), station: z.string() }).nullable().default(null),
   history: z.array(HistoryEventSchema),
   seq: z.number().int(),
 });
@@ -441,9 +463,9 @@ export function isAgentlessAttempt(agentId: string): boolean {
   return isScriptAttempt(agentId) || isHandoffAttempt(agentId);
 }
 
-/** A singleton run still gathering jobs: it has no worktree, manager or step yet. */
-export function isBoarding(run: Run): boolean {
-  return run.status === "boarding";
+/** A singleton's pipeline run: it keeps the waiting lists and jobs; its trains are other runs. */
+export function isPipeline(run: Run): boolean {
+  return run.playbook.singleton !== undefined && run.train === null;
 }
 
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["completed", "failed", "canceled"];

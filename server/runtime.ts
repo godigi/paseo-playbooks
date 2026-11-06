@@ -12,7 +12,7 @@ import {
   handoffAttemptId,
   isActive,
   isAgentlessAttempt,
-  isBoarding,
+  isPipeline,
   isHandoffAttempt,
   isPaused,
   isScriptAttempt,
@@ -23,7 +23,7 @@ import {
 } from "../shared/types";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
-import { checkoutSnapshot, currentRef, defaultBranch, snapshotDiff } from "./git";
+import { checkoutSnapshot, currentRef, defaultBranch, fastForward, snapshotDiff } from "./git";
 import { loadPlaybooks } from "./loader";
 import { managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt } from "./prompts";
 import type { RunStore } from "./store";
@@ -173,17 +173,6 @@ function silenceDue(step: Step, attempt: Attempt, activeAt: number): number | nu
   return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
-/** " (env: dev)" for a singleton run's key values; empty without a key. */
-function describeKey(inputs: Record<string, VarValue>): string {
-  const entries = Object.entries(inputs);
-  return entries.length === 0 ? "" : ` (${entries.map(([name, value]) => `${name}: ${value}`).join(", ")})`;
-}
-
-function sameKey(a: Record<string, VarValue>, b: Record<string, VarValue>): boolean {
-  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
-  return keys.every((name) => a[name] === b[name]);
-}
-
 export class Runtime {
   private paseo: PaseoApi | null = null;
   private reconciled: Promise<void> | null = null;
@@ -199,8 +188,8 @@ export class Runtime {
   private readonly scripts = new Map<string, { child: ChildProcess | null; next: ReturnType<typeof setTimeout> | null }>();
   /** Feedback a script attempt started with (after a goto), passed to each of its checks. */
   private readonly scriptFeedback = new Map<string, string>();
-  /** Boarding runs being given their worktree and manager. */
-  private readonly departing = new Set<string>();
+  /** Pipelines being created (with their workspace), by project and playbook. */
+  private readonly creatingPipelines = new Map<string, Promise<Run>>();
   /** The plugin's own work (scripts, hand-offs, departures) runs one pass at a time; a call during a pass asks for another. */
   private ticking = false;
   private tickAgain = false;
@@ -234,7 +223,12 @@ export class Runtime {
    */
   private async reconcile(): Promise<void> {
     for (const run of this.store.list()) {
-      if (!isActive(run) || isBoarding(run)) continue;
+      if (run.status === "boarding" || (isPipeline(run) && !isTerminal(run.status) && (run.playbook.singleton?.stations.length ?? 0) === 0)) {
+        // Boarding runs and singleton runs of v0.30.0 were replaced by pipelines.
+        await this.failRun(run.id, "singleton runs of v0.30.0 were replaced by pipelines; hand the job off again");
+        continue;
+      }
+      if (!isActive(run) || isPipeline(run)) continue;
       const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
       if (!manager || manager.agent.archivedAt) {
         await this.failRun(run.id, "manager lost");
@@ -344,7 +338,8 @@ export class Runtime {
   /** Sends queued wake-ups to the manager when it is idle, merged into one prompt. A paused run keeps them until resume. */
   async deliver(runId: string): Promise<void> {
     const run = this.store.get(runId);
-    if (!run || run.inbox.length === 0 || isPaused(run) || this.busyManagers.has(run.managerAgentId)) return;
+    // A pipeline has no manager: nothing to wake.
+    if (!run || !run.managerAgentId || run.inbox.length === 0 || isPaused(run) || this.busyManagers.has(run.managerAgentId)) return;
     const text = await this.store.mutate(runId, (current) => {
       const merged = current.inbox.join("\n\n");
       current.inbox = [];
@@ -437,7 +432,7 @@ export class Runtime {
       if (!entry.playbook) throw new UserError(`playbook "${playbookId}" is invalid:\n${entry.errors.join("\n")}`);
       playbook = entry.playbook;
     }
-    if (playbook.singleton) return this.boardFromStart(workspaceDir, workspace.projectId, playbook, inputs);
+    if (playbook.singleton) return this.startPipeline(workspaceDir, workspace.projectId, playbook);
     this.checkConcurrency(playbook, workspace.projectId);
     const run = engine.newRun({
       id: reservation?.runId ?? `run_${shortId()}`,
@@ -498,20 +493,20 @@ export class Runtime {
         this.tickAgain = false;
         await this.startScripts();
         await this.startHandoffs();
-        await this.endCarriedJobs();
-        await this.departBoarding();
+        await this.endTrains();
+        await this.departTrains();
       } while (this.tickAgain);
     } finally {
       this.ticking = false;
     }
   }
 
-  // ---------------------------------------------------------------- hand-offs and singleton runs
+  // ---------------------------------------------------------------- hand-offs and singleton pipelines
 
-  /** Starts the ready hand-off steps of every active, unpaused run: each hands a job to a boarding run of its singleton. */
+  /** Starts the ready hand-off steps of every active, unpaused run: each hands a job to its singleton's pipeline. */
   private async startHandoffs(): Promise<void> {
     for (const run of this.store.list()) {
-      if (!isActive(run) || isPaused(run) || isBoarding(run)) continue;
+      if (!isActive(run) || isPaused(run) || isPipeline(run)) continue;
       for (const stepId of engine.readyHandoffs(run)) {
         const attemptId = await this.store.mutate(run.id, (current) => {
           if (current.steps[stepId]!.status !== "ready" || isPaused(current)) return null;
@@ -521,29 +516,27 @@ export class Runtime {
         });
         if (!attemptId) continue;
         this.armTimeout(this.store.get(run.id)!, stepId);
-        const boarded = await this.board(run.id, stepId, attemptId).catch((error: unknown) => errorText(error));
-        if (typeof boarded === "string") await this.finishHandoff(run.id, stepId, attemptId, { outcome: "failure", summary: `could not hand off: ${boarded}`, outputs: {} });
+        const queued = await this.queueJob(run.id, stepId, attemptId).catch((error: unknown) => errorText(error));
+        if (typeof queued === "string") await this.finishHandoff(run.id, stepId, attemptId, { outcome: "failure", summary: `could not hand off: ${queued}`, outputs: {} });
       }
     }
   }
 
-  /** Puts the hand-off's job on the boarding run of its singleton and key (created if needed). */
-  private async board(runId: string, stepId: string, attemptId: string): Promise<true> {
+  /** Puts the hand-off's job in its singleton's pipeline (created with its workspace if needed). */
+  private async queueJob(runId: string, stepId: string, attemptId: string): Promise<true> {
     const run = this.store.get(runId)!;
     const step = engine.stepDef(run, stepId);
     const loaded = await loadPlaybooks(run.workspaceDir);
     const entry = loaded.entries.find((candidate) => candidate.id === step.handoff);
     if (!entry?.playbook) throw new UserError(entry ? `playbook "${step.handoff}" is invalid: ${entry.errors[0] ?? ""}` : `no playbook "${step.handoff}" in ${run.workspaceDir}`);
-    const target = entry.playbook;
-    if (!target.singleton) throw new UserError(`playbook "${target.id}" is not a singleton`);
+    if (!entry.playbook.singleton) throw new UserError(`playbook "${entry.playbook.id}" is not a singleton`);
+    const pipeline = await this.pipelineOf(entry.playbook, run.projectId, run.workspaceDir);
     const values = Object.fromEntries(
-      Object.entries(engine.stepInputs(run, step)).flatMap(([name, entry]) => (entry.value === undefined ? [] : [[name, entry.value]])),
+      Object.entries(engine.stepInputs(run, step)).flatMap(([name, value]) => (value.value === undefined ? [] : [[name, value.value]])),
     );
-    const key = engine.resolveKeyInputs(target, values);
-    const inputs = engine.resolveJobInputs(target, values);
-    const problems = [...(key.ok ? [] : key.errors), ...(inputs.ok ? [] : inputs.errors)];
-    if (!key.ok || !inputs.ok) throw new UserError(problems.join("; "));
-    const carrier = await this.boardingRun(target, run.projectId, run.workspaceDir, key.inputs);
+    // The pipeline's own copy of the playbook is the one that counts.
+    const inputs = engine.resolveJobInputs(pipeline.playbook, values);
+    if (!inputs.ok) throw new UserError(inputs.errors.join("; "));
     const job: Job = {
       id: `job_${shortId()}`,
       fromRunId: run.id,
@@ -557,119 +550,159 @@ export class Runtime {
       outputs: {},
       createdAt: nowIso(),
       endedAt: null,
+      passed: [],
+      waiting: [],
+      riding: [],
+      failedRides: {},
     };
-    await this.store.mutate(carrier.id, (current) => engine.addJob(current, job, nowIso()));
+    await this.store.mutate(pipeline.id, (current) => engine.addJob(current, job, nowIso()));
     await this.store.mutate(run.id, (current) => {
       const attempt = current.steps[stepId]!.attempts.at(-1)!;
       if (attempt.agentId !== attemptId) return;
-      attempt.job = { runId: carrier.id, jobId: job.id };
-      attempt.lastMessage = `Boarding run ${carrier.id} of "${target.id}"${describeKey(key.inputs)}.`;
+      attempt.job = { runId: pipeline.id, jobId: job.id };
+      attempt.lastMessage = `Waiting at ${job.waiting.map((place) => `"${place.station}"`).join(", ") || "the first station"} of "${pipeline.playbook.title}".`;
     });
     this.tickAgain = true;
     return true;
   }
 
-  /** The boarding run of a singleton for these key values, created when there is none. */
-  private async boardingRun(playbook: Playbook, projectId: string, sourceDir: string, key: Record<string, VarValue>): Promise<Run> {
-    const existing = this.store
-      .list()
-      .filter((run) => isBoarding(run) && run.projectId === projectId && run.playbook.id === playbook.id && sameKey(run.inputs, key))
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+  /** The active pipeline of a singleton in the project; created with its workspace when there is none. */
+  private async pipelineOf(playbook: Playbook, projectId: string, sourceDir: string): Promise<Run> {
+    const active = () => this.store.list().find((run) => isPipeline(run) && !isTerminal(run.status) && run.projectId === projectId && run.playbook.id === playbook.id);
+    const existing = active();
     if (existing) return existing;
-    const run = engine.newBoardingRun({ id: `run_${shortId()}`, playbook, workspaceDir: sourceDir, projectId, inputs: key, now: nowIso() });
+    const key = `${projectId}|${playbook.id}`;
+    // Two hand-offs at once must not create two pipelines.
+    let creating = this.creatingPipelines.get(key);
+    if (!creating) {
+      creating = this.createPipeline(playbook, projectId, sourceDir).finally(() => this.creatingPipelines.delete(key));
+      this.creatingPipelines.set(key, creating);
+    }
+    return creating;
+  }
+
+  /** Creates the singleton's shared workspace from its branch, and its pipeline run there. */
+  private async createPipeline(playbook: Playbook, projectId: string, sourceDir: string): Promise<Run> {
+    const ref = playbook.singleton?.branch ?? (await defaultBranch(sourceDir)) ?? undefined;
+    const id = shortId();
+    const branch = `playbooks/${playbook.id}-${id}`;
+    const created = await this.api().workspaces.create({
+      title: playbook.title,
+      source: { kind: "worktree", cwd: sourceDir, action: "branch-off", branchName: branch, ...(ref ? { refName: ref } : {}) },
+    });
+    const workspace = await this.api().workspaces.ref(created.id).refresh();
+    const workspaceDir = workspace?.workspaceDirectory ?? sourceDir;
+    const entry = (await loadPlaybooks(workspaceDir)).entries.find((candidate) => candidate.id === playbook.id);
+    if (!entry?.playbook?.singleton) throw new UserError(entry ? `playbook "${playbook.id}" is not a valid singleton on ${ref ?? "its branch"}: ${entry.errors[0] ?? ""}` : `no playbook "${playbook.id}" on ${ref ?? "its branch"}`);
+    const run = engine.newPipelineRun({ id: `run_${id}`, playbook: entry.playbook, workspaceId: created.id, workspaceDir, projectId, branch, now: nowIso() });
     await this.store.create(run);
     return run;
   }
 
-  /** Start (panel) or start_playbook on a singleton: joins or creates its boarding run, which departs even without a job. */
-  private async boardFromStart(sourceDir: string, projectId: string, playbook: Playbook, inputs: Record<string, unknown>): Promise<Run> {
-    const key = engine.resolveKeyInputs(playbook, inputs);
-    if (!key.ok) throw new UserError(key.errors.join("; "));
-    const run = await this.boardingRun(playbook, projectId, sourceDir, key.inputs);
-    await this.store.mutate(run.id, (current) => {
-      current.departEmpty = true;
-    });
+  /** Start (panel) or start_playbook on a singleton: its pipeline, created with its workspace if needed. */
+  private async startPipeline(sourceDir: string, projectId: string, playbook: Playbook): Promise<Run> {
+    const run = await this.pipelineOf(playbook, projectId, sourceDir);
     await this.tick();
     return this.store.get(run.id)!;
   }
 
-  /** Departs the boarding runs whose key has a free slot (oldest first): each gets its worktree and its own manager. */
-  private async departBoarding(): Promise<void> {
-    const boarding = this.store
-      .list()
-      .filter((run) => isBoarding(run) && !this.departing.has(run.id))
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    for (const run of boarding) {
-      const limit = run.playbook.singleton?.limit;
-      const running = this.store
-        .list()
-        .filter((other) => other.projectId === run.projectId && other.playbook.id === run.playbook.id && !isTerminal(other.status) && !isBoarding(other) && sameKey(other.inputs, run.inputs));
-      if (limit !== undefined && running.length >= limit) continue;
-      if (!run.departEmpty && !run.jobs.some((job) => job.status === "open")) continue;
-      this.departing.add(run.id);
-      try {
-        await this.depart(run.id);
-      } catch (error) {
-        console.error(`[playbooks] run ${run.id} could not depart:`, errorText(error));
-        const effects = await this.store.mutate(run.id, (current) => engine.failRun(current, `could not depart: ${errorText(error)}`, nowIso()));
-        await this.applyEffects(run.id, effects);
-        this.tickAgain = true;
-      } finally {
-        this.departing.delete(run.id);
+  /** The trains (runs) of a pipeline, newest first. */
+  private trainsOf(pipelineId: string): Run[] {
+    return this.store.list().filter((run) => run.train?.pipelineId === pipelineId);
+  }
+
+  /** Each free station of each active pipeline takes its next train from its waiting list. */
+  private async departTrains(): Promise<void> {
+    for (const pipeline of this.store.list()) {
+      if (!isPipeline(pipeline) || isTerminal(pipeline.status) || isPaused(pipeline)) continue;
+      const busy = new Set(this.trainsOf(pipeline.id).filter((train) => !isTerminal(train.status)).map((train) => train.train!.station));
+      const due = (pipeline.playbook.singleton?.stations ?? []).filter((station) => !busy.has(station.id) && engine.nextTrainJobs(pipeline, station.id).length > 0);
+      if (due.length === 0) continue;
+      // Between trains, the workspace follows its branch: a merged change applies from the next train.
+      if (busy.size === 0) await this.refreshPipeline(pipeline.id);
+      for (const station of due) {
+        await this.departTrain(pipeline.id, station.id).catch((error: unknown) => console.error(`[playbooks] train of "${station.id}" in ${pipeline.id} could not start:`, errorText(error)));
       }
     }
   }
 
-  /** Gives a boarding run its worktree (from the singleton's branch), reads the playbook there, and starts its manager. */
-  private async depart(runId: string): Promise<void> {
-    const run = this.store.get(runId)!;
-    const playbook = run.playbook;
-    const ref = playbook.singleton?.branch ?? (await defaultBranch(run.workspaceDir)) ?? undefined;
-    const branch = `playbooks/${playbook.id}-${run.id.replace(/^run_/, "")}`;
-    const created = await this.api().workspaces.create({
-      title: `${playbook.title}${describeKey(run.inputs)}`,
-      source: { kind: "worktree", cwd: run.workspaceDir, action: "branch-off", branchName: branch, ...(ref ? { refName: ref } : {}) },
+  /** Fast-forwards an idle pipeline's workspace and reads its playbook again; jobs at a station that is gone fail. */
+  private async refreshPipeline(pipelineId: string): Promise<void> {
+    const pipeline = this.store.get(pipelineId)!;
+    const ref = pipeline.playbook.singleton?.branch ?? (await defaultBranch(pipeline.workspaceDir));
+    if (ref) await fastForward(pipeline.workspaceDir, ref);
+    const entry = (await loadPlaybooks(pipeline.workspaceDir)).entries.find((candidate) => candidate.id === pipeline.playbook.id);
+    if (!entry?.playbook?.singleton) return;
+    const playbook = entry.playbook;
+    const ended = await this.store.mutate(pipelineId, (current) => {
+      current.playbook = playbook;
+      const stations = new Set(playbook.singleton!.stations.map((station) => station.id));
+      const lost = current.jobs.filter((job) => job.status === "open" && job.waiting.some((place) => !stations.has(place.station))).map((job) => job.id);
+      return engine.failJobs(current, lost, "its station was removed from the playbook", nowIso());
     });
-    const workspace = await this.api().workspaces.ref(created.id).refresh();
-    const workspaceDir = workspace?.workspaceDirectory ?? run.workspaceDir;
-    // The run's own copy of the playbook, on the singleton's branch, is the one that counts.
-    const entry = (await loadPlaybooks(workspaceDir)).entries.find((candidate) => candidate.id === playbook.id);
-    if (!entry?.playbook) throw new UserError(entry ? `playbook "${playbook.id}" is invalid on ${ref ?? "its branch"}: ${entry.errors[0] ?? ""}` : `no playbook "${playbook.id}" on ${ref ?? "its branch"}`);
-    if (!entry.playbook.singleton) throw new UserError(`playbook "${playbook.id}" is not a singleton on ${ref ?? "its branch"}`);
-    const manager = await created.agents.create({
-      config: this.managerConfig(entry.playbook),
-      title: `Playbook Manager · ${playbook.title}${describeKey(run.inputs)}`,
+    for (const job of ended) await this.deliverJob(job, { outcome: "failure", summary: job.summary ?? "station removed", outputs: {} });
+  }
+
+  /** Starts a station's next train: a fresh manager in the pipeline's workspace, and a run of the station carrying its jobs. */
+  private async departTrain(pipelineId: string, stationId: string): Promise<void> {
+    const pipeline = this.store.get(pipelineId)!;
+    const jobs = engine.nextTrainJobs(pipeline, stationId);
+    if (jobs.length === 0) return;
+    const playbook = engine.stationPlaybook(pipeline.playbook, stationId);
+    const manager = await this.api().workspaces.ref(pipeline.workspaceId).agents.create({
+      config: this.managerConfig(playbook),
+      title: `Playbook Manager · ${playbook.title}`,
       labels: { [MANAGER_LABEL]: "true" },
     });
-    const departed = await this.store.mutate(runId, (current) =>
-      engine.departRun(current, { workspaceId: created.id, workspaceDir, branch, managerAgentId: manager.id, playbook: entry.playbook!, now: nowIso() }),
-    );
-    for (const { job, reason } of departed.refused) await this.deliverJob(job, { outcome: "failure", summary: `job refused by run ${runId}: ${reason}`, outputs: {} });
-    const current = this.store.get(runId)!;
-    const open = current.jobs.filter((job) => job.status === "open");
-    // The handing-off steps show where their job is now.
-    for (const job of open) {
-      if (!this.store.get(job.fromRunId)) continue;
-      const attemptId = handoffAttemptId(job.fromRunId, job.fromStepId, job.attempt);
-      await this.store.mutate(job.fromRunId, (from) => {
-        const attempt = from.steps[job.fromStepId]?.attempts.at(-1);
-        if (attempt?.agentId === attemptId) attempt.lastMessage = `On run ${runId} of "${playbook.id}"${describeKey(current.inputs)}, departed with ${open.length} job(s).`;
-      });
-    }
-    await manager.send(singletonKickoff(current, engine.readySteps(current)));
+    const previous = this.trainsOf(pipelineId).find((train) => train.train!.station === stationId);
+    const train = engine.newTrainRun({ id: `run_${shortId()}`, pipeline, station: stationId, jobs, managerAgentId: manager.id, now: nowIso() });
+    await this.store.create(train);
+    await this.store.mutate(pipelineId, (current) => engine.boardTrain(current, stationId, train.id, jobs.map((job) => job.id), nowIso()));
+    // The station's previous train manager is done: one manager per station in the workspace.
+    if (previous && previous.managerAgentId !== manager.id) await this.archiveStepAgent(previous.managerAgentId);
+    for (const job of jobs) await this.noteHandoff(job, `On the "${stationId}" train (${train.id}) of "${pipeline.playbook.title}", with ${jobs.length} job(s).`);
+    const started = this.store.get(train.id)!;
+    await manager.send(singletonKickoff(started, engine.readySteps(started)));
     this.busyManagers.add(manager.id);
     this.tickAgain = true;
   }
 
-  /** Jobs still open in singleton runs that have ended: settled with the run's outcome, or failed; their hand-offs are told. */
-  private async endCarriedJobs(): Promise<void> {
-    for (const run of this.store.list()) {
-      if (!run.playbook.singleton || !isTerminal(run.status) || !run.jobs.some((job) => job.status === "open")) continue;
-      const ended = await this.store.mutate(run.id, (current) => engine.endOpenJobs(current, nowIso()));
-      for (const job of ended) {
-        const result = job.status === "settled" ? { outcome: job.outcome!, summary: job.summary ?? "", outputs: job.outputs } : { outcome: "failure", summary: job.summary ?? `run ${run.id} ${run.status}`, outputs: {} };
-        await this.deliverJob(job, result);
+  /** Shows on the handing-off step where its job is. */
+  private async noteHandoff(job: Job, text: string): Promise<void> {
+    if (!this.store.get(job.fromRunId)) return;
+    const attemptId = handoffAttemptId(job.fromRunId, job.fromStepId, job.attempt);
+    await this.store.mutate(job.fromRunId, (from) => {
+      const attempt = from.steps[job.fromStepId]?.attempts.at(-1);
+      if (attempt?.agentId === attemptId && from.steps[job.fromStepId]!.status === "running") attempt.lastMessage = text;
+    });
+  }
+
+  /**
+   * Trains that ended move their jobs on (next stations, out of the pipeline, back to the waiting
+   * list, or failed); a pipeline that ended fails its open jobs and cancels its trains. The
+   * hand-offs of jobs that ended are told.
+   */
+  private async endTrains(): Promise<void> {
+    for (const train of this.store.list()) {
+      if (!train.train || !isTerminal(train.status)) continue;
+      const pipeline = this.store.get(train.train.pipelineId);
+      if (!pipeline || !pipeline.jobs.some((job) => job.riding.some((ride) => ride.runId === train.id))) continue;
+      const ended = await this.store.mutate(pipeline.id, (current) => engine.trainEnded(current, train, nowIso()));
+      for (const job of ended) await this.deliverJob(job, job.status === "settled" ? { outcome: job.outcome!, summary: job.summary ?? "", outputs: job.outputs } : { outcome: "failure", summary: job.summary ?? "", outputs: {} });
+      for (const job of this.store.get(pipeline.id)!.jobs.filter((candidate) => candidate.status === "open")) {
+        const next = job.waiting.map((place) => `"${place.station}"`).join(", ");
+        if (next) await this.noteHandoff(job, `Waiting at ${next} of "${pipeline.playbook.title}".`);
       }
+      this.tickAgain = true;
+    }
+    for (const pipeline of this.store.list()) {
+      if (!isPipeline(pipeline) || !isTerminal(pipeline.status)) continue;
+      for (const train of this.trainsOf(pipeline.id).filter((candidate) => !isTerminal(candidate.status))) {
+        await this.cancelRun(train.id, `its pipeline ${pipeline.id} is ${pipeline.status}`, null).catch(() => undefined);
+      }
+      if (!pipeline.jobs.some((job) => job.status === "open")) continue;
+      const ended = await this.store.mutate(pipeline.id, (current) => engine.failOpenJobs(current, `pipeline ${current.id} ${current.status}${current.failure ? `: ${current.failure}` : ""}`, nowIso()));
+      for (const job of ended) await this.deliverJob(job, { outcome: "failure", summary: job.summary ?? "", outputs: {} });
     }
   }
 
@@ -685,34 +718,35 @@ export class Runtime {
     if (received) await this.settleScripts(runId);
   }
 
-  /** A hand-off step was canceled, reset or timed out: its job leaves its boarding run, or the run carrying it is told. */
+  /** A hand-off step was canceled, reset or timed out: its job leaves the pipeline, and the trains carrying it are told. */
   private async withdrawHandoff(fromRunId: string, attemptId: string, reason: string): Promise<void> {
     this.clearTimeout(attemptId);
     const from = this.store.get(fromRunId);
     const attempt = from && Object.values(from.steps).flatMap((state) => state.attempts).find((candidate) => candidate.agentId === attemptId);
-    if (!attempt?.job) return;
-    const carrier = this.store.get(attempt.job.runId);
-    if (!carrier) return;
-    const job = await this.store.mutate(carrier.id, (current) => engine.withdrawJob(current, attempt.job!.jobId, reason, nowIso()));
-    if (!job) return;
-    const after = this.store.get(carrier.id)!;
-    if (isBoarding(after) && !after.departEmpty && !after.jobs.some((candidate) => candidate.status === "open")) {
-      // A boarding run left with no job is dropped.
-      await this.store.delete(carrier.id);
-      return;
-    }
-    if (!isBoarding(after) && !isTerminal(after.status)) {
-      await this.enqueue(carrier.id, [`Job ${job.id} (from ${job.label}) was withdrawn: ${reason}. Leave it out of the rest of the run; it no longer needs settle_job.`]);
-      await this.deliver(carrier.id);
+    if (!attempt?.job || !this.store.get(attempt.job.runId)) return;
+    const withdrawn = await this.store.mutate(attempt.job.runId, (current) => engine.withdrawJob(current, attempt.job!.jobId, reason, nowIso()));
+    if (!withdrawn) return;
+    for (const trainId of withdrawn.trains) {
+      const train = this.store.get(trainId);
+      if (!train) continue;
+      await this.store.mutate(trainId, (current) => engine.mirrorJob(current, withdrawn.job));
+      if (isTerminal(train.status)) continue;
+      await this.enqueue(trainId, [`Job ${withdrawn.job.id} (from ${withdrawn.job.label}) was withdrawn: ${reason}. Leave it out of the rest of the train; it no longer needs settle_job.`]);
+      await this.deliver(trainId);
     }
   }
 
-  /** The run's manager settles one job; the step that handed it off is told at once. */
-  async settleJob(managerId: string, runId: string, jobId: string, input: { outcome: string; summary: string; outputs: Record<string, unknown> }): Promise<Run> {
-    const run = this.ownedRun(managerId, runId);
-    const job = await this.store.mutate(run.id, (current) => engine.settleJob(current, jobId, { ...input, now: nowIso() }));
-    await this.deliverJob(job, { outcome: job.outcome!, summary: job.summary ?? "", outputs: job.outputs });
-    return this.store.get(run.id)!;
+  /** A train's manager settles one of its jobs: sets its outputs, or ends it (its hand-off is told at once). */
+  async settleJob(managerId: string, runId: string, jobId: string, input: { outcome?: string | undefined; summary: string; outputs: Record<string, unknown> }): Promise<Run> {
+    const train = this.ownedRun(managerId, runId);
+    if (!train.train) throw new UserError(`run ${train.id} is not a train of a singleton pipeline: it carries no job`);
+    if (isTerminal(train.status)) throw new UserError(`train ${train.id} is ${train.status}`);
+    const pipelineId = train.train.pipelineId;
+    if (!this.store.get(pipelineId)) throw new UserError(`the pipeline of train ${train.id} no longer exists`);
+    const settled = await this.store.mutate(pipelineId, (current) => engine.settleJob(current, train.id, jobId, { ...input, now: nowIso() }));
+    await this.store.mutate(train.id, (current) => engine.mirrorJob(current, settled.job));
+    if (settled.ended) await this.deliverJob(settled.job, { outcome: settled.job.outcome!, summary: settled.job.summary ?? "", outputs: settled.job.outputs });
+    return this.store.get(train.id)!;
   }
 
   // ---------------------------------------------------------------- script steps
@@ -997,7 +1031,7 @@ export class Runtime {
     const effects = await this.store.mutate(runId, (current) => engine.cancelRun(current, reason, nowIso()));
     await this.applyEffects(runId, effects);
     await this.admitQueued(runId);
-    if (by) {
+    if (by && !isPipeline(this.store.get(runId)!)) {
       const status = this.store.get(runId)!.status;
       await this.dismissQuestions(this.store.get(runId)!.managerAgentId, `The run was canceled ${by}. End your turn.`);
       await this.enqueue(runId, [
@@ -1120,6 +1154,8 @@ export class Runtime {
     if (!run) throw new UserError(`unknown run "${runId}"`);
     const blocker = restartBlocker(run, stepId);
     if (blocker) throw new UserError(blocker);
+    if (isPipeline(run)) throw new UserError(`run ${run.id} is a singleton pipeline: it is not restarted; the next hand-off starts a new one`);
+    if (run.train) throw new UserError(`run ${run.id} is a train of pipeline ${run.train.pipelineId}: a failed train's jobs ride the station's next train (or fail, past its retries)`);
     if (takeOver && takeOver.workspaceId !== run.workspaceId) {
       throw new UserError(`run ${run.id} is in another workspace (${run.workspaceId}, ${run.workspaceDir}): only an agent of that workspace can take it over; omit takeOver and a manager is found for it`);
     }
@@ -1566,8 +1602,8 @@ export class Runtime {
     if (!entry?.playbook) throw new UserError(entry ? `playbook "${input.playbook}" is invalid:\n${entry.errors.join("\n")}` : `no playbook "${input.playbook}"`);
     const playbook = entry.playbook;
     if (playbook.singleton) {
-      const run = await this.boardFromStart(workspaceDir, workspace.projectId, playbook, input.inputs);
-      return { status: "started" as const, workspaceId: run.workspaceId || workspace.id, managerAgentId: run.managerAgentId, runId: run.id, queued: isBoarding(run) };
+      const run = await this.startPipeline(workspaceDir, workspace.projectId, playbook);
+      return { status: "started" as const, workspaceId: run.workspaceId, managerAgentId: run.managerAgentId, runId: run.id, queued: false };
     }
     const resolved = engine.resolveRunInputs(playbook, input.inputs);
     if (!resolved.ok) throw new UserError(resolved.errors.join("; "));

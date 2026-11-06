@@ -139,22 +139,23 @@ export function managerAfterRestart(ready: string[], reported: string[]): string
     .join(" ");
 }
 
-/** Kickoff for the manager of a singleton run that just departed with its jobs. */
+/** Kickoff for the manager of a train: one run of a singleton pipeline's station, carrying jobs. */
 export function singletonKickoff(run: Run, ready: string[]): string {
   const jobs = jobsText(run);
   return `${MANAGER_PROTOCOL}
 
-You are the Playbook Manager of run ${run.id} (singleton playbook "${run.playbook.id}"), which the plugin
-just started in its own worktree. The run already exists: do not call start_playbook.
-Run inputs:
-${JSON.stringify(run.inputs, null, 2)}
+You are the Playbook Manager of run ${run.id}: a train of station "${run.train?.station ?? "?"}" of the singleton
+pipeline "${run.train?.playbook ?? run.playbook.id}", in the pipeline's shared workspace. The run already exists: do not
+call start_playbook.
 
-This run carries jobs, handed off by other runs that wait for them. Each job has its own inputs; the
-steps read them all through {{ run.jobs }}. Settle each job with settle_job (an outcome of the
-playbook, a summary and its outputs) as soon as its result is known: the run that handed it off is
-told at once, and may go on while this run carries on with the others. A job left open when the run
-completes takes the run's outcome and outputs; when the run fails or is canceled, its open jobs fail.
-${jobs ? `Jobs on this run:\n${jobs}` : "This run carries no job (it was started by hand)."}
+This train carries jobs, handed off by other runs that wait for them. Each job has its own inputs (and the
+outputs set at earlier stations); the steps read them all through {{ run.jobs }}. Use settle_job:
+- without an outcome, to set a job's outputs (for example a release tag that later stations read);
+- with an outcome (for example "ejected"), to end a job now: the run that handed it off is told at once,
+  and this train goes on with the others.
+When the train completes, its jobs still open pass this station and go on to the next ones. If the train
+fails, they wait here for the next train (within the station's retries), then fail.
+${jobs ? `Jobs on this train:\n${jobs}` : "This train carries no job."}
 
 Ready now: ${ready.join(", ") || "none"}. Start them with start_step.`;
 }

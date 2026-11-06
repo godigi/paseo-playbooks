@@ -61,3 +61,13 @@ export async function defaultBranch(cwd: string): Promise<string | null> {
   }
   return currentRef(cwd);
 }
+
+/** Best effort: fetches `branch` from origin and fast-forwards the checkout to it. Never fails. */
+export async function fastForward(cwd: string, branch: string): Promise<void> {
+  try {
+    await git(cwd, ["fetch", "--quiet", "origin", branch]);
+    await git(cwd, ["merge", "--ff-only", "--quiet", `origin/${branch}`]);
+  } catch {
+    // Offline, no origin, or not a fast-forward: keep the checkout as it is.
+  }
+}

@@ -1,6 +1,6 @@
 # Singleton lanes and hand-off steps in the UI
 
-Status: Accepted
+Status: Superseded by `2026-11-06-pipeline-ui.md`
 
 ## Context
 

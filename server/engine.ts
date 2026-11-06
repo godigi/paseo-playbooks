@@ -7,7 +7,7 @@ import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../sh
 import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
 import { stringify as toYaml } from "yaml";
 import type { AfterTask, AskChoice, Attempt, Gate, Job, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
-import { isActive, isAgentlessAttempt, isPaused, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
+import { isActive, isAgentlessAttempt, isPaused, isPipeline, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, parseDuration, renderTemplate, replaceRefs, resolveValue, templateRefs } from "../shared/vars";
 
 export class EngineError extends Error {}
@@ -94,47 +94,49 @@ export function resolveRunInputs(
   return errors.length > 0 ? { ok: false, errors } : { ok: true, inputs };
 }
 
-/** A singleton playbook's inputs split: those in its key are each run's, the others each job's. */
-export function splitInputs(playbook: Playbook): { run: Playbook["inputs"]; job: Playbook["inputs"] } {
-  const key = new Set(playbook.singleton?.key ?? []);
-  const entries = Object.entries(playbook.inputs);
-  return {
-    run: Object.fromEntries(entries.filter(([name]) => key.has(name))),
-    job: Object.fromEntries(entries.filter(([name]) => !key.has(name))),
-  };
-}
-
-/** Validates the run's (key) inputs of a singleton playbook; job inputs given here are ignored. */
-export function resolveKeyInputs(playbook: Playbook, given: Record<string, unknown>) {
-  const { run } = splitInputs(playbook);
-  const keyGiven = Object.fromEntries(Object.entries(given).filter(([name]) => name in run));
-  return resolveRunInputs({ ...playbook, inputs: run }, keyGiven);
-}
-
-/** Validates one job's inputs against a singleton playbook (its non-key inputs). */
+/** Validates one job's inputs against a singleton playbook (every input of a singleton is each job's). */
 export function resolveJobInputs(playbook: Playbook, given: Record<string, unknown>) {
-  const { job } = splitInputs(playbook);
-  const jobGiven = Object.fromEntries(Object.entries(given).filter(([name]) => !(playbook.singleton?.key ?? []).includes(name)));
-  return resolveRunInputs({ ...playbook, inputs: job }, jobGiven);
+  return resolveRunInputs(playbook, given);
 }
 
 export function newRun(input: NewRunInput): Run {
   const resolved = resolveRunInputs(input.playbook, input.inputs);
   if (!resolved.ok) throw new EngineError(resolved.errors.join("; "));
-  return createRun(input, resolved.inputs, "running");
+  return createRun(input, resolved.inputs, "run");
 }
 
 /**
- * A singleton run gathering jobs: no worktree, manager or step yet. `workspaceDir` is a
- * checkout of the project its worktree will branch from when it departs.
+ * A singleton's pipeline: one long-lived run that keeps the stations' waiting lists and the
+ * jobs. It has no manager and starts no step: each train is a run of its own (newTrainRun).
  */
-export function newBoardingRun(input: Omit<NewRunInput, "workspaceId" | "managerAgentId" | "branch">): Run {
-  const resolved = resolveKeyInputs(input.playbook, input.inputs);
-  if (!resolved.ok) throw new EngineError(resolved.errors.join("; "));
-  return createRun({ ...input, workspaceId: "", managerAgentId: "", branch: null }, resolved.inputs, "boarding");
+export function newPipelineRun(input: Omit<NewRunInput, "managerAgentId" | "inputs">): Run {
+  return createRun({ ...input, managerAgentId: "", inputs: {} }, {}, "pipeline");
 }
 
-function createRun(input: NewRunInput, inputs: Record<string, VarValue>, status: "running" | "boarding"): Run {
+/**
+ * The playbook a station's trains run: the station's steps alone (a sub-playbook's expanded
+ * steps, or one step), with their needs kept inside the station.
+ */
+export function stationPlaybook(pipeline: Playbook, stationId: string): Playbook {
+  const station = pipeline.singleton?.stations.find((candidate) => candidate.id === stationId);
+  if (!station) throw new EngineError(`no station "${stationId}" in "${pipeline.id}"`);
+  const own = new Set(station.steps);
+  return {
+    ...pipeline,
+    id: `${pipeline.id}.${station.id}`,
+    title: `${pipeline.title} · ${station.title}`,
+    inputs: {},
+    outputs: {},
+    outcomes: ["success"],
+    steps: pipeline.steps.filter((step) => own.has(step.id)).map((step) => ({ ...step, needs: step.needs.filter((need) => own.has(need)) })),
+    // The station's own block is the whole train: an `end` in it ends the train.
+    blocks: Object.fromEntries(Object.entries(pipeline.blocks).filter(([prefix]) => prefix.startsWith(`${station.id}.`))),
+    after: [],
+    singleton: undefined,
+  };
+}
+
+function createRun(input: NewRunInput, inputs: Record<string, VarValue>, kind: "run" | "pipeline"): Run {
   const run: Run = {
     version: 1,
     id: input.id,
@@ -146,7 +148,7 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, status:
     managerAgentId: input.managerAgentId,
     inputs,
     outputs: null,
-    status,
+    status: "running",
     failure: null,
     createdAt: input.now,
     updatedAt: input.now,
@@ -167,12 +169,12 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, status:
     ),
     inbox: [],
     jobs: [],
-    departEmpty: false,
+    train: null,
     history: [],
     seq: 0,
   };
-  if (status === "boarding") {
-    log(run, input.now, "run_boarding", null, `playbook ${input.playbook.id}`);
+  if (kind === "pipeline") {
+    log(run, input.now, "pipeline_started", null, `playbook ${input.playbook.id}`);
     return run;
   }
   // A templated timeout that only depends on the run's inputs is checked now, not at its step.
@@ -196,7 +198,7 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, status:
 export function refreshReady(run: Run, now: string): { ready: string[]; queued: string[] } {
   const ready: string[] = [];
   const queued: string[] = [];
-  if (run.status === "boarding") return { ready, queued };
+  if (run.status === "boarding" || isPipeline(run)) return { ready, queued };
   const limited = Object.entries(run.playbook.blocks).filter(([, block]) => block.concurrency !== undefined);
   // A skipped step (its `when` did not match) counts as done, so the steps after it may move too.
   let skipped = true;
@@ -1239,9 +1241,9 @@ export function replaceManager(run: Run, managerAgentId: string, reason: string,
   log(run, now, "manager_replaced", null, `${previous} → ${managerAgentId}: ${reason}`);
 }
 
-// ---------------------------------------------------------------- singleton runs and jobs
+// ---------------------------------------------------------------- singleton pipelines and jobs
 
-/** A run's open jobs, as steps read them: `{{ run.jobs }}` (YAML), `PLAYBOOK_JOBS` (JSON). */
+/** A train's open jobs, as its steps read them: `{{ run.jobs }}` (YAML), `PLAYBOOK_JOBS` (JSON). */
 export function openJobs(run: Run): Array<{ id: string; from: string; inputs: Record<string, VarValue>; outputs: Record<string, VarValue> }> {
   return run.jobs
     .filter((job) => job.status === "open")
@@ -1253,42 +1255,75 @@ export function jobsText(run: Run): string {
   return jobs.length === 0 ? "" : toYaml(jobs).trimEnd();
 }
 
-/** Adds a job to a boarding run. */
-export function addJob(run: Run, job: Job, now: string): void {
-  if (run.status !== "boarding") throw new EngineError(`run ${run.id} is ${run.status}; jobs only board a boarding run`);
-  run.jobs.push(job);
-  log(run, now, "job_boarded", null, `${job.id} from ${job.fromRunId}/${job.fromStepId}`);
+function stationsOf(pipeline: Run) {
+  return pipeline.playbook.singleton?.stations ?? [];
 }
 
-/** The boarding run departs: it gets its worktree, manager and playbook, and its first steps become ready. */
-export function departRun(
-  run: Run,
-  input: { workspaceId: string; workspaceDir: string; branch: string | null; managerAgentId: string; playbook: Playbook; now: string },
-): { ready: string[]; refused: Array<{ job: Job; reason: string }> } {
-  if (run.status !== "boarding") throw new EngineError(`run ${run.id} is ${run.status}, not boarding`);
-  run.playbook = input.playbook;
-  run.workspaceId = input.workspaceId;
-  run.workspaceDir = input.workspaceDir;
-  run.branch = input.branch;
-  run.managerAgentId = input.managerAgentId;
-  run.status = "running";
-  run.steps = Object.fromEntries(
-    input.playbook.steps.map((step) => [step.id, run.steps[step.id] ?? { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, completedSeq: null, queuedAt: null }]),
-  );
-  run.after = Object.fromEntries(input.playbook.after.map((task) => [task.id, run.after[task.id] ?? { status: "pending", startedAt: null, endedAt: null, detail: null }]));
-  // The run's own copy of the playbook is the one that counts: jobs that do not fit it fail.
-  const refused: Array<{ job: Job; reason: string }> = [];
-  for (const job of run.jobs) {
-    if (job.status !== "open") continue;
-    const checked = resolveJobInputs(input.playbook, job.inputs);
-    if (checked.ok) job.inputs = checked.inputs;
-    else refused.push({ job, reason: `its inputs do not fit "${input.playbook.id}" on ${input.branch ?? "its branch"}: ${checked.errors.join("; ")}` });
+/** Puts a job on the waiting lists of the stations it may enter now (all needs passed, not there yet). */
+function queueNext(pipeline: Run, job: Job, now: string): void {
+  for (const station of stationsOf(pipeline)) {
+    if (job.passed.includes(station.id) || job.waiting.some((entry) => entry.station === station.id) || job.riding.some((entry) => entry.station === station.id)) continue;
+    if (station.needs.every((need) => job.passed.includes(need))) job.waiting.push({ station: station.id, since: now });
   }
-  for (const { job, reason } of refused) endJob(run, job, "failed", null, reason, {}, input.now);
-  log(run, input.now, "run_departed", null, `${run.jobs.filter((job) => job.status === "open").length} job(s), manager ${input.managerAgentId}`);
-  const { ready } = refreshReady(run, input.now);
-  updateStatus(run);
-  return { ready, refused };
+}
+
+/** A hand-off's job joins the pipeline: it waits at the stations with no needs. */
+export function addJob(pipeline: Run, job: Job, now: string): void {
+  if (!isPipeline(pipeline) || isTerminal(pipeline.status)) throw new EngineError(`run ${pipeline.id} is not an active pipeline`);
+  pipeline.jobs.push(job);
+  queueNext(pipeline, job, now);
+  log(pipeline, now, "job_queued", null, `${job.id} from ${job.fromRunId}/${job.fromStepId} at ${job.waiting.map((entry) => entry.station).join(", ")}`);
+}
+
+/** The jobs a station's next train takes: the oldest alone (fifo), or every waiting one (merge). */
+export function nextTrainJobs(pipeline: Run, stationId: string): Job[] {
+  const station = stationsOf(pipeline).find((candidate) => candidate.id === stationId);
+  if (!station) return [];
+  const since = (job: Job) => job.waiting.find((entry) => entry.station === stationId)!.since;
+  const waiting = pipeline.jobs
+    .filter((job) => job.status === "open" && job.waiting.some((entry) => entry.station === stationId))
+    .sort((a, b) => since(a).localeCompare(since(b)) || a.createdAt.localeCompare(b.createdAt));
+  return station.mode === "merge" ? waiting : waiting.slice(0, 1);
+}
+
+/** The jobs board a train: they leave the station's waiting list and ride the train run. */
+export function boardTrain(pipeline: Run, stationId: string, trainRunId: string, jobIds: string[], now: string): void {
+  for (const job of pipeline.jobs.filter((candidate) => jobIds.includes(candidate.id))) {
+    const entry = job.waiting.find((candidate) => candidate.station === stationId);
+    job.waiting = job.waiting.filter((candidate) => candidate.station !== stationId);
+    job.riding.push({ station: stationId, runId: trainRunId, since: entry?.since ?? now });
+  }
+  log(pipeline, now, "train_departed", stationId, `${trainRunId} with ${jobIds.join(", ")}`);
+}
+
+/** A station's train: an ordinary run of the station's steps, carrying copies of its jobs. */
+export function newTrainRun(input: {
+  id: string;
+  pipeline: Run;
+  station: string;
+  jobs: Job[];
+  managerAgentId: string;
+  now: string;
+}): Run {
+  const playbook = stationPlaybook(input.pipeline.playbook, input.station);
+  const run = createRun(
+    {
+      id: input.id,
+      playbook,
+      workspaceId: input.pipeline.workspaceId,
+      workspaceDir: input.pipeline.workspaceDir,
+      projectId: input.pipeline.projectId,
+      branch: input.pipeline.branch,
+      managerAgentId: input.managerAgentId,
+      inputs: {},
+      now: input.now,
+    },
+    {},
+    "run",
+  );
+  run.train = { pipelineId: input.pipeline.id, playbook: input.pipeline.playbook.id, station: input.station };
+  run.jobs = input.jobs.map((job) => ({ ...structuredClone(job), waiting: [], riding: [] }));
+  return run;
 }
 
 function endJob(run: Run, job: Job, status: Job["status"], outcome: string | null, summary: string, outputs: Record<string, VarValue>, now: string): void {
@@ -1297,60 +1332,138 @@ function endJob(run: Run, job: Job, status: Job["status"], outcome: string | nul
   job.summary = summary || null;
   job.outputs = { ...job.outputs, ...outputs };
   job.endedAt = now;
+  job.waiting = [];
   log(run, now, `job_${status}`, null, `${job.id}${outcome ? `: ${outcome}` : ""}${summary ? ` (${summary.slice(0, 200)})` : ""}`);
 }
 
-/** The run's manager settles one job: an outcome of the playbook, and its outputs (all of them for the first outcome). */
-export function settleJob(run: Run, jobId: string, input: { outcome: string; summary: string; outputs: Record<string, unknown>; now: string }): Job {
-  const job = run.jobs.find((candidate) => candidate.id === jobId);
-  if (!job) throw new EngineError(`no job "${jobId}" in run ${run.id} (jobs: ${run.jobs.map((candidate) => candidate.id).join(", ") || "none"})`);
-  if (job.status !== "open") throw new EngineError(`job ${jobId} is already ${job.status}${job.outcome ? ` (${job.outcome})` : ""}`);
-  if (isTerminal(run.status) || run.status === "boarding") throw new EngineError(`run ${run.id} is ${run.status}; only a running run settles its jobs`);
-  if (!run.playbook.outcomes.includes(input.outcome)) {
-    throw new EngineError(`outcome "${input.outcome}" is not an outcome of "${run.playbook.id}"; use one of: ${run.playbook.outcomes.join(", ")}`);
-  }
-  const outputs: Record<string, VarValue> = {};
+/** Checks outputs against the singleton's declared types; `all` requires every one of them. */
+function checkJobOutputs(playbook: Playbook, outputs: Record<string, unknown>, all: boolean): { ok: true; outputs: Record<string, VarValue> } | { ok: false; errors: string[] } {
+  const result: Record<string, VarValue> = {};
   const errors: string[] = [];
-  const merged = { ...job.outputs, ...input.outputs };
-  for (const [name, def] of Object.entries(run.playbook.outputs)) {
-    const raw = merged[name];
+  for (const [name, def] of Object.entries(playbook.outputs)) {
+    const raw = outputs[name];
     if (raw === undefined || raw === null || raw === "") {
-      if (input.outcome === run.playbook.outcomes[0]) errors.push(`missing output "${name}" (${def.type})`);
+      if (all) errors.push(`missing output "${name}" (${def.type})`);
       continue;
     }
     const coerced = coerceValue(def, raw);
-    if (coerced.ok) outputs[name] = coerced.value;
+    if (coerced.ok) result[name] = coerced.value;
     else errors.push(`output "${name}": ${coerced.error}`);
   }
-  for (const name of Object.keys(input.outputs)) {
-    if (!run.playbook.outputs[name]) errors.push(`unknown output "${name}" (declared: ${Object.keys(run.playbook.outputs).join(", ") || "none"})`);
+  for (const name of Object.keys(outputs)) {
+    if (!playbook.outputs[name]) errors.push(`unknown output "${name}" (declared: ${Object.keys(playbook.outputs).join(", ") || "none"})`);
   }
-  if (errors.length > 0) throw new EngineError(`cannot settle job ${jobId}: ${errors.join("; ")}`);
-  endJob(run, job, "settled", input.outcome, input.summary, outputs, input.now);
-  return job;
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, outputs: result };
 }
 
 /**
- * The jobs still open when the run ended: settled with the run's outcome and outputs when it
- * completed, failed when it failed or was canceled. Returns them; the runtime tells their runs.
+ * A train's manager settles one of its jobs. Without an outcome, the job's outputs are set and
+ * it goes on. With an outcome of the singleton, the job ends now (all outputs required for the
+ * first outcome). Applied to the pipeline; the runtime mirrors it on the train's copy.
  */
-export function endOpenJobs(run: Run, now: string): Job[] {
-  if (!isTerminal(run.status)) return [];
-  const open = run.jobs.filter((job) => job.status === "open");
-  const outcome = [...run.history].reverse().find((event) => event.type === "run_outcome")?.detail ?? run.playbook.outcomes[0]!;
+export function settleJob(
+  pipeline: Run,
+  trainRunId: string,
+  jobId: string,
+  input: { outcome?: string | undefined; summary: string; outputs: Record<string, unknown>; now: string },
+): { job: Job; ended: boolean } {
+  const job = pipeline.jobs.find((candidate) => candidate.id === jobId);
+  if (!job || !job.riding.some((entry) => entry.runId === trainRunId)) {
+    throw new EngineError(`job "${jobId}" is not on this train (its jobs: ${pipeline.jobs.filter((candidate) => candidate.riding.some((entry) => entry.runId === trainRunId)).map((candidate) => candidate.id).join(", ") || "none"})`);
+  }
+  if (job.status !== "open") throw new EngineError(`job ${jobId} is already ${job.status}${job.outcome ? ` (${job.outcome})` : ""}`);
+  const outcomes = pipeline.playbook.outcomes;
+  if (input.outcome !== undefined && !outcomes.includes(input.outcome)) {
+    throw new EngineError(`outcome "${input.outcome}" is not an outcome of "${pipeline.playbook.id}"; use one of: ${outcomes.join(", ")}, or none to only set outputs`);
+  }
+  const checked = checkJobOutputs(pipeline.playbook, { ...(input.outcome === outcomes[0] ? job.outputs : {}), ...input.outputs }, input.outcome === outcomes[0]);
+  if (!checked.ok) throw new EngineError(`cannot settle job ${jobId}: ${checked.errors.join("; ")}`);
+  if (input.outcome === undefined) {
+    job.outputs = { ...job.outputs, ...checked.outputs };
+    log(pipeline, input.now, "job_outputs", null, `${jobId}: ${Object.keys(checked.outputs).join(", ") || "none"}`);
+    return { job, ended: false };
+  }
+  endJob(pipeline, job, "settled", input.outcome, input.summary, checked.outputs, input.now);
+  return { job, ended: true };
+}
+
+/**
+ * A train has ended. Its jobs still open: on completion they pass the station and wait at the
+ * next ones, or leave the pipeline (settled with the first outcome, once every output is set);
+ * on failure they wait at the station again, at the front, while its `retries` allow, else
+ * fail; on cancel they fail. Returns the jobs that ended, for their hand-offs.
+ */
+export function trainEnded(pipeline: Run, train: Run, now: string): Job[] {
+  const stationId = train.train!.station;
+  const station = stationsOf(pipeline).find((candidate) => candidate.id === stationId);
+  const ended: Job[] = [];
+  for (const job of pipeline.jobs) {
+    const ride = job.riding.find((entry) => entry.runId === train.id);
+    if (!ride) continue;
+    job.riding = job.riding.filter((entry) => entry.runId !== train.id);
+    if (job.status !== "open") continue;
+    const copy = train.jobs.find((candidate) => candidate.id === job.id);
+    if (copy) job.outputs = { ...job.outputs, ...copy.outputs };
+    if (train.status === "completed") {
+      job.passed.push(stationId);
+      queueNext(pipeline, job, now);
+      if (job.waiting.length === 0 && job.riding.length === 0 && stationsOf(pipeline).every((candidate) => job.passed.includes(candidate.id))) {
+        const checked = checkJobOutputs(pipeline.playbook, job.outputs, true);
+        if (checked.ok) endJob(pipeline, job, "settled", pipeline.playbook.outcomes[0]!, `passed every station`, checked.outputs, now);
+        else endJob(pipeline, job, "failed", null, `left the pipeline without its outputs: ${checked.errors.join("; ")}`, {}, now);
+        ended.push(job);
+      }
+      continue;
+    }
+    const rides = (job.failedRides[stationId] ?? 0) + 1;
+    job.failedRides[stationId] = rides;
+    if (train.status === "failed" && station && rides <= station.retries) {
+      // Back at the front: it keeps the place it had in the waiting list.
+      job.waiting.push({ station: stationId, since: ride.since });
+      log(pipeline, now, "job_requeued", stationId, `${job.id} after train ${train.id} ${train.status} (${rides}/${station.retries})`);
+      continue;
+    }
+    endJob(pipeline, job, "failed", null, `train ${train.id} at "${stationId}" ${train.status}${train.failure ? `: ${train.failure}` : ""}`, {}, now);
+    ended.push(job);
+  }
+  log(pipeline, now, "train_ended", stationId, `${train.id} ${train.status}`);
+  return ended;
+}
+
+/** A hand-off was canceled, reset or timed out: its job leaves the pipeline. Returns it and the trains carrying it. */
+export function withdrawJob(pipeline: Run, jobId: string, reason: string, now: string): { job: Job; trains: string[] } | null {
+  const job = pipeline.jobs.find((candidate) => candidate.id === jobId);
+  if (!job || job.status !== "open") return null;
+  const trains = job.riding.map((entry) => entry.runId);
+  job.riding = [];
+  endJob(pipeline, job, "withdrawn", null, reason, {}, now);
+  return { job, trains };
+}
+
+/** The pipeline was canceled or failed: every open job fails. Returns them. */
+export function failOpenJobs(run: Run, reason: string, now: string): Job[] {
+  return failJobs(run, run.jobs.filter((job) => job.status === "open").map((job) => job.id), reason, now);
+}
+
+/** These open jobs fail (e.g. their station was removed from the playbook). Returns them. */
+export function failJobs(run: Run, jobIds: string[], reason: string, now: string): Job[] {
+  const open = run.jobs.filter((job) => job.status === "open" && jobIds.includes(job.id));
   for (const job of open) {
-    if (run.status === "completed") endJob(run, job, "settled", outcome, `run ${run.id} completed`, run.outputs ?? {}, now);
-    else endJob(run, job, "failed", null, `run ${run.id} ${run.status}${run.failure ? `: ${run.failure}` : ""}`, {}, now);
+    job.riding = [];
+    endJob(run, job, "failed", null, reason, {}, now);
   }
   return open;
 }
 
-/** A hand-off was canceled or reset: its job leaves the run. Returns it if it was still open. */
-export function withdrawJob(run: Run, jobId: string, reason: string, now: string): Job | null {
-  const job = run.jobs.find((candidate) => candidate.id === jobId);
-  if (!job || job.status !== "open") return null;
-  endJob(run, job, "withdrawn", null, reason, {}, now);
-  return job;
+/** Mirrors on a train's copy what happened to a job in the pipeline. */
+export function mirrorJob(train: Run, job: Job): void {
+  const copy = train.jobs.find((candidate) => candidate.id === job.id);
+  if (!copy) return;
+  copy.status = job.status;
+  copy.outcome = job.outcome;
+  copy.summary = job.summary;
+  copy.outputs = { ...job.outputs };
+  copy.endedAt = job.endedAt;
 }
 
 /**
