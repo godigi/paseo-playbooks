@@ -149,8 +149,17 @@ function pendingGates(run: Run): Gate[] {
   return run.gates.filter((gate) => gate.status === "pending");
 }
 
-/** A run's name in lists: its first text input (the request), else its id. */
+/** A singleton run's key values, e.g. "env: dev"; empty without a key. */
+function keyText(run: Run): string {
+  return Object.entries(run.inputs).map(([name, value]) => `${name}: ${value}`).join(", ");
+}
+
+/** A run's name in lists: its first text input (the request), else its id; a singleton run's key and jobs. */
 function runTitle(run: Run): string {
+  if (run.playbook.singleton) {
+    const open = run.jobs.filter((job) => job.status === "open").length;
+    return `${keyText(run) || run.playbook.title} · ${run.jobs.length} job(s)${open !== run.jobs.length ? `, ${open} open` : ""}`;
+  }
   const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
   return text ? text.trim().split("\n")[0]! : run.id;
 }
@@ -221,6 +230,10 @@ const LIVE = new Set(["running", "waiting", "reported", "queued", "ready", "fail
 function progress(run: Run): { position: number; marks: number[]; tone: Tone; status: string } {
   const steps = mainSteps(run);
   const done = steps.length;
+  if (run.status === "boarding") {
+    const open = run.jobs.filter((job) => job.status === "open").length;
+    return { position: 0, marks: [0], tone: "waiting", status: `Waiting list: ${open} job(s), departs when the track is free` };
+  }
   if (run.status === "completed") {
     if (isActive(run)) return { position: done, marks: [done], tone: "running", status: "Done, wrapping up" };
     return { position: done, marks: [done], tone: run.seenAt ? "seen" : "done", status: "Done" };
@@ -709,6 +722,7 @@ function PlaybookGroup(props: {
         extra={working > 0 ? `${working} working` : undefined}
         extraColor={theme.colors.accent}
       />
+      {playbook.singleton ? <Lanes theme={theme} runs={props.runs} /> : null}
       {/* No overflow clipping: the sort menu opens over the rows below. */}
       <View style={{ borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
         <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: theme.colors.border, zIndex: 10 }}>
@@ -735,6 +749,73 @@ function PlaybookGroup(props: {
           />
         ))}
       </View>
+    </View>
+  );
+}
+
+/**
+ * A singleton playbook's lanes, one per key value (every value of an enum key, else the values
+ * seen), in order: its waiting list (the boarding run's jobs) and its running runs.
+ */
+function Lanes(props: { theme: Theme; runs: Run[] }) {
+  const { theme } = props;
+  const playbook = props.runs[0]!.playbook;
+  const key = playbook.singleton?.key ?? [];
+  const lanes = useMemo(() => {
+    const seen = new Map<string, Record<string, string>>();
+    const only = key.length === 1 ? playbook.inputs[key[0]!] : undefined;
+    if (only?.type === "enum") for (const value of only.values ?? []) seen.set(JSON.stringify({ [key[0]!]: value }), { [key[0]!]: value });
+    for (const run of props.runs) {
+      const values = Object.fromEntries(key.map((name) => [name, String(run.inputs[name] ?? "")]));
+      seen.set(JSON.stringify(values), values);
+    }
+    if (seen.size === 0) seen.set("{}", {});
+    return [...seen.entries()];
+  }, [props.runs, playbook, key]);
+  return (
+    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+      {lanes.map(([id, values]) => {
+        const inLane = props.runs.filter((run) => key.every((name) => String(run.inputs[name] ?? "") === values[name]));
+        const waiting = inLane.filter((run) => run.status === "boarding").flatMap((run) => run.jobs.filter((job) => job.status === "open"));
+        const running = inLane.filter((run) => run.status !== "boarding" && isActive(run));
+        const label = Object.values(values).join(" · ") || playbook.title;
+        return (
+          <View
+            key={id}
+            accessibilityLabel={`Lane ${label}: ${waiting.length} job(s) waiting, ${running.length} running`}
+            style={{ minWidth: 150, flexGrow: 1, flexBasis: 150, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1, padding: 10, gap: 6 }}
+          >
+            <Text style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "600" }}>{label}</Text>
+            <View style={{ gap: 2 }}>
+              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Waiting list</Text>
+              {waiting.length === 0 ? (
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>empty</Text>
+              ) : (
+                waiting.map((job) => (
+                  <Text key={job.id} numberOfLines={1} style={{ color: theme.colors.statusWarning, fontSize: 12 }}>
+                    {job.label}
+                  </Text>
+                ))
+              )}
+            </View>
+            <View style={{ gap: 2 }}>
+              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Running</Text>
+              {running.length === 0 ? (
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>track free</Text>
+              ) : (
+                running.map((run) => {
+                  const state = progress(run);
+                  return (
+                    <Text key={run.id} numberOfLines={2} style={{ color: toneColor(theme, state.tone), fontSize: 12 }}>
+                      {shortId(run)} · {run.jobs.filter((job) => job.status === "open").length} open job(s) · {state.status}
+                    </Text>
+                  );
+                })
+              )}
+            </View>
+          </View>
+        );
+      })}
     </View>
   );
 }
@@ -800,7 +881,8 @@ function RunRow(props: {
       .then(refresh)
       .catch((error: unknown) => console.error("[playbooks] mark seen failed", error));
   };
-  const openWorkspace = props.onOpenWorkspace
+  // A boarding run has no workspace or manager yet.
+  const openWorkspace = props.onOpenWorkspace && run.workspaceId
     ? () => {
         opened();
         props.onOpenWorkspace!(run.workspaceId);
@@ -824,7 +906,8 @@ function RunRow(props: {
         </Text>
         <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
           {shortId(run)} · <Text style={{ color: state.tone === "seen" || state.tone === "paused" ? theme.colors.foregroundMuted : color }}>{state.status}</Text> ·{" "}
-          {ago(run.updatedAt)} · {props.workspace}
+          {ago(run.updatedAt)}
+          {props.workspace ? ` · ${props.workspace}` : ""}
         </Text>
       </View>
     </Pressable>
@@ -836,7 +919,7 @@ function RunRow(props: {
       workspace={props.workspace}
       compact={compact}
       onOpenAgent={
-        props.onOpenAgent
+        props.onOpenAgent && run.managerAgentId
           ? (agentId) => {
               opened();
               props.onOpenAgent!(agentId);

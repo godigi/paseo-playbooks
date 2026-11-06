@@ -42,3 +42,22 @@ export async function currentRef(cwd: string): Promise<string | null> {
     return null;
   }
 }
+
+/** The project's default branch: origin's HEAD, else `main` or `master` if present, else the current branch. */
+export async function defaultBranch(cwd: string): Promise<string | null> {
+  try {
+    const head = (await git(cwd, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])).trim();
+    if (head) return head.replace(/^origin\//, "");
+  } catch {
+    // No origin HEAD: look for the usual names.
+  }
+  for (const name of ["main", "master"]) {
+    try {
+      await git(cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`]);
+      return name;
+    } catch {
+      // Not this one.
+    }
+  }
+  return currentRef(cwd);
+}

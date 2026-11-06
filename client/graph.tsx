@@ -651,8 +651,10 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
   const attempts = state?.attempts ?? [];
   const latest = attempts.at(-1);
   const isScript = step.kind === "script";
-  // Script steps have no agent: their attempts open the details sheet instead of a conversation.
-  const latestAgent = latest && !isScript ? latest.agentId : null;
+  const isHandoff = step.kind === "handoff";
+  // Script and hand-off steps have no agent: their attempts open the details sheet instead of a conversation.
+  const agentless = isScript || isHandoff;
+  const latestAgent = latest && !agentless ? latest.agentId : null;
   const live = useAgent(latestAgent ?? "", (agent) => ({ status: agent.status, attention: agent.attentionReason }));
   const reduceMotion = useReduceMotion();
   let nodeState: NodeState = run ? state?.status ?? "pending" : "definition";
@@ -678,11 +680,16 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
     return () => loop.stop();
   }, [nodeState, reduceMotion, pulse]);
 
-  const subtitle = isGate
+  const condition = step.when?.length ? ` · if ${step.when.map((when) => `${when.input}=${when.values.join("|")}`).join(", ")}` : "";
+  const subtitle = (isGate
     ? "Gate"
     : isScript
       ? `Script${nodeState === "running" && latest?.checks ? ` · check ${latest.checks}` : ""}`
-      : `${role?.title ?? step.role}${role?.readonly ? " · ro" : ""}`;
+      : isHandoff
+        ? `Hand-off → ${step.handoff}`
+        : `${role?.title ?? step.role}${role?.readonly ? " · ro" : ""}`) + condition;
+  // Where a hand-off's job is: its boarding run, the run carrying it, or its result.
+  const jobLine = isHandoff && nodeState === "running" ? latest?.lastMessage ?? null : null;
   const stateLabel = nodeStateLabel(nodeState);
   const onPress = () => (latestAgent ? props.onOpenAgent(latestAgent) : props.onOpenSheet(step.id));
   const isHighlighted = highlighted === step.id;
@@ -729,6 +736,11 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
               {stateLabel}
             </Text>
           ) : null}
+          {jobLine ? (
+            <Text numberOfLines={2} style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>
+              {jobLine}
+            </Text>
+          ) : null}
         </Pressable>
         {pendingGate && run ? (
           <View style={{ paddingHorizontal: 8, paddingBottom: 8 }}>
@@ -742,7 +754,7 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
                 key={attempt.n}
                 accessibilityRole="button"
                 accessibilityLabel={`Open attempt ${attempt.n} of ${step.id}`}
-                onPress={() => (isScript ? props.onOpenSheet(step.id) : props.onOpenAgent(attempt.agentId))}
+                onPress={() => (agentless ? props.onOpenSheet(step.id) : props.onOpenAgent(attempt.agentId))}
                 style={{ borderRadius: 6, paddingHorizontal: 5, paddingVertical: 1, backgroundColor: theme.colors.surface2 }}
               >
                 <Text style={{ color: theme.colors.foreground, fontSize: 10 }}>#{attempt.n}</Text>

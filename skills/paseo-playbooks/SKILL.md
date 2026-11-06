@@ -136,7 +136,8 @@ steps:
 | `title` | Full name, shown in the step's details and on its graph node. Default: the id, capitalised (`investigate` → Investigate). On a playbook step it names the block's frame. |
 | `short_title` | Name in the Playbooks screen's step columns. Default: `title`. Not on playbook steps (their own steps are the columns). |
 | `needs` | Steps that must complete first. No `needs` = starts with the run. Steps ready together run in parallel. File order does not matter. |
-| `role` / `gate` / `playbook` / `script` | Exactly one, as a block: an agent step, a human gate, a sub-playbook, or a script the plugin runs itself (see "Step kinds" below). |
+| `role` / `gate` / `playbook` / `script` / `handoff` | Exactly one, as a block: an agent step, a human gate, a sub-playbook, a script the plugin runs itself, or a hand-off to a singleton playbook (see "Step kinds" and "Singleton playbooks and hand-off steps" below). |
+| `when` | Run the step only for some values of the run's inputs: `{ env: prd }` or `{ env: [stg, prd] }`; otherwise it is skipped (see Conditional steps). |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
@@ -176,7 +177,7 @@ several lines:
 | Block field | Meaning |
 | --- | --- |
 | `role.name` | Required: the role (a directory of `roles/`). |
-| `role.prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
+| `role.prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ run.jobs }}` (a singleton run's open jobs, as YAML), `{{ attempt }}`. |
 | `role.silence` | After this long without agent activity (default `30m`, or `off`), the plugin asks the agent once to report or say what it is waiting for, and tells the manager. |
 | `role.archive_agents` | When the step completes, or its run or after-task ends, its agents are archived, and an attempt's agent is archived when the next attempt starts (default `true`). `false` keeps them, e.g. to debug. |
 | `role.agent` | Step-level agent settings. |
@@ -256,6 +257,91 @@ The script contract:
   `defaults/main.yaml`) a polling script waits forever.
 - Pausing the run lets a running script keep checking; its result waits for the resume.
   Canceling the run, or a `goto` that resets the step, kills it.
+
+### Conditional steps
+
+`when` runs a step only for some values of the run's inputs (or, inside a sub-playbook, of
+the block's inputs). Values are checked against the input's type. There is no expression
+language: only equality.
+
+```yaml
+steps:
+  - id: go
+    when: { env: prd }          # only the prd run asks for a human go
+    gate: { question: Release to prd? }
+  - id: release
+    needs: [go]                 # a skipped step counts as done: release starts at once on dev
+    role: { name: env_releaser }
+```
+
+A skipped step's outputs are unset: a later step may read them only if it has the same
+`when`. A `when` on a playbook step applies to every step of the block. After-tasks have none.
+
+### Singleton playbooks and hand-off steps
+
+A **singleton playbook** takes work (**jobs**) from other runs and handles it in groups, one
+group at a time per resource. Its runs do not belong to whoever handed work off: each has its
+own worktree and Playbook Manager, created by the plugin.
+
+```yaml
+# apply.yaml
+title: Apply
+singleton:
+  branch: main              # runs branch off it (default: the project's default branch)
+  concurrency:
+    key: [env]              # the run's inputs; the other inputs are each job's
+    limit: 1                # running runs per key value; the others wait on the list
+inputs:
+  env: { type: enum, values: [dev, stg, prd], required: true }   # in the key: the run's
+  pr_url: { type: string, required: true }                       # not in the key: each job's
+outputs:
+  report: { type: string }                                       # each job's
+outcomes: [done, rejected]                                       # each job's
+steps:
+  - id: apply
+    inputs: [env]
+    role:
+      name: applier
+      prompt: |
+        Apply these jobs to {{ inputs.env }}:
+        {{ run.jobs }}
+```
+
+- `singleton: {}` takes every default: no key (one waiting list for the project), no limit
+  (every job runs on its own at once). A singleton cannot also set the top-level
+  `concurrency`, and cannot be a sub-playbook step or an after-task.
+- **Waiting list:** per key value there is at most one boarding run gathering jobs. As soon
+  as the key has a free slot, it departs with every job on it: the plugin creates its worktree
+  and manager. Jobs handed off after that wait for the next one.
+- **Run and job inputs:** steps read the key inputs as `{{ inputs.env }}`, and each job's
+  inputs only through `{{ run.jobs }}` (`PLAYBOOK_JOBS` as JSON for scripts); wiring a job's
+  input into a step is refused.
+- **Settling:** the run's manager calls `settle_job` for each job (an outcome, a summary and
+  the playbook's outputs, all of them for the first outcome) as soon as its result is known.
+  Jobs still open when the run completes take the run's outcome and outputs; when it fails or
+  is canceled, their hand-offs fail. A singleton's `outputs` need no source (`settle_job`
+  gives them).
+
+A **hand-off step** gives a singleton a job and waits for its result, like a gate:
+
+```yaml
+  - id: apply_dev
+    needs: [approve]
+    handoff: { name: apply }
+    inputs: { env: dev, pr_url: ~ }   # the target's key inputs plus its job inputs
+    timeout: 8h                       # the whole wait, waiting list included
+    retries: 1                        # a failed run hands off a new job
+    on:
+      rejected: { goto: fix, max_loops: 2 }
+```
+
+- Its contract is the target's `inputs`, `outputs` and `outcomes` (plus `failure`), as for a
+  sub-playbook step; every outcome but the first needs an `on` entry (not `ask`). `prompt`,
+  `outputs`, `outcomes`, `agent` do not apply.
+- The plugin starts it and completes it from the result; the manager never calls `start_step`
+  or `complete_step` for it. Canceling the run, or a `goto` that resets the step, withdraws
+  the job. While the run is paused, a result waits for the resume.
+- A hand-off that leads back to its own playbook is refused (the runs would wait on each other).
 
 ### Sub-playbooks
 
@@ -453,10 +539,15 @@ on:
 - no cycles in `needs`; no unknown steps, roles, inputs or outputs
 - two steps that can run at the same time (neither needs the other) must not both be able
   to edit files: make one role `readonly: true` or order them with `needs`
-- prompts use only `inputs`, `run.id` and `attempt` (after-tasks also `run.status` and
+- prompts use only `inputs`, `run.id`, `run.jobs` and `attempt` (after-tasks also `run.status` and
   `run.failure`); inputs only reference ancestors (after-tasks also main steps and `run.*`)
 - after-tasks have no `needs`, and only after-tasks have `trigger`
 - a `script` names an existing, executable file of `scripts/`; `poll` goes in the `script:` block
+- a `handoff` names a singleton playbook of the same folder, and does not lead back to its
+  own playbook; a singleton is never a sub-playbook or an after-task, and its steps never
+  wire a job's input
+- `when` names the run's inputs (on a singleton, only its key inputs) with values of their
+  type; a skipped step's outputs are read only by steps with the same `when`
 - no `next` key: chaining was removed; to run a playbook after another, write a parent
   playbook that includes both as sub-playbook steps
 

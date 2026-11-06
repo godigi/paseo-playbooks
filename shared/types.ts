@@ -94,17 +94,34 @@ export const RoleSchema = z.object({
 export type Role = z.infer<typeof RoleSchema>;
 
 
+/**
+ * A `when` condition of a step: the step runs only when the value `source` renders to (a run or
+ * block input, after sub-playbook expansion) is one of `values`; otherwise it is skipped.
+ */
+export const WhenSchema = z.object({
+  /** The input's name as written in the YAML, for messages. */
+  input: z.string(),
+  /** Template rendered against the run, e.g. "{{ playbook.inputs.env }}". */
+  source: z.string(),
+  values: z.array(z.string()),
+});
+export type When = z.infer<typeof WhenSchema>;
+
 export const StepSchema = z.object({
   id: z.string(),
   /** Full name (details panel, graph). Unset = stepLabel(id). */
   title: z.string().optional(),
   /** Name in the Playbooks screen columns. Unset = the title. */
   shortTitle: z.string().optional(),
-  kind: z.enum(["agent", "gate", "script"]),
+  kind: z.enum(["agent", "gate", "script", "handoff"]),
   role: z.string().optional(),
   gate: z.string().optional(),
   /** Script steps: the executable, relative to the workspace (`<playbooks folder>/scripts/<name>`). */
   script: z.string().optional(),
+  /** Hand-off steps: the singleton playbook the step hands a job to. */
+  handoff: z.string().optional(),
+  /** Runs the step only when every condition holds; otherwise it is skipped. Unset = always. */
+  when: z.array(WhenSchema).optional(),
   /** Script steps: rerun the script this often while it exits with SCRIPT_NOT_YET. Unset = run it once. */
   pollMs: z.number().int().positive().optional(),
   needs: z.array(z.string()),
@@ -160,6 +177,19 @@ export const PlaybookSchema = z.object({
   inputs: z.record(z.string(), VarDefSchema),
   outputs: z.record(z.string(), PlaybookOutputSchema),
   concurrency: z.number().int().positive().optional(),
+  /**
+   * Set on a singleton playbook: it takes jobs from hand-off steps. Its inputs in `key` are each
+   * run's; the others are each job's. Per key value, at most one boarding run gathers jobs, and
+   * at most `limit` runs run at once (unset = no limit).
+   */
+  singleton: z
+    .object({
+      /** Branch its runs branch off; unset = the project's default branch. */
+      branch: z.string().optional(),
+      key: z.array(z.string()),
+      limit: z.number().int().positive().optional(),
+    })
+    .optional(),
   /**
    * How the playbook can end, as seen by a parent that uses it as a sub-playbook. The first is
    * a normal finish (all steps done, or a plain `end`); `{ end: <outcome> }` picks another.
@@ -260,6 +290,8 @@ export const AttemptSchema = z.object({
   checks: z.number().int().min(0).default(0),
   /** Script steps: when the next check runs, while the script says "not yet". */
   nextCheckAt: z.string().nullable().default(null),
+  /** Hand-off steps: the job this attempt handed off, and the singleton run that holds it. */
+  job: z.object({ runId: z.string(), jobId: z.string() }).nullable().default(null),
 });
 export type Attempt = z.infer<typeof AttemptSchema>;
 
@@ -301,7 +333,8 @@ export const GateSchema = z.object({
 });
 export type Gate = z.infer<typeof GateSchema>;
 
-export const RunStatusSchema = z.enum(["running", "waiting_gate", "completed", "failed", "canceled"]);
+/** "boarding": a singleton run gathering jobs, before it departs (no worktree, manager or step yet). */
+export const RunStatusSchema = z.enum(["boarding", "running", "waiting_gate", "completed", "failed", "canceled"]);
 export type RunStatus = z.infer<typeof RunStatusSchema>;
 
 export const AfterTaskStatusSchema = z.enum(["pending", "running", "completed", "failed", "canceled"]);
@@ -315,6 +348,26 @@ export const RunAfterTaskSchema = z.object({
   detail: z.string().nullable(),
 });
 export type RunAfterTask = z.infer<typeof RunAfterTaskSchema>;
+
+/** Work a hand-off step gave a singleton run: its inputs, and once settled its outcome and outputs. */
+export const JobSchema = z.object({
+  id: z.string(),
+  /** The handing-off run and step, and the attempt that handed it off. */
+  fromRunId: z.string(),
+  fromStepId: z.string(),
+  attempt: z.number().int().positive(),
+  /** A short label for the panel, e.g. the handing-off run's playbook title. */
+  label: z.string(),
+  inputs: z.record(z.string(), VarValueSchema),
+  /** open: waiting or being handled; settled: has an outcome; failed: its run failed or was canceled; withdrawn: its hand-off was canceled. */
+  status: z.enum(["open", "settled", "failed", "withdrawn"]),
+  outcome: z.string().nullable(),
+  summary: z.string().nullable(),
+  outputs: z.record(z.string(), VarValueSchema),
+  createdAt: z.string(),
+  endedAt: z.string().nullable(),
+});
+export type Job = z.infer<typeof JobSchema>;
 
 export const HistoryEventSchema = z.object({
   seq: z.number().int(),
@@ -353,6 +406,10 @@ export const RunSchema = z.object({
   /** State of each after-task, by id. Runs created before after-tasks have none. */
   after: z.record(z.string(), RunAfterTaskSchema).default({}),
   inbox: z.array(z.string()),
+  /** Singleton runs: the jobs handed to this run (open ones are its work). */
+  jobs: z.array(JobSchema).default([]),
+  /** A boarding singleton run started from the panel: it departs even without a job. */
+  departEmpty: z.boolean().default(false),
   history: z.array(HistoryEventSchema),
   seq: z.number().int(),
 });
@@ -368,6 +425,25 @@ export function scriptAttemptId(runId: string, stepId: string, attempt: number):
 
 export function isScriptAttempt(agentId: string): boolean {
   return agentId.startsWith("script:");
+}
+
+/** Hand-off steps have no agent either: their attempts carry this id. */
+export function handoffAttemptId(runId: string, stepId: string, attempt: number): string {
+  return `handoff:${runId}:${stepId}:${attempt}`;
+}
+
+export function isHandoffAttempt(agentId: string): boolean {
+  return agentId.startsWith("handoff:");
+}
+
+/** An attempt run by the plugin itself (a script check or a hand-off), with no agent behind it. */
+export function isAgentlessAttempt(agentId: string): boolean {
+  return isScriptAttempt(agentId) || isHandoffAttempt(agentId);
+}
+
+/** A singleton run still gathering jobs: it has no worktree, manager or step yet. */
+export function isBoarding(run: Run): boolean {
+  return run.status === "boarding";
 }
 
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["completed", "failed", "canceled"];

@@ -60,7 +60,7 @@ export function nodeStateLabel(state: NodeState): string {
     case "queued":
       return "waiting for a free slot";
     case "skipped":
-      return "skipped (block ended)";
+      return "skipped";
     case "definition":
       return "";
     default:
@@ -69,7 +69,7 @@ export function nodeStateLabel(state: NodeState): string {
 }
 
 export function runStatusLabel(status: RunStatus): string {
-  return status === "waiting_gate" ? "waiting for approval" : status;
+  return status === "waiting_gate" ? "waiting for approval" : status === "boarding" ? "waiting list" : status;
 }
 
 export function runStatusColor(theme: Theme, status: RunStatus): string {
@@ -80,6 +80,7 @@ export function runStatusColor(theme: Theme, status: RunStatus): string {
     case "canceled":
       return theme.colors.statusDanger;
     case "waiting_gate":
+    case "boarding":
       return theme.colors.statusWarning;
     default:
       return theme.colors.accent;
