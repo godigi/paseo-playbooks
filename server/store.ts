@@ -16,6 +16,9 @@ export function defaultRunsDir(): string {
 export class RunStore {
   private readonly runs = new Map<string, Run>();
   private readonly queues = new Map<string, Promise<unknown>>();
+  /** Writes in flight, awaited by close. */
+  private readonly writing = new Set<Promise<void>>();
+  private closed = false;
 
   constructor(private readonly dir: string) {}
 
@@ -69,10 +72,22 @@ export class RunStore {
     await rm(path.join(this.dir, `${id}.json`), { force: true });
   }
 
+  /** Stops writing (mutations still apply in memory) and waits for the writes in flight. */
+  async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled(this.writing);
+  }
+
   private async write(run: Run): Promise<void> {
+    if (this.closed) return;
     const file = path.join(this.dir, `${run.id}.json`);
     const temp = `${file}.${process.pid}.tmp`;
-    await writeFile(temp, `${JSON.stringify(run, null, 2)}\n`, "utf8");
-    await rename(temp, file);
+    const done = writeFile(temp, `${JSON.stringify(run, null, 2)}\n`, "utf8").then(() => rename(temp, file));
+    this.writing.add(done);
+    try {
+      await done;
+    } finally {
+      this.writing.delete(done);
+    }
   }
 }

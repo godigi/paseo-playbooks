@@ -11,7 +11,9 @@ import { RunStore } from "./store";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
 const temps: string[] = [];
+const runtimes: Runtime[] = [];
 afterEach(async () => {
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -52,6 +54,7 @@ async function setup(options: { lastText?: string; failSend?: boolean } = {}) {
   await store.create(run);
   const fake = fakePaseo(options.lastText ?? "report_step_result was not found. PR: https://x/pr/1", options.failSend);
   const runtime = new Runtime(store);
+  runtimes.push(runtime);
   await runtime.attach(fake.paseo as never);
   return { store, runtime, ...fake };
 }

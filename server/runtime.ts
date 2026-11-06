@@ -214,11 +214,13 @@ export class Runtime {
     return this.paseo;
   }
 
-  dispose(): void {
+  /** Stops timers and scripts; resolves once the run files written in flight are on disk, after which nothing is written. */
+  dispose(): Promise<void> {
     for (const timer of [...this.timers.values(), ...this.watches.values()]) clearTimeout(timer);
     this.timers.clear();
     this.watches.clear();
     for (const id of [...this.scripts.keys()]) this.stopScript(id);
+    return this.store.close();
   }
 
   /**
