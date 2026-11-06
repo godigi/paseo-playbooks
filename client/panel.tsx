@@ -182,6 +182,8 @@ function PlaybookCard(props: {
   // A singleton's pipeline is not a tab: its stations stay on top, and its trains are the tabs.
   const pipeline = card.runs.find((candidate) => isPipeline(candidate) && !isTerminal(candidate.status)) ?? card.runs.find(isPipeline);
   const tabs = card.runs.filter((candidate) => !isPipeline(candidate));
+  // A live pipeline stays running while it exists, idle or not: its trains say what it does.
+  const dotted = card.runs.filter((candidate) => !isPipeline(candidate) || isTerminal(candidate.status));
   // A selected run that disappeared (archived) falls back to the default tab.
   const current = selected === "definition" || tabs.some((candidate) => candidate.id === selected) ? selected : null;
   // Active and unopened runs get tabs; finished ones already opened, or over a day old, go in History.
@@ -212,10 +214,10 @@ function PlaybookCard(props: {
             </Text>
           </View>
         </Pressable>
-        {card.runs.length > 0 ? (
+        {dotted.length > 0 ? (
           <RunDots
             theme={theme}
-            runs={card.runs}
+            runs={dotted}
             readRuns={props.readRuns}
             onOpen={(run) => {
               setExpanded(true);
