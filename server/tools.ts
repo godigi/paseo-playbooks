@@ -2,7 +2,7 @@ import { defineAgentTool, type AgentToolDefinition, type AgentToolResult } from 
 import { askHumanText, choicesOfGate, GATE_SUMMARY_MAX } from "../shared/gates";
 import { z } from "zod";
 import type { PlaybookEntry, Run } from "../shared/types";
-import { isActive, isAgentlessAttempt, isBoarding, isPaused, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
+import { isActive, isAgentlessAttempt, isPaused, isPipeline, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
 import * as engine from "./engine";
 import { hasPlaybooks, loadPlaybooks } from "./loader";
 import { MANAGER_PROTOCOL } from "./prompts";
@@ -49,13 +49,14 @@ function compactGate(gate: Run["gates"][number]) {
   return { id: gate.id, kind: gate.kind, stepId: gate.stepId, status: gate.status, summary: gate.summary, comment: clip(gate.comment), decidedBy: gate.decidedBy };
 }
 
-/** A singleton run's jobs: id, where from, status and outcome (inputs with view "full"). */
+/** A train's (or pipeline's) jobs: id, where from, status and outcome (inputs with view "full"). */
 function jobStatus(run: Run, full = false) {
   return run.jobs.map((job) => ({
     id: job.id,
     from: job.label,
     status: job.status,
     outcome: job.outcome,
+    ...(isPipeline(run) ? { passed: job.passed, waiting: job.waiting.map((place) => place.station), riding: job.riding.map((ride) => `${ride.station} (${ride.runId})`) } : {}),
     ...(full ? { inputs: job.inputs, outputs: job.outputs, summary: job.summary } : { summary: clip(job.summary) }),
   }));
 }
@@ -79,7 +80,7 @@ export function runChange(run: Run, stepId?: string) {
     running: runningSteps(run),
     gates: run.gates.filter((gate) => gate.status === "pending").map(compactGate),
     ...(isTerminal(run.status) ? { outputs: run.outputs } : {}),
-    ...(run.playbook.singleton ? { jobs: jobStatus(run) } : {}),
+    ...(run.jobs.length > 0 || run.train ? { jobs: jobStatus(run) } : {}),
     after: afterStatus(run),
   };
 }
@@ -119,7 +120,7 @@ export function runCompact(run: Run, only?: string[]) {
     ),
     gates: run.gates.map(compactGate),
     loops: run.loops,
-    ...(run.playbook.singleton ? { jobs: jobStatus(run) } : {}),
+    ...(run.jobs.length > 0 || run.train ? { jobs: jobStatus(run) } : {}),
     after: afterStatus(run),
   };
 }
@@ -169,7 +170,7 @@ export function runFull(run: Run, only?: string[]) {
     ),
     gates: run.gates,
     loops: run.loops,
-    ...(run.playbook.singleton ? { jobs: jobStatus(run, true) } : {}),
+    ...(run.jobs.length > 0 || run.train ? { jobs: jobStatus(run, true) } : {}),
     after: run.playbook.after.map((task) => ({ ...task, ...(run.after[task.id] ?? { status: "pending" }) })),
   };
 }
@@ -200,7 +201,9 @@ function describeEntry(entry: PlaybookEntry) {
     inputs: pb.inputs,
     outputs: Object.fromEntries(Object.entries(pb.outputs).map(([name, def]) => [name, { type: def.type, from: def.label }])),
     concurrency: pb.concurrency ?? null,
-    ...(pb.singleton ? { singleton: { branch: pb.singleton.branch ?? "(default branch)", key: pb.singleton.key, limit: pb.singleton.limit ?? null } } : {}),
+    ...(pb.singleton
+      ? { singleton: { branch: pb.singleton.branch ?? "(default branch)", stations: pb.singleton.stations.map((station) => ({ id: station.id, needs: station.needs, queue: station.mode, retries: station.retries })) } }
+      : {}),
     after: pb.after.map((task) => ({ id: task.id, title: task.title, trigger: task.trigger, steps: task.steps })),
     steps: pb.steps.map((step) => ({
       id: step.id,
@@ -249,9 +252,7 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
           const run = await runtime.startPlaybook(agent, playbook, inputs);
           if (run.playbook.singleton) {
             return ok(
-              isBoarding(run)
-                ? `"${playbook}" is a singleton: run ${run.id} is boarding and departs as soon as its key has a free slot, with its own worktree and Playbook Manager. You do not manage it.`
-                : `"${playbook}" is a singleton: run ${run.id} departed with its own worktree and Playbook Manager (agent ${run.managerAgentId}). You do not manage it.`,
+              `"${playbook}" is a singleton: its pipeline is run ${run.id}, in its own workspace. Hand-off steps give it jobs; each station's trains get their own Playbook Manager there. You do not manage it.`,
               { runId: run.id, status: run.status },
             );
           }
@@ -367,11 +368,11 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
     defineAgentTool({
       name: "settle_job",
       description:
-        "Singleton runs: settle one job the run carries (see get_run `jobs`, or {{ run.jobs }} in the step prompts) with an outcome of the playbook, a summary and its outputs (all of them for the first outcome). The run that handed it off is told at once; this run goes on with the others.",
+        "Trains of a singleton pipeline: settle one job your train carries (see get_run `jobs`, or {{ run.jobs }} in the step prompts). Without outcome: set its outputs (e.g. a release tag later stations read); it goes on with the train. With an outcome of the singleton (e.g. ejected): it ends now and the run that handed it off is told at once; the train goes on with the others. Jobs still open when the train completes pass to the next station.",
       input: z.object({
         runId: IdArg,
         jobId: z.string(),
-        outcome: z.string().describe("One of the playbook's outcomes"),
+        outcome: z.string().optional().describe("One of the singleton's outcomes, to end the job now; omit to only set outputs"),
         summary: z.string().describe("What happened to this job, for the run that handed it off"),
         outputs: z.record(z.string(), VarValueSchema).default({}).describe("The playbook's outputs for this job"),
       }),
@@ -379,7 +380,12 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
         guard(async () => {
           const run = await runtime.settleJob(agent.id, runId, jobId, { outcome, summary, outputs });
           const open = run.jobs.filter((job) => job.status === "open").map((job) => job.id);
-          return ok(`Job ${jobId} settled with "${outcome}"; its run was told. Open jobs: ${open.join(", ") || "none"}.`, runChange(run));
+          return ok(
+            outcome === undefined
+              ? `Outputs of job ${jobId} set; it goes on with the train. Open jobs: ${open.join(", ") || "none"}.`
+              : `Job ${jobId} ended with "${outcome}"; its run was told. Open jobs on this train: ${open.join(", ") || "none"}.`,
+            runChange(run),
+          );
         }),
     }),
     defineAgentTool({

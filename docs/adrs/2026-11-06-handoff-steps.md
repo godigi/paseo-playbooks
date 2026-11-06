@@ -1,6 +1,6 @@
 # Hand-off steps: a run hands a job to a singleton playbook and waits for its result
 
-Status: Accepted
+Status: Superseded by `2026-11-06-singleton-pipelines.md`
 
 ## Specification changes
 

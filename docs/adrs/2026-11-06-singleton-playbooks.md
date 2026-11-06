@@ -1,6 +1,6 @@
 # Singleton playbooks: a waiting list per key, departing when a slot is free
 
-Status: Accepted
+Status: Superseded by `2026-11-06-singleton-pipelines.md`
 
 ## Specification changes
 

@@ -140,6 +140,7 @@ steps:
 | `needs` | Steps that must complete first. No `needs` = starts with the run. Steps ready together run in parallel. File order does not matter. |
 | `role` / `gate` / `playbook` / `script` / `handoff` | Exactly one, as a block: an agent step, a human gate, a sub-playbook, a script the plugin runs itself, or a hand-off to a singleton playbook (see "Step kinds" and "Singleton playbooks and hand-off steps" below). |
 | `when` | Run the step only for some values of the run's inputs: `{ env: prd }` or `{ env: [stg, prd] }`; otherwise it is skipped (see Conditional steps). |
+| `queue` | A singleton's stations only: `{ mode: fifo }` (default, one job per train) or `{ mode: merge }` (every waiting job per train). |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
@@ -179,7 +180,7 @@ several lines:
 | Block field | Meaning |
 | --- | --- |
 | `role.name` | Required: the role (a directory of `roles/`). |
-| `role.prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ run.jobs }}` (a singleton run's open jobs, as YAML), `{{ attempt }}`. |
+| `role.prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ run.jobs }}` (a singleton train's open jobs, as YAML), `{{ attempt }}`. |
 | `role.silence` | After this long without agent activity (default `30m`, or `off`), the plugin asks the agent once to report or say what it is waiting for, and tells the manager. |
 | `role.archive_agents` | When the step completes, or its run or after-task ends, its agents are archived, and an attempt's agent is archived when the next attempt starts (default `true`). `false` keeps them, e.g. to debug. |
 | `role.agent` | Step-level agent settings. |
@@ -281,69 +282,77 @@ A skipped step's outputs are unset: a later step may read them only if it has th
 
 ### Singleton playbooks and hand-off steps
 
-A **singleton playbook** takes work (**jobs**) from other runs and handles it in groups, one
-group at a time per resource. Its runs do not belong to whoever handed work off: each has its
-own worktree and Playbook Manager, created by the plugin.
+A **singleton playbook** is a pipeline that takes work (**jobs**) from other runs: one
+long-lived run per project, in one shared workspace. Its top-level steps are **stations**,
+ordered by `needs`; jobs move through them.
 
 ```yaml
-# apply.yaml
-title: Apply
-singleton:
-  branch: main              # runs branch off it (default: the project's default branch)
-  concurrency:
-    key: [env]              # the run's inputs; the other inputs are each job's
-    limit: 1                # running runs per key value; the others wait on the list
+# release_trains.yaml
+title: Release trains
+singleton: { branch: main }            # its workspace branches off it (default: the default branch)
 inputs:
-  env: { type: enum, values: [dev, stg, prd], required: true }   # in the key: the run's
-  pr_url: { type: string, required: true }                       # not in the key: each job's
+  pr_url: { type: string, required: true }   # each job's
 outputs:
-  report: { type: string }                                       # each job's
-outcomes: [done, rejected]                                       # each job's
+  report: { type: string }                   # each job's
+outcomes: [shipped, ejected]                 # each job's, when it leaves the pipeline
 steps:
-  - id: apply
-    inputs: [env]
-    role:
-      name: applier
-      prompt: |
-        Apply these jobs to {{ inputs.env }}:
-        {{ run.jobs }}
+  - id: dev
+    playbook: { name: train }                # a hidden playbook: release, wait, QA
+    inputs: { env: dev }                     # constants only
+    queue: { mode: merge }                   # every waiting job rides the same train
+    retries: 2                               # failed trains a job may ride again here
+  - id: stg
+    needs: [dev]
+    playbook: { name: train }
+    inputs: { env: stg }
+    queue: { mode: merge }
+  - id: prd
+    needs: [stg]
+    playbook: { name: train_prd }            # its own file, with a go gate first
+    queue: { mode: merge }
+    retries: 3                               # "Not now" waits for the next train
 ```
 
-- `singleton: {}` takes every default: no key (one waiting list for the project), no limit
-  (every job runs on its own at once). A singleton cannot also set the top-level
-  `concurrency`, and cannot be a sub-playbook step or an after-task.
-- **Waiting list:** per key value there is at most one boarding run gathering jobs. As soon
-  as the key has a free slot, it departs with every job on it: the plugin creates its worktree
-  and manager. Jobs handed off after that wait for the next one.
-- **Run and job inputs:** steps read the key inputs as `{{ inputs.env }}`, and each job's
-  inputs only through `{{ run.jobs }}` (`PLAYBOOK_JOBS` as JSON for scripts); wiring a job's
-  input into a step is refused.
-- **Settling:** the run's manager calls `settle_job` for each job (an outcome, a summary and
-  the playbook's outputs, all of them for the first outcome) as soon as its result is known.
-  Jobs still open when the run completes take the run's outcome and outputs; when it fails or
-  is canceled, their hand-offs fail. A singleton's `outputs` need no source (`settle_job`
-  gives them).
+- **Stations:** each has a waiting list and runs **one train at a time**. A train is an
+  ordinary run of the station's steps, with its own Playbook Manager in the shared workspace;
+  the station's previous manager is archived when the next train leaves. Stations run in
+  parallel.
+- **`queue: { mode }`:** `fifo` (default) takes the oldest waiting job alone; `merge` takes
+  every waiting job (a merge queue). Only on a singleton's top-level steps.
+- **Moving on:** when a train completes, its jobs still open pass the station and wait at the
+  next ones. A job that passed every station leaves the pipeline with the first outcome; all
+  `outputs` must be set by then. When a train fails, its jobs wait at the station again, at
+  the front, up to its `retries`, then fail. `goto` between stations is refused.
+- **Jobs in steps:** every input of a singleton is each job's. Steps read the train's jobs
+  (inputs, and outputs set at earlier stations) through `{{ run.jobs }}`
+  (`PLAYBOOK_JOBS` for scripts); wiring a job's input into a step is refused. A station's
+  `inputs` take constants, which a sub-playbook reads as its inputs (`when: { env: prd }`
+  inside it works).
+- **Settling:** the train's manager calls `settle_job` for a job: without an outcome to set
+  its outputs (a tag later stations read), with an outcome (`ejected`) to end it now.
+  A singleton's `outputs` need no source.
+- Every role a singleton uses must be `readonly` (trains share one checkout). A singleton
+  cannot set `concurrency` or `after`, and cannot be a sub-playbook or an after-task. When no
+  train is running, its workspace is fast-forwarded to `branch` and its playbook read again.
 
-A **hand-off step** gives a singleton a job and waits for its result, like a gate:
+A **hand-off step** gives a singleton a job and waits until the job leaves the pipeline:
 
 ```yaml
-  - id: apply_dev
+  - id: release
     needs: [approve]
-    handoff: { name: apply }
-    inputs: { env: dev, pr_url: ~ }   # the target's key inputs plus its job inputs
-    timeout: 8h                       # the whole wait, waiting list included
-    retries: 1                        # a failed run hands off a new job
+    handoff: { name: release_trains }
+    inputs: { pr_url: ~ }             # the singleton's inputs
+    timeout: 48h                      # the whole pipeline, human gates included (or none)
     on:
-      rejected: { goto: fix, max_loops: 2 }
+      ejected: { goto: fix, max_loops: 2 }
 ```
 
-- Its contract is the target's `inputs`, `outputs` and `outcomes` (plus `failure`), as for a
-  sub-playbook step; every outcome but the first needs an `on` entry (not `ask`). `prompt`,
-  `outputs`, `outcomes`, `agent` do not apply.
-- The plugin starts it and completes it from the result; the manager never calls `start_step`
-  or `complete_step` for it. Canceling the run, or a `goto` that resets the step, withdraws
-  the job. While the run is paused, a result waits for the resume.
-- A hand-off that leads back to its own playbook is refused (the runs would wait on each other).
+- Its contract is the singleton's `inputs`, `outputs` and `outcomes` (plus `failure`); every
+  outcome but the first needs an `on` entry (not `ask`).
+- The plugin starts it and completes it; the manager never calls `start_step` or
+  `complete_step` for it. Canceling the run, or a `goto` that resets the step, withdraws the
+  job. While the run is paused, a result waits for the resume.
+- A hand-off that leads back to its own playbook is refused.
 
 ### Sub-playbooks
 
@@ -546,9 +555,10 @@ on:
 - after-tasks have no `needs`, and only after-tasks have `trigger`
 - a `script` names an existing, executable file of `scripts/`; `poll` goes in the `script:` block
 - a `handoff` names a singleton playbook of the same folder, and does not lead back to its
-  own playbook; a singleton is never a sub-playbook or an after-task, and its steps never
-  wire a job's input
-- `when` names the run's inputs (on a singleton, only its key inputs) with values of their
+  own playbook; a singleton is never a sub-playbook or an after-task, its steps never wire a
+  job's input, its roles are all `readonly`, and its stations do not `goto` each other;
+  `queue` only goes on a singleton's top-level steps
+- `when` names the run's inputs (never a singleton's: they are each job's) with values of their
   type; a skipped step's outputs are read only by steps with the same `when`
 - no `next` key: chaining was removed; to run a playbook after another, write a parent
   playbook that includes both as sub-playbook steps

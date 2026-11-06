@@ -17,6 +17,7 @@ import type {
   Transition,
   VarDef,
   VarType,
+  Station,
   VarValue,
   When,
 } from "../shared/types";
@@ -160,6 +161,14 @@ const RawStepSchema = z.object({
     playbook: kindBlock(RawPlaybookStepSchema).optional(),
     script: kindBlock(RawScriptStepSchema).optional(),
     handoff: kindBlock(RawHandoffStepSchema).optional(),
+    /** A singleton's station: which waiting jobs a train takes. */
+    queue: z
+      .object({
+        /** fifo: the oldest waiting job alone; merge: every waiting job. */
+        mode: z.enum(["fifo", "merge"]).default("fifo"),
+      })
+      .strict()
+      .optional(),
     /** Runs the step only for these input values (one value or a list per input); otherwise it is skipped. */
     when: z.record(z.string(), z.union([RawScalarSchema, z.array(RawScalarSchema).min(1)])).optional(),
     inputs: z.union([z.array(z.string()), z.record(z.string(), z.string().nullable())]).optional(),
@@ -197,23 +206,16 @@ const RawPlaybookSchema = z.object({
     /** Removed: playbooks compose only as sub-playbook steps. Kept here to refuse it clearly. */
     next: z.unknown().optional(),
     concurrency: z.number().int().positive().optional(),
-    /** Takes jobs from hand-off steps; `{}` for the defaults. A boolean is read only to refuse it. */
+    /** A pipeline taking jobs from hand-off steps; `{}` for the defaults. A boolean is read only to refuse it. */
     singleton: z
       .union([
         z.boolean(),
         z
           .object({
-            /** Branch its runs branch off; default: the project's default branch. */
+            /** Branch its workspace branches off; default: the project's default branch. */
             branch: z.string().min(1).optional(),
-            concurrency: z
-              .object({
-                /** Inputs that are each run's; the others are each job's. */
-                key: z.array(z.string()).default([]),
-                /** Running runs per key value; default: no limit. */
-                limit: z.number().int().positive().optional(),
-              })
-              .strict()
-              .optional(),
+            /** Removed in favour of stations; read only to refuse it. */
+            concurrency: z.unknown().optional(),
           })
           .strict(),
       ])
@@ -530,14 +532,16 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   if (typeof pb.singleton === "boolean") err(`singleton: a feature is a block: write \`singleton: {}\` for the defaults, or leave it out`);
   if (pb.singleton !== undefined && typeof pb.singleton !== "boolean") {
     const raw = pb.singleton;
-    singleton = { key: raw.concurrency?.key ?? [] };
+    singleton = { stations: [] };
     if (raw.branch !== undefined) singleton.branch = raw.branch;
-    if (raw.concurrency?.limit !== undefined) singleton.limit = raw.concurrency.limit;
-    if (pb.concurrency !== undefined) err("`concurrency` does not apply to a singleton playbook; set `singleton.concurrency` (key and limit) instead");
-    for (const name of singleton.key) if (!inputs[name]) err(`singleton.concurrency.key: "${name}" is not an input of this playbook`);
-    if (new Set(singleton.key).size !== singleton.key.length) err("singleton.concurrency.key: duplicate input");
+    if (raw.concurrency !== undefined) {
+      err("singleton.concurrency was removed: each top-level step is a station with its own waiting list; set `queue: { mode: fifo | merge }` on a step instead");
+    }
+    if (pb.concurrency !== undefined) err("`concurrency` does not apply to a singleton playbook: each top-level step is a station, which runs one train at a time");
+    if (pb.after !== undefined) err("`after` does not apply to a singleton playbook (its pipeline never ends)");
   }
-  const keyInputs = new Set(singleton?.key ?? []);
+  // A singleton has no run inputs: every input is each job's.
+  const keyInputs = new Set<string>();
 
   /** A step's `when`: each input must exist (a key input on a singleton) and each value fit its type. */
   const parseWhen = (where: string, raw: Record<string, VarValue | VarValue[]> | undefined): When[] | undefined => {
@@ -550,7 +554,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         continue;
       }
       if (singleton && !keyInputs.has(name)) {
-        err(`${where}: when.${name}: on a singleton playbook, \`when\` may only use the run's inputs (singleton.concurrency.key: ${[...keyInputs].join(", ") || "none"}), not each job's`);
+        err(`${where}: when.${name}: a singleton's inputs are each job's, so \`when\` cannot use them; put the condition in the station's sub-playbook, on an input the station sets`);
         continue;
       }
       const values: string[] = [];
@@ -974,9 +978,61 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         for (const ref of templateRefs(wired.source)) {
           const input = /^playbook\.inputs\.([A-Za-z_][\w-]*)$/.exec(ref)?.[1];
           if (input !== undefined && !keyInputs.has(input)) {
-            err(`step "${step.id}": inputs.${name}: "${input}" is each job's input (not in singleton.concurrency.key), with one value per job; read it through {{ run.jobs }} in the prompt`);
+            err(`step "${step.id}": inputs.${name}: "${input}" is each job's input, with one value per job; read it through {{ run.jobs }} in the prompt`);
           }
         }
+      }
+    }
+  }
+
+  // A singleton's top-level steps are stations; `queue` only applies to them.
+  const stations: Station[] = [];
+  for (const { raw: rawStep, task } of rawAll) {
+    if (rawStep.queue === undefined) continue;
+    if (!singleton) err(`step "${rawStep.id}": \`queue\` only applies to a step of a singleton playbook (a station)`);
+    else if (task) err(`after "${rawStep.id}": \`queue\` does not apply to an after-task`);
+  }
+  if (errors.length === 0 && singleton) {
+    const stationIds = new Set(pb.steps.map((raw) => raw.id));
+    for (const raw of pb.steps) {
+      const own = finalSteps.filter((step) => step.id === raw.id || step.id.startsWith(`${raw.id}.`)).map((step) => step.id);
+      const block = blocks.get(raw.id);
+      stations.push({
+        id: raw.id,
+        title: raw.title ?? block?.title ?? stepLabel(raw.id),
+        needs: raw.needs,
+        mode: raw.queue?.mode ?? "fifo",
+        retries: raw.retries,
+        steps: own,
+      });
+      // Jobs only move forward: a station loops only inside itself.
+      for (const step of finalSteps.filter((candidate) => own.includes(candidate.id))) {
+        for (const [outcome, transition] of Object.entries(step.on)) {
+          const targets = transition.kind === "goto" ? [transition.target] : transition.kind === "ask" ? (transition.choices?.map((choice) => choice.target) ?? [transition.target]) : [];
+          for (const target of targets) {
+            if (!own.includes(target) && stationIds.size > 0) err(`step "${step.id}": on.${outcome}: goto "${target}" leaves station "${raw.id}"; jobs only move forward between stations`);
+          }
+        }
+      }
+    }
+    // A train is its station alone: its steps cannot read another station's outputs.
+    for (const station of stations) {
+      const own = new Set(station.steps);
+      for (const step of finalSteps.filter((candidate) => own.has(candidate.id))) {
+        for (const [name, wired] of Object.entries(step.inputs)) {
+          for (const ref of templateRefs(wired.source)) {
+            const from = /^steps\.([a-z][a-z0-9_.-]*)\.outputs\./.exec(ref)?.[1];
+            if (from !== undefined && !own.has(from)) {
+              err(`step "${step.id}": inputs.${name}: reads step "${from}" of another station; a train only sees its own station's steps (pass values between stations as job outputs, with settle_job)`);
+            }
+          }
+        }
+      }
+    }
+    // Trains of different stations share one checkout: no role may edit files.
+    for (const step of finalSteps) {
+      if (step.kind === "agent" && step.role && roles[step.role] && !roles[step.role]!.readonly) {
+        err(`step "${step.id}": role "${step.role}" is not readonly; a singleton's trains share one workspace, so every role it uses must be \`readonly: true\``);
       }
     }
   }
@@ -1003,7 +1059,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     })),
   };
   if (pb.concurrency !== undefined && !singleton) entry.playbook.concurrency = pb.concurrency;
-  if (singleton) entry.playbook.singleton = singleton;
+  if (singleton) entry.playbook.singleton = { ...singleton, stations };
   return { entry };
 }
 
