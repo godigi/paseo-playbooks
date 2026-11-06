@@ -33,16 +33,15 @@ outputs:
   env_url: {}
 steps:
   - id: release
-    role: implementer
+    role: { name: implementer, prompt: "Release {{ inputs.env }}" }
     inputs: [env, release_timeout]
     outputs: { env_url: {} }
     outcomes: [success, no_deploy, failure]
     on:
       no_deploy: { end: no_deploy }
     timeout: "{{ inputs.release_timeout }}"
-    prompt: "Release {{ inputs.env }}"
   - id: qa
-    role: reviewer
+    role: { name: reviewer }
     needs: [release]
     inputs: [env_url]
 `;
@@ -50,20 +49,20 @@ const RELEASE = `
 outcomes: [success, no_deploy]
 steps:
   - id: dev
-    playbook: env
+    playbook: { name: env }
     inputs: { env: dev, release_timeout: 5h }
     on:
       no_deploy: { end: no_deploy }
   - id: stg
-    playbook: env
+    playbook: { name: env }
     needs: [dev]
     inputs: { env: stg, release_timeout: 4h }
     on: { no_deploy: end }
   - id: prd_go
     needs: [stg]
-    gate: Go to prd?
+    gate: { question: Go to prd? }
   - id: prd
-    playbook: env
+    playbook: { name: env }
     needs: [prd_go]
     inputs: { env: prd, release_timeout: 6h }
     on: { no_deploy: end }
@@ -71,10 +70,10 @@ steps:
 const ticket = (route: string) => `
 steps:
   - id: release
-    playbook: release
+    playbook: { name: release }
     on: { no_deploy: ${route} }
   - id: announce
-    role: reviewer
+    role: { name: reviewer }
     needs: [release]
 `;
 
@@ -152,11 +151,11 @@ describe("sub-playbook outcomes", () => {
   it("validates outcomes and their routes", async () => {
     const entries = await load({
       "env.yaml": ENV,
-      "unrouted.yaml": "steps:\n  - id: dev\n    playbook: env\n    inputs: { env: dev }\n",
-      "goto.yaml": "steps:\n  - id: a\n    role: reviewer\n  - id: dev\n    playbook: env\n    needs: [a]\n    inputs: { env: dev }\n    on: { no_deploy: { goto: a } }\n",
-      "unknown.yaml": "steps:\n  - id: dev\n    playbook: env\n    inputs: { env: dev }\n    on: { no_deploy: complete, other: end }\n",
-      "undeclared.yaml": "steps:\n  - id: a\n    role: reviewer\n    outcomes: [success, skip]\n    on: { skip: { end: skip } }\n",
-      "after.yaml": "steps:\n  - id: a\n    role: reviewer\nafter:\n  - id: dev\n    playbook: env\n    inputs: { env: dev }\n    on: { no_deploy: end }\n",
+      "unrouted.yaml": "steps:\n  - id: dev\n    playbook: { name: env }\n    inputs: { env: dev }\n",
+      "goto.yaml": "steps:\n  - id: a\n    role: { name: reviewer }\n  - id: dev\n    playbook: { name: env }\n    needs: [a]\n    inputs: { env: dev }\n    on: { no_deploy: { goto: a } }\n",
+      "unknown.yaml": "steps:\n  - id: dev\n    playbook: { name: env }\n    inputs: { env: dev }\n    on: { no_deploy: complete, other: end }\n",
+      "undeclared.yaml": "steps:\n  - id: a\n    role: { name: reviewer }\n    outcomes: [success, skip]\n    on: { skip: { end: skip } }\n",
+      "after.yaml": "steps:\n  - id: a\n    role: { name: reviewer }\nafter:\n  - id: dev\n    playbook: { name: env }\n    inputs: { env: dev }\n    on: { no_deploy: end }\n",
     });
     expect(entries.get("env")!.errors).toEqual([]);
     expect(entries.get("unrouted")!.errors.join("\n")).toMatch(/outcome "no_deploy" of playbook "env" needs an `on` entry/);
@@ -187,19 +186,19 @@ describe("templated timeout", () => {
   it("refuses a bad duration when the run starts, or when the step starts if it comes from a step output", async () => {
     const entries = await load({
       "env.yaml": ENV,
-      "bad.yaml": "steps:\n  - id: dev\n    playbook: env\n    inputs: { env: dev, release_timeout: soon }\n    on: { no_deploy: end }\n",
+      "bad.yaml": "steps:\n  - id: dev\n    playbook: { name: env }\n    inputs: { env: dev, release_timeout: soon }\n    on: { no_deploy: end }\n",
       "late.yaml": `
 steps:
   - id: plan
-    role: reviewer
+    role: { name: reviewer }
     outputs: { hours: {} }
   - id: work
-    role: implementer
+    role: { name: implementer }
     needs: [plan]
     inputs: { budget: "{{ steps.plan.outputs.hours }}h" }
     timeout: "{{ inputs.budget }}"
 `,
-      "refs.yaml": "steps:\n  - id: a\n    role: reviewer\n    timeout: \"{{ inputs.nope }}\"\n  - id: b\n    role: reviewer\n    needs: [a]\n    timeout: \"{{ run.id }}\"\n",
+      "refs.yaml": "steps:\n  - id: a\n    role: { name: reviewer }\n    timeout: \"{{ inputs.nope }}\"\n  - id: b\n    role: { name: reviewer }\n    needs: [a]\n    timeout: \"{{ run.id }}\"\n",
     });
     expect(entries.get("bad")!.errors).toEqual([]);
     expect(() => drive(entries.get("bad")!.playbook!)).toThrow(/timeout "\{\{ inputs.release_timeout \}\}" gave "soon"/);

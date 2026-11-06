@@ -17,26 +17,23 @@ inputs:
 
 steps:
   - id: fix
-    role: developer
+    role: { name: developer, prompt: "Fix {{ inputs.issue }} and add a test." }
     inputs: [issue]
-    prompt: "Fix {{ inputs.issue }} and add a test."
 
-  - id: review                # review et test tournent en parallèle :
-    role: reviewer            # leurs rôles sont en lecture seule
+  - id: review                                         # review et test tournent en parallèle :
+    role: { name: reviewer, prompt: Review the fix. }  # leurs rôles sont en lecture seule
     needs: [fix]
     outcomes: [ok, changes_requested]
-    prompt: Review the fix.
     on:
       changes_requested: { goto: fix, max_loops: 2 }
 
   - id: test
-    role: tester
+    role: { name: tester, prompt: Run the test suite. }
     needs: [fix]
-    prompt: Run the test suite.
 
   - id: approve               # validation humaine : Approve ou Reject
     needs: [review, test]
-    gate: Merge this fix?
+    gate: { question: Merge this fix? }
     on:
       rejected: { goto: fix }
 ```

@@ -18,7 +18,7 @@ const PLAYBOOK = `
 title: Release
 steps:
   - id: release
-    role: implementer
+    role: { name: implementer }
     outputs: { pr: {} }
 `;
 

@@ -13,26 +13,23 @@ inputs:
 
 steps:
   - id: fix
-    role: developer
+    role: { name: developer, prompt: "Fix {{ inputs.issue }} and add a test." }
     inputs: [issue]
-    prompt: "Fix {{ inputs.issue }} and add a test."
 
-  - id: review                # review 和 test 并行运行：
-    role: reviewer            # 它们的角色是只读的
+  - id: review                                         # review 和 test 并行运行：
+    role: { name: reviewer, prompt: Review the fix. }  # 它们的角色是只读的
     needs: [fix]
     outcomes: [ok, changes_requested]
-    prompt: Review the fix.
     on:
       changes_requested: { goto: fix, max_loops: 2 }
 
   - id: test
-    role: tester
+    role: { name: tester, prompt: Run the test suite. }
     needs: [fix]
-    prompt: Run the test suite.
 
   - id: approve               # 人工审批：Approve 或 Reject
     needs: [review, test]
-    gate: Merge this fix?
+    gate: { question: Merge this fix? }
     on:
       rejected: { goto: fix }
 ```

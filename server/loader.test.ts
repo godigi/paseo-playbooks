@@ -1,4 +1,4 @@
-import { cp, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { chmod, cp, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -55,7 +55,7 @@ describe("loadPlaybooks", () => {
   });
 
   it("reads hidden, false by default", async () => {
-    const step = "steps:\n  - id: a\n    role: investigator\n    prompt: go\n";
+    const step = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
     const dir = await workspace({ "retro.yaml": `hidden: true\n${step}`, "pr.yaml": step });
     const { entries } = await loadPlaybooks(dir);
     expect(entries.find((entry) => entry.id === "retro")).toMatchObject({ hidden: true, errors: [] });
@@ -73,9 +73,9 @@ describe("loadPlaybooks", () => {
     const dir = await workspace({
       "bad.yaml": `
 steps:
-  - { id: a, role: reviewer, needs: [b] }
-  - { id: b, role: reviewer, needs: [a] }
-  - { id: c, role: ghost, needs: [zzz] }
+  - { id: a, role: { name: reviewer }, needs: [b] }
+  - { id: b, role: { name: reviewer }, needs: [a] }
+  - { id: c, role: { name: ghost }, needs: [zzz] }
 `,
     });
     const [entry] = (await loadPlaybooks(dir)).entries;
@@ -90,8 +90,8 @@ steps:
     const dir = await workspace({
       "two.yaml": `
 steps:
-  - { id: a, role: implementer }
-  - { id: b, role: implementer }
+  - { id: a, role: { name: implementer } }
+  - { id: b, role: { name: implementer } }
 `,
     });
     const [entry] = (await loadPlaybooks(dir)).entries;
@@ -102,9 +102,9 @@ steps:
     const dir = await workspace({
       "amb.yaml": `
 steps:
-  - { id: a, role: reviewer, outputs: { findings: {} } }
-  - { id: b, role: local_qa, outputs: { findings: {} } }
-  - { id: c, role: implementer, needs: [a, b], inputs: [findings] }
+  - { id: a, role: { name: reviewer }, outputs: { findings: {} } }
+  - { id: b, role: { name: local_qa }, outputs: { findings: {} } }
+  - { id: c, role: { name: implementer }, needs: [a, b], inputs: [findings] }
 `,
     });
     const [entry] = (await loadPlaybooks(dir)).entries;
@@ -117,9 +117,8 @@ steps:
 inputs: { request: { required: true } }
 steps:
   - id: a
-    role: reviewer
+    role: { name: reviewer, prompt: "{{ inputs.request }} {{ steps.x.outputs.y }} {{ inputs.nope }}" }
     inputs: [request]
-    prompt: "{{ inputs.request }} {{ steps.x.outputs.y }} {{ inputs.nope }}"
 `,
     });
     const errors = (await loadPlaybooks(dir)).entries[0]!.errors.join("\n");
@@ -132,10 +131,10 @@ steps:
       "goto.yaml": `
 steps:
   - id: a
-    role: reviewer
+    role: { name: reviewer }
     outcomes: [ok, again]
     on: { again: { goto: b } }
-  - { id: b, role: reviewer, needs: [a] }
+  - { id: b, role: { name: reviewer }, needs: [a] }
 `,
     });
     const errors = (await loadPlaybooks(dir)).entries[0]!.errors.join("\n");
@@ -157,30 +156,32 @@ steps:
       "bad.yaml": `
 steps:
   - id: x
-    role: reviewer
+    role: { name: reviewer }
     outcomes: [success, failure, abort]
   - id: approve
     needs: [x]
-    gate: Ship it?
-    choices:
-      ship: {}
-      hold: {}
-      failure: {}
+    gate:
+      question: Ship it?
+      choices:
+        ship: {}
+        hold: {}
+        failure: {}
 `,
       "ok.yaml": `
 steps:
   - id: x
-    role: reviewer
+    role: { name: reviewer }
     outcomes: [done, failure]
   - id: approve
     needs: [x]
-    gate: Ship it?
+    gate: { question: Ship it? }
   - id: pick
     needs: [approve]
-    gate: Which?
-    choices:
-      ship: {}
-      hold: {}
+    gate:
+      question: Which?
+      choices:
+        ship: {}
+        hold: {}
     on:
       hold: fail
 `,
@@ -204,14 +205,13 @@ inputs:
   request: {}
 steps:
   - id: a
-    role: reviewer
+    role: { name: reviewer }
     outputs: { plan: {} }
     inputs:
       req: "{{ inputs.request }}"
   - id: b
-    role: reviewer
+    role: { name: reviewer, prompt: "Do {{ playbook.inputs.request }} with {{ steps.a.outputs.plan }}" }
     needs: [a]
-    prompt: "Do {{ playbook.inputs.request }} with {{ steps.a.outputs.plan }}"
 `,
     });
     const errors = (await loadPlaybooks(dir)).entries[0]!.errors.join("\n");
@@ -222,7 +222,7 @@ steps:
 
   it("refuses choices on agent steps", async () => {
     const dir = await workspace({
-      "bad.yaml": "steps:\n  - id: investigate\n    role: investigator\n    choices:\n      ok: {}\n",
+      "bad.yaml": "steps:\n  - id: investigate\n    role: { name: investigator }\n    choices:\n      ok: {}\n",
     });
     const entry = (await loadPlaybooks(dir)).entries.find((candidate) => candidate.id === "bad")!;
     expect(entry.errors.join("\n")).toMatch(/`choices` only applies to a gate/);
@@ -237,14 +237,16 @@ steps:
         "  request: { type: string, hint: ignored }",
         "steps:",
         "  - id: investigate",
-        "    role: investigator",
+        "    role:",
+        "      name: investigator",
+        "      agent: { model: claude-haiku-5-5, flavour: mild }",
         "    owner: someone",
-        "    agent: { model: claude-haiku-5-5, flavour: mild }",
         "  - id: approve",
         "    needs: [investigate]",
-        "    gate: Looks good?",
-        "    choices:",
-        "      approved: { label: Approve, emoji: yes }",
+        "    gate:",
+        "      question: Looks good?",
+        "      choices:",
+        "        approved: { label: Approve, emoji: yes }",
       ].join("\n"),
     });
     const entry = (await loadPlaybooks(dir)).entries.find((candidate) => candidate.id === "odd")!;
@@ -256,11 +258,11 @@ steps:
     const dir = await workspace({
       "outer.yaml": `
 steps:
-  - { id: investigate, role: investigator, title: Investigate the bug, short_title: Investig. }
-  - { id: approve, needs: [investigate], gate: Go?, title: Approve the plan }
-  - { id: pr, needs: [approve], playbook: inner, title: Pull request }
+  - { id: investigate, role: { name: investigator }, title: Investigate the bug, short_title: Investig. }
+  - { id: approve, needs: [investigate], gate: { question: Go? }, title: Approve the plan }
+  - { id: pr, needs: [approve], playbook: { name: inner }, title: Pull request }
 `,
-      "inner.yaml": "steps:\n  - { id: review, role: reviewer }\n",
+      "inner.yaml": "steps:\n  - { id: review, role: { name: reviewer } }\n",
     });
     const pb = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "outer")!.playbook!;
     expect(pb.steps.map((step) => [step.id, step.title, step.shortTitle])).toEqual([
@@ -272,44 +274,179 @@ steps:
   });
 
   it("reads silence on steps and in defaults, with off; refuses it where there is no agent", async () => {
-    const steps = "steps:\n  - id: a\n    role: investigator\n    prompt: go\n  - id: b\n    role: investigator\n    prompt: go\n    silence: off\n  - id: c\n    role: investigator\n    prompt: go\n    silence: 10m\n";
-    const dir = await workspace({ "defaults/main.yaml": "silence: 45m\n", "pr.yaml": steps });
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n  - id: b\n    role: { name: investigator, prompt: go, silence: off }\n  - id: c\n    role: { name: investigator, prompt: go, silence: 10m }\n";
+    const dir = await workspace({ "defaults/main.yaml": "role: { silence: 45m }\n", "pr.yaml": steps });
     const playbook = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "pr")!.playbook!;
     expect(playbook.steps.map((step) => step.silenceMs)).toEqual([2_700_000, 0, 600_000]);
 
-    const plain = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: investigator\n    prompt: go\n" });
+    const plain = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n" });
     expect((await loadPlaybooks(plain)).entries[0]!.playbook!.steps[0]!.silenceMs).toBeUndefined();
 
     const bad = await workspace({
-      "defaults/main.yaml": "silence: soon\n",
-      "pr.yaml": "steps:\n  - id: a\n    role: investigator\n    prompt: go\n    silence: 0m\n  - id: ok\n    gate: Go?\n    silence: 5m\n    needs: [a]\n",
+      "defaults/main.yaml": "role: { silence: soon }\n",
+      "pr.yaml": "steps:\n  - id: a\n    role: { name: investigator, prompt: go, silence: 0m }\n  - id: ok\n    gate: { question: Go? }\n    silence: 5m\n    needs: [a]\n",
     });
     const errors = (await loadPlaybooks(bad)).entries.flatMap((entry) => entry.errors).join("\n");
-    expect(errors).toMatch(/defaults\/main.yaml: silence: expected a duration such as 30m, or off/);
-    expect(errors).toMatch(/step "a": silence: expected a duration such as 30m, or off/);
-    expect(errors).toMatch(/step "ok": `silence` does not apply to a gate/);
+    expect(errors).toMatch(/defaults\/main.yaml: role.silence: expected a duration such as 30m, or off/);
+    expect(errors).toMatch(/step "a": role.silence: expected a duration such as 30m, or off/);
+    expect(errors).toMatch(/step "ok": `silence` only applies to an agent step \(under `role:`\)/);
   });
 
   it("reads archive_agents on steps and in defaults; refuses it where there is no agent", async () => {
-    const steps = "steps:\n  - id: a\n    role: investigator\n    prompt: go\n  - id: b\n    role: investigator\n    prompt: go\n    archive_agents: true\n";
-    const dir = await workspace({ "defaults/main.yaml": "archive_agents: false\n", "pr.yaml": steps });
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n  - id: b\n    role: { name: investigator, prompt: go, archive_agents: true }\n";
+    const dir = await workspace({ "defaults/main.yaml": "role: { archive_agents: false }\n", "pr.yaml": steps });
     const playbook = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "pr")!.playbook!;
     expect(playbook.steps.map((step) => step.archiveAgents)).toEqual([false, true]);
 
-    const plain = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: investigator\n    prompt: go\n" });
+    const plain = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n" });
     expect((await loadPlaybooks(plain)).entries[0]!.playbook!.steps[0]!.archiveAgents).toBeUndefined();
 
-    const bad = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: investigator\n    prompt: go\n  - id: ok\n    gate: Go?\n    archive_agents: false\n    needs: [a]\n" });
-    expect((await loadPlaybooks(bad)).entries.flatMap((entry) => entry.errors).join("\n")).toMatch(/step "ok": `archive_agents` does not apply to a gate/);
+    const bad = await workspace({ "pr.yaml": "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n  - id: ok\n    gate: { question: Go? }\n    archive_agents: false\n    needs: [a]\n" });
+    expect((await loadPlaybooks(bad)).entries.flatMap((entry) => entry.errors).join("\n")).toMatch(/step "ok": `archive_agents` only applies to an agent step/);
   });
 
   it("refuses short_title on a playbook step", async () => {
     const dir = await workspace({
-      "outer.yaml": "steps:\n  - { id: pr, playbook: inner, short_title: PR }\n",
-      "inner.yaml": "steps:\n  - { id: review, role: reviewer }\n",
+      "outer.yaml": "steps:\n  - { id: pr, playbook: { name: inner }, short_title: PR }\n",
+      "inner.yaml": "steps:\n  - { id: review, role: { name: reviewer } }\n",
     });
     const entry = (await loadPlaybooks(dir)).entries.find((candidate) => candidate.id === "outer")!;
     expect(entry.errors.join("\n")).toMatch(/`short_title` does not apply to a playbook step/);
+  });
+
+  describe("step kind blocks", () => {
+    const errorsOf = async (files: Record<string, string>, id = "pb") =>
+      (await loadPlaybooks(await workspace(files))).entries.find((entry) => entry.id === id)!.errors;
+
+    it("reads each kind's block into the step", async () => {
+      const dir = await workspace({
+        "scripts/wait.sh": "#!/bin/sh\nexit 0\n",
+        "sub.yaml": "steps:\n  - { id: look, role: { name: reviewer } }\n",
+        "pb.yaml": `
+steps:
+  - id: review
+    role:
+      name: reviewer
+      prompt: |
+        Look closely.
+      silence: 30m
+      archive_agents: false
+      agent: { model: claude-haiku-5-5 }
+  - id: approve
+    needs: [review]
+    gate: { question: Ship it?, choices: { ship: ~, hold: { comment: required } } }
+    on: { hold: { goto: review } }
+  - id: wait
+    needs: [approve]
+    script: { run: wait.sh, poll: 30s }
+  - id: sub
+    needs: [wait]
+    playbook: { name: sub }
+`,
+      });
+      await chmod(path.join(dir, ".paseo/plugins/playbooks/scripts/wait.sh"), 0o755);
+      const entry = (await loadPlaybooks(dir)).entries.find((candidate) => candidate.id === "pb")!;
+      expect(entry.errors).toEqual([]);
+      const byId = Object.fromEntries(entry.playbook!.steps.map((step) => [step.id, step]));
+      expect(byId.review).toMatchObject({ kind: "agent", role: "reviewer", prompt: "Look closely.\n", silenceMs: 1_800_000, archiveAgents: false });
+      expect(byId.review!.agent.model).toBe("claude-haiku-5-5");
+      expect(byId.approve).toMatchObject({ kind: "gate", gate: "Ship it?", outcomes: ["ship", "hold"] });
+      expect(byId.approve!.choices.map((choice) => [choice.id, choice.comment])).toEqual([["ship", "none"], ["hold", "required"]]);
+      expect(byId.wait).toMatchObject({ kind: "script", script: ".paseo/plugins/playbooks/scripts/wait.sh", pollMs: 30_000 });
+      expect(byId["sub.look"]).toMatchObject({ kind: "agent", role: "reviewer" });
+    });
+
+    it("refuses the plain-string form with the block to write", async () => {
+      const errors = await errorsOf({
+        "sub.yaml": "steps:\n  - { id: look, role: { name: reviewer } }\n",
+        "pb.yaml": `
+steps:
+  - id: review
+    role: reviewer
+    prompt: Look closely.
+  - id: approve
+    needs: [review]
+    gate: Ship it?
+  - id: sub
+    needs: [approve]
+    playbook: sub
+after:
+  - id: wait
+    script: wait_ci
+    poll: 30s
+`,
+      });
+      expect(errors).toContain('.paseo/plugins/playbooks/pb.yaml: step "review": role: write `role: { name: reviewer, prompt: Look closely. }`');
+      expect(errors).toContain('.paseo/plugins/playbooks/pb.yaml: step "approve": gate: write `gate: { question: Ship it? }`');
+      expect(errors).toContain('.paseo/plugins/playbooks/pb.yaml: step "sub": playbook: write `playbook: { name: sub }`');
+      expect(errors).toContain('.paseo/plugins/playbooks/pb.yaml: after "wait": script: write `script: { run: wait_ci, poll: 30s }`');
+    });
+
+    it("refuses a kind field written flat on the step, with where it moved", async () => {
+      const errors = await errorsOf({
+        "pb.yaml": `
+steps:
+  - id: review
+    role: { name: reviewer }
+    prompt: "Review {{ inputs.x }}"
+    silence: 30m
+    agent: { model: claude-haiku-5-5 }
+  - id: approve
+    needs: [review]
+    gate: { question: Ship it? }
+    choices: { ship: ~, hold: ~ }
+  - id: other
+    needs: [approve]
+    role: { name: reviewer }
+    archive_agents: false
+    poll: 1m
+`,
+      });
+      const at = ".paseo/plugins/playbooks/pb.yaml";
+      expect(errors).toContain(
+        `${at}: step "review": \`prompt\`, \`silence\` and \`agent\` moved under \`role:\`: write \`role: { name: reviewer, prompt: "Review {{ inputs.x }}", silence: 30m, agent: { model: claude-haiku-5-5 } }\``,
+      );
+      expect(errors).toContain(`${at}: step "approve": \`choices\` moved under \`gate:\`: write \`gate: { question: Ship it?, choices: { ship: ~, hold: ~ } }\``);
+      expect(errors).toContain(`${at}: step "other": \`archive_agents\` moved under \`role:\`: write \`role: { name: reviewer, archive_agents: false }\``);
+      expect(errors).toContain(`${at}: step "other": \`poll\` only applies to a script step (under \`script:\`)`);
+    });
+
+    it("refuses an unknown key or a missing required field in a block", async () => {
+      expect(await errorsOf({ "pb.yaml": "steps:\n  - id: a\n    role: { name: reviewer, promt: hi }\n" })).toEqual([
+        '.paseo/plugins/playbooks/pb.yaml: steps.0.role: Unrecognized key: "promt"',
+      ]);
+      expect((await errorsOf({ "pb.yaml": "steps:\n  - id: a\n    script: { run: x.sh, timeout: 5m }\n" })).join("\n")).toMatch(/steps.0.script: Unrecognized key: "timeout"/);
+      expect((await errorsOf({ "pb.yaml": "steps:\n  - id: a\n    gate: { choices: { ok: ~ } }\n" })).join("\n")).toMatch(/steps.0.gate.question: Invalid input/);
+      expect((await errorsOf({ "pb.yaml": "steps:\n  - id: a\n    role: { name: reviewer }\nafter:\n  - id: b\n    playbook: { name: x, inputs: {} }\n" })).join("\n")).toMatch(
+        /after.0.playbook: Unrecognized key: "inputs"/,
+      );
+    });
+
+    it("keeps the shared fields on the step and refuses them on the kinds they do not fit", async () => {
+      const errors = (
+        await errorsOf({
+          "sub.yaml": "steps:\n  - { id: look, role: { name: reviewer } }\n",
+          "pb.yaml": "steps:\n  - id: a\n    gate: { question: Go? }\n    timeout: 5m\n  - id: b\n    needs: [a]\n    playbook: { name: sub }\n    outputs: { x: {} }\n",
+        })
+      ).join("\n");
+      expect(errors).toMatch(/step "a": `timeout` does not apply to a gate/);
+      expect(errors).toMatch(/step "b": `outputs` does not apply to a playbook step/);
+    });
+
+    it("reads silence and archive_agents under role: in the defaults, and refuses them flat", async () => {
+      const steps = "steps:\n  - { id: a, role: { name: reviewer } }\n";
+      const dir = await workspace({ "defaults/main.yaml": "timeout: 1h\nrole: { silence: 20m, archive_agents: false }\n", "pb.yaml": steps });
+      const step = (await loadPlaybooks(dir)).entries[0]!.playbook!.steps[0]!;
+      expect(step).toMatchObject({ timeoutMs: 3_600_000, silenceMs: 1_200_000, archiveAgents: false });
+
+      const old = await errorsOf({ "defaults/main.yaml": "silence: 20m\narchive_agents: false\n", "pb.yaml": steps });
+      expect(old).toContain(
+        ".paseo/plugins/playbooks/defaults/main.yaml: `silence` and `archive_agents` moved under `role:`: write `role: { silence: 20m, archive_agents: false }`",
+      );
+      expect((await errorsOf({ "defaults/main.yaml": "role: { silence: 20m, prompt: hi }\n", "pb.yaml": steps })).join("\n")).toMatch(
+        /defaults\/main.yaml: role: Unrecognized key: "prompt"/,
+      );
+    });
   });
 
   it("refuses the removed next key", async () => {
@@ -317,9 +454,9 @@ steps:
       "first.yaml": `
 next: [{ playbook: second }]
 steps:
-  - { id: a, role: reviewer }
+  - { id: a, role: { name: reviewer } }
 `,
-      "second.yaml": "steps:\n  - { id: b, role: reviewer }\n",
+      "second.yaml": "steps:\n  - { id: b, role: { name: reviewer } }\n",
     });
     const first = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "first")!;
     expect(first.playbook).toBeNull();
@@ -327,7 +464,7 @@ steps:
   });
 
   it("also loads .paseo/playbooks/, with its own roles", async () => {
-    const dir = await workspace({ "lite.yaml": "steps:\n  - { id: a, role: reviewer }\n" }, true, ".paseo/playbooks");
+    const dir = await workspace({ "lite.yaml": "steps:\n  - { id: a, role: { name: reviewer } }\n" }, true, ".paseo/playbooks");
     expect(await hasPlaybooks(dir)).toBe(true);
     const result = await loadPlaybooks(dir);
     expect(result.roots).toEqual([path.join(dir, ".paseo/playbooks")]);
@@ -337,8 +474,8 @@ steps:
   });
 
   it("merges both folders and reports a playbook id defined in both", async () => {
-    const dir = await workspace({ "one.yaml": "steps:\n  - { id: a, role: reviewer }\n", "same.yaml": "steps:\n  - { id: a, role: reviewer }\n" });
-    await workspace({ "two.yaml": "steps:\n  - { id: b, role: local_qa }\n", "same.yaml": "steps:\n  - { id: b, role: local_qa }\n" }, true, ".paseo/playbooks", dir);
+    const dir = await workspace({ "one.yaml": "steps:\n  - { id: a, role: { name: reviewer } }\n", "same.yaml": "steps:\n  - { id: a, role: { name: reviewer } }\n" });
+    await workspace({ "two.yaml": "steps:\n  - { id: b, role: { name: local_qa } }\n", "same.yaml": "steps:\n  - { id: b, role: { name: local_qa } }\n" }, true, ".paseo/playbooks", dir);
     const result = await loadPlaybooks(dir);
     expect(result.roots).toHaveLength(2);
     const byFile = Object.fromEntries(result.entries.map((entry) => [entry.file, entry]));
@@ -352,7 +489,7 @@ steps:
 
   it("does not share roles across folders", async () => {
     const dir = await workspace({}, true);
-    await workspace({ "solo.yaml": "steps:\n  - { id: a, role: reviewer }\n" }, false, ".paseo/playbooks", dir);
+    await workspace({ "solo.yaml": "steps:\n  - { id: a, role: { name: reviewer } }\n" }, false, ".paseo/playbooks", dir);
     const [entry] = (await loadPlaybooks(dir)).entries;
     expect(entry!.errors.join("\n")).toMatch(/\.paseo\/playbooks\/roles\/reviewer\/role\.yaml: file not found/);
   });

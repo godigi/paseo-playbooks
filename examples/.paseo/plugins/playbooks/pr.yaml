@@ -19,15 +19,24 @@ outputs:
 
 steps:
   - id: investigate
-    role: investigator
+    role:
+      name: investigator
+      prompt: |
+        Request: {{ inputs.request }}
     inputs: [request]
     outputs:
       plan: { type: string, description: Implementation plan }
-    prompt: |
-      Request: {{ inputs.request }}
 
   - id: implement
-    role: implementer
+    role:
+      name: implementer
+      prompt: |
+        Request: {{ inputs.request }}
+
+        Plan:
+        {{ inputs.plan }}
+
+        Open (or update) the pull request against {{ inputs.base_branch }}.
     needs: [investigate]
     inputs: [request, plan, base_branch]
     outputs:
@@ -36,33 +45,33 @@ steps:
       branch: { type: string }
     retries: 1
     timeout: 1h
-    prompt: |
-      Request: {{ inputs.request }}
-
-      Plan:
-      {{ inputs.plan }}
-
-      Open (or update) the pull request against {{ inputs.base_branch }}.
 
   - id: review
-    role: reviewer
+    role: { name: reviewer, prompt: "Review the pull request {{ inputs.pr_url }}." }
     needs: [implement]
     inputs: [pr_url]
     outputs:
       findings: { type: string }
-    prompt: "Review the pull request {{ inputs.pr_url }}."
 
   - id: local_qa
-    role: local_qa
+    role: { name: local_qa, prompt: "Test the branch {{ inputs.branch }}." }
     needs: [implement]
     inputs: [branch]
     outputs:
       report: { type: string }
       tests_passed: { type: boolean }
-    prompt: "Test the branch {{ inputs.branch }}."
 
   - id: babysit
-    role: babysitter
+    role:
+      name: babysitter
+      prompt: |
+        Pull request: {{ inputs.pr_url }}
+
+        Review findings:
+        {{ inputs.review }}
+
+        Local QA report:
+        {{ inputs.qa }}
     needs: [review, local_qa]
     inputs:
       pr_url: ~
@@ -70,13 +79,5 @@ steps:
       qa: "{{ steps.local_qa.outputs.report }}"
     outcomes: [ready, changes_requested]
     timeout: 2h
-    prompt: |
-      Pull request: {{ inputs.pr_url }}
-
-      Review findings:
-      {{ inputs.review }}
-
-      Local QA report:
-      {{ inputs.qa }}
     on:
       changes_requested: { goto: implement, max_loops: 3 }

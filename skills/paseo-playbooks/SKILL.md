@@ -49,8 +49,9 @@ agent:                 # defaults for every step
 manager:               # settings of the manager agent when Start creates a new one
   mode: default
 timeout: 1h            # default step timeout (optional)
-silence: 30m           # remind a step agent after this long without activity (default 30m; off to disable)
-archive_agents: true   # archive step agents once the run no longer needs them (default true)
+role:                  # defaults for agent steps, in the shape of a step's `role:` block
+  silence: 30m         # remind a step agent after this long without activity (default 30m; off to disable)
+  archive_agents: true # archive step agents once the run no longer needs them (default true)
 ```
 
 Agent settings (`provider`, `model`, `mode`, `thinking`) merge field by field. Precedence:
@@ -90,14 +91,17 @@ outputs:                                   # the run's result
 
 steps:
   - id: investigate
-    role: investigator
+    role: { name: investigator, prompt: "Request: {{ inputs.request }}" }
     inputs: [request]                      # list form: every name auto-matched
     outputs:
       plan: { type: string }
-    prompt: "Request: {{ inputs.request }}"
 
   - id: implement
-    role: implementer
+    role:
+      name: implementer
+      prompt: |
+        Request: {{ inputs.request }}
+        Plan: {{ inputs.plan }}
     needs: [investigate]
     inputs: [request, plan, base_branch]
     outputs:
@@ -106,19 +110,15 @@ steps:
       branch: { type: string }
     retries: 1
     timeout: 1h
-    prompt: |
-      Request: {{ inputs.request }}
-      Plan: {{ inputs.plan }}
 
   - id: review
-    role: reviewer
+    role: { name: reviewer, prompt: "Review {{ inputs.pr_url }}" }
     needs: [implement]
     inputs: [pr_url]
     outputs: { findings: { type: string } }
-    prompt: "Review {{ inputs.pr_url }}"
 
   - id: babysit
-    role: babysitter
+    role: { name: babysitter }
     needs: [review]
     inputs:                                # map form: explicit source, or ~ for auto
       pr_url: ~
@@ -136,19 +136,57 @@ steps:
 | `title` | Full name, shown in the step's details and on its graph node. Default: the id, capitalised (`investigate` → Investigate). On a playbook step it names the block's frame. |
 | `short_title` | Name in the Playbooks screen's step columns. Default: `title`. Not on playbook steps (their own steps are the columns). |
 | `needs` | Steps that must complete first. No `needs` = starts with the run. Steps ready together run in parallel. File order does not matter. |
-| `role` / `gate` / `playbook` / `script` | Exactly one: an agent step, a human gate with its message, a sub-playbook, or a script the plugin runs itself (see below). |
+| `role` / `gate` / `playbook` / `script` | Exactly one, as a block: an agent step, a human gate, a sub-playbook, or a script the plugin runs itself (see "Step kinds" below). |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
-| `prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
 | `on` | Per outcome: `complete`, `end`, `{ end: <playbook outcome> }`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; a choice may `goto` a step or end the step with an `outcome` and `outputs`; see Loops). |
 | `retries` | Extra attempts after `failure`. |
 | `timeout` | `30m`, `2h`…, or a template of the step's inputs (`"{{ inputs.release_timeout }}"`), rendered when each attempt starts; an empty value falls back to the default timeout, a value that is not a duration fails the start (or the run's start, when it only depends on the run's inputs). Expiry counts as a failure. The agent is reminded shortly before. If its work turns out done, `nudge_step` it: its next report replaces the timeout failure. |
-| `silence` | Agent steps: after this long without agent activity (default `30m`, or `off`), the plugin asks the agent once to report or say what it is waiting for, and tells the manager. |
-| `archive_agents` | Agent steps: when the step completes, or its run or after-task ends, its agents are archived, and an attempt's agent is archived when the next attempt starts (default `true`). `false` keeps them, e.g. to debug. |
-| `poll` | Script steps only: rerun the script this often (`30s`, `1m`) while it exits with 75. |
-| `agent` | Step-level agent settings. |
-| `choices` | Gates only: the buttons, in order. Each key is an outcome, with `label`, `comment: none \| optional \| required` and `color: primary \| neutral \| success \| warning \| danger` (theme colours; default primary for the first, neutral for the others). Without `choices`, the default Reject is `danger`. |
+
+### Step kinds
+
+Each kind is a block under its keyword; an option that only one kind uses goes in its block.
+A plain string (`role: reviewer`) is refused, and so is a kind's option written on the step
+(`prompt:` beside `role:`): the error says what to write instead. Unknown keys in a block are
+refused.
+
+```yaml
+- id: review
+  role: { name: reviewer, prompt: "Review {{ inputs.pr_url }}", silence: 1h, archive_agents: false, agent: { thinking: high } }
+- id: approve
+  gate: { question: Ship it?, choices: { ship: ~, hold: { comment: required } } }
+- id: wait_ci
+  script: { run: wait-ci.sh, poll: 30s }
+- id: release
+  playbook: { name: release }
+```
+
+Write a block in flow style when it fits on one line, and in block style when a value spans
+several lines:
+
+```yaml
+- id: implement
+  role:
+    name: implementer
+    prompt: |
+      Request: {{ inputs.request }}
+```
+
+| Block field | Meaning |
+| --- | --- |
+| `role.name` | Required: the role (a directory of `roles/`). |
+| `role.prompt` | Template; may use only `{{ inputs.<name> }}`, `{{ run.id }}`, `{{ attempt }}`. |
+| `role.silence` | After this long without agent activity (default `30m`, or `off`), the plugin asks the agent once to report or say what it is waiting for, and tells the manager. |
+| `role.archive_agents` | When the step completes, or its run or after-task ends, its agents are archived, and an attempt's agent is archived when the next attempt starts (default `true`). `false` keeps them, e.g. to debug. |
+| `role.agent` | Step-level agent settings. |
+| `gate.question` | Required: the message shown on the gate. |
+| `gate.choices` | The buttons, in order. Each key is an outcome, with `label`, `comment: none \| optional \| required` and `color: primary \| neutral \| success \| warning \| danger` (theme colours; default primary for the first, neutral for the others). Without `choices`, the default Reject is `danger`. |
+| `script.run` | Required: an executable of `scripts/` (see "Script steps"). |
+| `script.poll` | Rerun the script this often (`30s`, `1m`) while it exits with 75. |
+| `playbook.name` | Required: a playbook of the same folder (see "Sub-playbooks"). |
+
+`outputs`, `outcomes` and `timeout` stay on the step (agent and script steps share them).
 
 A gate's outcomes are the keys of its `choices` (default: `approved` with label Approve, and
 `rejected` with label Reject and an optional comment). The panel shows
@@ -176,7 +214,7 @@ task only).
 
 ### Script steps
 
-A step with `script: <file>` runs an executable from the folder's `scripts/`, with no
+A step with `script: { run: <file> }` runs an executable from the folder's `scripts/`, with no
 agent and no manager: the plugin starts it as soon as it is ready and completes it from the
 result. Use it for deterministic work, above all **waiting** (a PR merged, a deploy
 finished, a lane clear), so that no agent spends turns polling:
@@ -184,14 +222,13 @@ finished, a lane clear), so that no agent spends turns polling:
 ```yaml
 steps:
   - id: wait_dev_lane
-    script: wait-dev-lane-clear.sh
-    poll: 1m                    # check every minute while it says "not yet"
+    script: { run: wait-dev-lane-clear.sh, poll: 1m }   # check every minute while it says "not yet"
     timeout: 2h                 # then fail (retries apply)
     inputs: [services]
     outputs: { lane_head: {} }
   - id: dev_release
     needs: [wait_dev_lane]
-    role: env_releaser
+    role: { name: env_releaser }
 ```
 
 The script contract:
@@ -203,7 +240,7 @@ The script contract:
   `PLAYBOOK_INPUT_<NAME>` (upper case; `services` → `PLAYBOOK_INPUT_SERVICES`), plus
   `PLAYBOOK_RUN_ID`, `PLAYBOOK_STEP_ID`, `PLAYBOOK_ATTEMPT`, `PLAYBOOK_CHECK` (1, 2, … within
   the attempt), `PLAYBOOK_WORKSPACE` and, after a `goto`, `PLAYBOOK_FEEDBACK`.
-- **Exit code:** `0` = done; `75` = not yet, run me again after `poll` (without `poll`, 75 is a
+- **Exit code:** `0` = done; `75` = not yet, run me again after `script.poll` (without `poll`, 75 is a
   failure); anything else = `failure`.
 - **Result:** on success, the last line of stdout may be a JSON object
   `{"outcome": "...", "summary": "...", "outputs": {...}}`, each key optional. `outcome`
@@ -213,7 +250,7 @@ The script contract:
 - **Checks must be idempotent and short:** each check looks once and exits. The plugin does
   the waiting between checks, and it reruns the current check after a daemon restart.
   A script must not edit the checkout (the concurrency rule does not check scripts).
-- `prompt` and `agent` do not apply; `inputs`, `outputs`, `outcomes`, `on`, `retries`,
+- There is no prompt or agent; `inputs`, `outputs`, `outcomes`, `on`, `retries`,
   `timeout` and `needs` work as for agent steps. A failure with retries left runs again by
   itself; the manager is woken only with the final result. Without `timeout` (here or in
   `defaults/main.yaml`) a polling script waits forever.
@@ -222,21 +259,21 @@ The script contract:
 
 ### Sub-playbooks
 
-A step with `playbook: <id>` runs another playbook of the same folder in place, like a
+A step with `playbook: { name: <id> }` runs another playbook of the same folder in place, like a
 building block:
 
 ```yaml
 steps:
   - id: pr
-    playbook: pr                 # its inputs match by name, or map them in `inputs`
+    playbook: { name: pr }       # its inputs match by name, or map them in `inputs`
   - id: approve
     needs: [pr]
-    gate: Release it?
+    gate: { question: Release it? }
     on:
       rejected: { goto: pr }     # restarts the whole block, with the comment as feedback
   - id: release
     needs: [approve]
-    playbook: release            # gets pr_url from the pr block's outputs
+    playbook: { name: release }  # gets pr_url from the pr block's outputs
 ```
 
 - The loader expands the block: its steps become `pr.investigate`, `pr.implement`, … in
@@ -266,7 +303,7 @@ steps:
   outcomes: [success, no_deploy]
   steps:
     - id: release
-      role: env_releaser
+      role: { name: env_releaser }
       inputs: [env, release_timeout]
       outcomes: [success, no_deploy, failure]
       on: { no_deploy: { end: no_deploy } }   # nothing to deploy: end this block, say why
@@ -274,17 +311,16 @@ steps:
   # release.yaml
   steps:
     - id: dev
-      playbook: env_release
+      playbook: { name: env_release }
       inputs: { env: dev, release_timeout: 5h }
       on: { no_deploy: end }                    # skip stg, the prd gate and prd
     - id: stg
-      playbook: env_release
+      playbook: { name: env_release }
       needs: [dev]
       inputs: { env: stg, release_timeout: 4h }
       on: { no_deploy: end }
   ```
-- `prompt`, `outputs`, `outcomes`, `timeout`, `silence`, `archive_agents`, `agent` and
-  `choices` do not apply to a playbook step (its `on` takes only `complete`, `end` and `fail`, and not on an after-task). A playbook that includes itself (directly or not) is an error.
+- `outputs`, `outcomes` and `timeout` do not apply to a playbook step (its `on` takes only `complete`, `end` and `fail`, and not on an after-task). A playbook that includes itself (directly or not) is an error.
 - The sub-playbook's manager settings are ignored; its gates stay gates of the run.
 - The sub-playbook's `concurrency` applies to the block. Its slots are shared by every run
   in the project (also top-level runs of that playbook). A run takes a slot when the block's
@@ -297,20 +333,19 @@ steps:
 ### After-tasks
 
 `after:` lists tasks that run once the run has ended, whatever its outcome, such as a retro.
-Each one is an agent step (`role` + `prompt`), a gate, or a sub-playbook (`playbook: <id>`):
+Each one is an agent step (`role: { name, prompt }`), a gate, or a sub-playbook (`playbook: { name: <id> }`):
 
 ```yaml
 after:
   - id: retro
-    playbook: retro
+    playbook: { name: retro }
     inputs:
       run_id: "{{ run.id }}"   # run values are always mapped explicitly
   - id: notify
-    role: reviewer
+    role: { name: reviewer, prompt: "Post a summary of run {{ run.id }} ({{ inputs.status }})." }
     trigger: manual      # a Start button on the finished run, or start_after_task (default: auto)
     inputs:
       status: "{{ run.status }}"
-    prompt: "Post a summary of run {{ run.id }} ({{ inputs.status }})."
 ```
 
 - They belong to the same run and manager and show below End in the panel. They never
@@ -360,7 +395,7 @@ To let an agent step ask a human a question, give it an outcome that routes to `
 
 ```yaml
 - id: investigate
-  role: investigator
+  role: { name: investigator }
   outcomes: [success, needs_input]   # the agent reports needs_input with its question as summary
   on:
     needs_input: { ask: "The investigation needs your input.", max_loops: 3 }
@@ -421,7 +456,7 @@ on:
 - prompts use only `inputs`, `run.id` and `attempt` (after-tasks also `run.status` and
   `run.failure`); inputs only reference ancestors (after-tasks also main steps and `run.*`)
 - after-tasks have no `needs`, and only after-tasks have `trigger`
-- a `script` names an existing, executable file of `scripts/`; only script steps have `poll`
+- a `script` names an existing, executable file of `scripts/`; `poll` goes in the `script:` block
 - no `next` key: chaining was removed; to run a playbook after another, write a parent
   playbook that includes both as sub-playbook steps
 

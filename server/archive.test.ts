@@ -36,7 +36,7 @@ function fakePaseo() {
   return { paseo: { agents: { ref }, workspaces: { ref: () => ({ agents: { create } }) } }, archived };
 }
 
-async function setup(stepExtra = "") {
+async function setup(roleExtra = "") {
   const dir = await mkdtemp(path.join(tmpdir(), "archive-"));
   temps.push(dir);
   const root = path.join(dir, ".paseo/playbooks");
@@ -44,7 +44,7 @@ async function setup(stepExtra = "") {
   await cp(path.join(EXAMPLES, ".paseo/plugins/playbooks/roles"), path.join(root, "roles"), { recursive: true });
   await writeFile(
     path.join(root, "release.yaml"),
-    `title: Release\nsteps:\n  - id: a\n    role: implementer\n    retries: 1\n${stepExtra}  - id: b\n    role: implementer\n    needs: [a]\n`,
+    `title: Release\nsteps:\n  - id: a\n    role: { name: implementer${roleExtra} }\n    retries: 1\n  - id: b\n    role: { name: implementer }\n    needs: [a]\n`,
   );
   const playbook = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "release")!.playbook!;
   const store = new RunStore(path.join(dir, "runs"));
@@ -106,14 +106,14 @@ describe("step agents the run no longer needs", () => {
   });
 
   it("are kept with archive_agents: false", async () => {
-    const { runtime, archived } = await setup("    archive_agents: false\n");
+    const { runtime, archived } = await setup(", archive_agents: false");
     await attempt(runtime, "failure");
     await attempt(runtime, "success");
     expect(archived).toEqual([]);
   });
 
   it("are kept with archive_agents: false when the run fails", async () => {
-    const { store, runtime, archived } = await setup("    archive_agents: false\n");
+    const { store, runtime, archived } = await setup(", archive_agents: false");
     await attempt(runtime, "failure");
     await attempt(runtime, "failure");
     expect(store.get("run_x")!.status).toBe("failed");

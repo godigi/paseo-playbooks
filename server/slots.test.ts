@@ -29,7 +29,7 @@ inputs: { request: { required: true } }
 outputs: { pr_url: {} }
 steps:
   - id: implement
-    role: implementer
+    role: { name: implementer }
     inputs: [request]
     outputs: { pr_url: {} }
 `;
@@ -40,11 +40,11 @@ inputs: { pr_url: { required: true } }
 outputs: { env_url: {} }
 steps:
   - id: prepare
-    role: reviewer
+    role: { name: reviewer }
     inputs: [pr_url]
     outputs: { ok: {} }
   - id: deploy
-    role: reviewer
+    role: { name: reviewer }
     needs: [prepare]
     inputs: [pr_url]
     outputs: { env_url: {} }
@@ -55,10 +55,10 @@ inputs: { request: { required: true } }
 outputs: { env_url: {} }
 steps:
   - id: pr
-    playbook: pr
+    playbook: { name: pr }
   - id: release
     needs: [pr]
-    playbook: release
+    playbook: { name: release }
 `;
 
 let clock = 0;
