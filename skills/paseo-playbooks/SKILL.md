@@ -67,7 +67,9 @@ agent: { thinking: high }
 ```
 
 `instructions.md` is the role's system prompt: what the role does and returns. The plugin
-appends the step protocol (allowed outcomes, required outputs, `report_step_result`).
+appends the step protocol (allowed outcomes, required outputs, `report_step_result`, and
+waiting inside the turn with a bounded foreground poll, never on a Monitor, background
+command or timer).
 
 A `readonly` role may still run commands (tests, linters) but must leave tracked files,
 the index and HEAD unchanged; build output in ignored files is fine.

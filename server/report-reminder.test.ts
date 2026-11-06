@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AttemptSchema } from "../shared/types";
 import { newRun, startAttempt } from "./engine";
 import { loadPlaybooks } from "./loader";
+import { stepSystemPrompt } from "./prompts";
 import { Runtime } from "./runtime";
 import { RunStore } from "./store";
 
@@ -85,6 +86,27 @@ describe("a step that ends its turn without reporting", () => {
     expect(sent[1]!.text).toMatch(/PR: https:\/\/x\/pr\/1/);
   });
 
+  it("wakes the manager when it reports after its turn ended", async () => {
+    const { store, runtime, sent } = await setup();
+    await runtime.onTurnEnded("step-1", "completed");
+    expect(sent[0]!.text).toMatch(/keep waiting in this turn with a bounded foreground poll/);
+    await runtime.onTurnEnded("step-1", "completed");
+    expect(sent.map((entry) => entry.agentId)).toEqual(["step-1", "m"]);
+    await runtime.onManagerTurnEnded("m");
+
+    // A background task wakes the agent later and it reports: the manager hears it right away.
+    await runtime.report("step-1", { outcome: "success", summary: "merged", outputs: { pr: "https://x/pr/1" } });
+    expect(sent.map((entry) => entry.agentId)).toEqual(["step-1", "m", "m"]);
+    expect(sent[2]!.text).toMatch(/attempt 1 reported success: merged Outputs: \{"pr":"https:\/\/x\/pr\/1"\}\. It reported after its turn had ended\./);
+    expect(sent[2]!.text).toMatch(/Call complete_step for "release"/);
+    expect(store.get("run_x")!.steps.release!.attempts[0]!.report).toMatchObject({ outcome: "success" });
+
+    // The turn end that follows the late report wakes no one again, and a second report is refused.
+    await runtime.onTurnEnded("step-1", "completed");
+    expect(sent).toHaveLength(3);
+    await expect(runtime.report("step-1", { outcome: "success", summary: "again", outputs: { pr: "https://x/pr/1" } })).rejects.toThrow(/already reported/);
+  });
+
   it("wakes the manager directly when the turn failed or the reminder cannot be sent", async () => {
     const failed = await setup();
     await failed.runtime.onTurnEnded("step-1", "failed");
@@ -95,6 +117,14 @@ describe("a step that ends its turn without reporting", () => {
     await unsent.runtime.onTurnEnded("step-1", "completed");
     expect(unsent.sent.map((entry) => entry.agentId)).toEqual(["m"]);
     expect(unsent.store.get("run_x")!.steps.release!.status).toBe("reported");
+  });
+
+  it("is told to wait inside its turn with a foreground poll", async () => {
+    const { store } = await setup();
+    const playbook = store.get("run_x")!.playbook;
+    const prompt = stepSystemPrompt(playbook, playbook.steps[0]!, { title: "Implementer", instructions: "Implement.", readonly: false } as never);
+    expect(prompt).toMatch(/wait inside your turn with a bounded\nforeground poll/);
+    expect(prompt).toMatch(/Never end your turn to wait on a Monitor, a background command or a timer/);
   });
 
   it("reads run files written before the reminder existed", () => {

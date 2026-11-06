@@ -150,6 +150,11 @@ function lastAssistantText(entries: ReadonlyArray<{ item: { type: string; text?:
   return null;
 }
 
+/** The manager's line for a step agent's report. */
+function reportedLine(stepId: string, n: number, report: { outcome: string; summary: string; outputs: Record<string, unknown> }): string {
+  return `step "${stepId}" attempt ${n} reported ${report.outcome}: ${report.summary}${Object.keys(report.outputs).length ? ` Outputs: ${JSON.stringify(report.outputs)}.` : ""}`;
+}
+
 /** Remind a step agent after this long without activity, unless its step sets `silence`. */
 export const DEFAULT_SILENCE_MS = 30 * 60_000;
 
@@ -1231,7 +1236,27 @@ export class Runtime {
     const found = this.stepRunOf(agentId);
     if (!found) throw new UserError("you are not the current attempt of any playbook step");
     await this.store.mutate(found.run.id, (current) => engine.recordReport(current, agentId, report, nowIso()));
+    await this.onLateReport(found.run.id, found.stepId, agentId);
     return found.stepId;
+  }
+
+  /**
+   * A report for an attempt whose turn already ended (after the reminder, say, the agent ended its
+   * turn waiting, then a background task woke it). Its next turn end is ignored as the step is no
+   * longer running, so the manager is woken here, as if the turn had ended with the report.
+   */
+  private async onLateReport(runId: string, stepId: string, agentId: string): Promise<void> {
+    const run = this.store.get(runId)!;
+    const attempt = run.steps[stepId]!.attempts.at(-1)!;
+    if (run.steps[stepId]!.status !== "reported" || attempt.agentId !== agentId || !attempt.report) return;
+    const violation = attempt.readonlySnapshot !== null ? snapshotDiff(attempt.readonlySnapshot, await checkoutSnapshot(run.workspaceDir)) : null;
+    if (violation) await this.store.mutate(runId, (current) => engine.markReadonlyViolation(current, stepId, violation, nowIso()));
+    await this.enqueue(runId, [
+      `${reportedLine(stepId, attempt.n, this.store.get(runId)!.steps[stepId]!.attempts.at(-1)!.report!)} It reported after its turn had ended.`,
+      violation ? `Readonly check failed (${violation}); complete it with "failure".` : "",
+      `Call complete_step for "${stepId}".`,
+    ].filter(Boolean));
+    await this.deliver(runId);
   }
 
   async onStepTurnEnded(runId: string, agentId: string, turnEnd: "completed" | "failed" | "canceled" | "lost" | "timeout"): Promise<void> {
@@ -1257,7 +1282,7 @@ export class Runtime {
     const report = this.store.get(runId)!.steps[ended.stepId]!.attempts.at(-1)!.report;
     const head = `step "${ended.stepId}" attempt ${ended.attempt.n}`;
     const line = report
-      ? `${head} reported ${report.outcome}: ${report.summary}${Object.keys(report.outputs).length ? ` Outputs: ${JSON.stringify(report.outputs)}.` : ""}${turnEnd === "timeout" ? " If its work is in fact done, nudge_step it to report: its report replaces the timeout failure. Or call complete_step with the outputs from its conversation." : ""}`
+      ? `${reportedLine(ended.stepId, ended.attempt.n, report)}${turnEnd === "timeout" ? " If its work is in fact done, nudge_step it to report: its report replaces the timeout failure. Or call complete_step with the outputs from its conversation." : ""}`
       : ended.attempt.reminded
         ? `${head} ended (${turnEnd}) without reporting, even after the plugin asked it to.${lastMessage ? ` Last message: ${lastMessage.slice(0, 1500)}` : ""} If it is still waiting on something, nudge_step it later. If it could not report (e.g. report_step_result "not found"), check the outputs it gave in its conversation and call complete_step with them.`
         : `${head} ended (${turnEnd}) without reporting.${lastMessage ? ` Last message: ${lastMessage.slice(0, 1500)}` : ""} Use nudge_step to ask it to report, or complete_step.`;
