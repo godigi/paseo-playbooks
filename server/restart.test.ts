@@ -12,7 +12,9 @@ import { RunStore } from "./store";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
 const temps: string[] = [];
+const runtimes: Runtime[] = [];
 afterEach(async () => {
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -212,6 +214,7 @@ describe("Runtime.restartRun", () => {
     await store.create(run);
     const fake = fakePaseo({ m: { archivedAt: archivedManager ? now() : null } });
     const runtime = new Runtime(store);
+    runtimes.push(runtime);
     await runtime.attach(fake.paseo as never);
     return { store, runtime, ...fake };
   }
@@ -284,6 +287,7 @@ describe("a manager archived with the agent that created it", () => {
     const agents = { m: { archivedAt: null as string | null }, coordinator: { archivedAt: null as string | null }, [implementer]: { archivedAt: null as string | null, status: "running" } };
     const fake = fakePaseo(agents);
     const runtime = new Runtime(store);
+    runtimes.push(runtime);
     await runtime.attach(fake.paseo as never);
     // Archived after the plugin started: by Paseo's cascade from the coordinator, or on its own.
     if (parentArchived) agents.coordinator.archivedAt = now();
@@ -339,6 +343,7 @@ describe("Runtime.startAfterTask", () => {
     await store.create(run);
     const fake = fakePaseo({ m: { archivedAt: null } });
     const runtime = new Runtime(store);
+    runtimes.push(runtime);
     await runtime.attach(fake.paseo as never);
     return { store, runtime, ...fake };
   }

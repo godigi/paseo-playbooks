@@ -12,7 +12,7 @@ const EXAMPLES = path.resolve(__dirname, "..", "examples");
 const temps: string[] = [];
 const runtimes: Runtime[] = [];
 afterEach(async () => {
-  for (const runtime of runtimes.splice(0)) runtime.dispose();
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -101,10 +101,12 @@ describe("a running step that goes silent", () => {
 describe("nudge_step on a timed-out step", () => {
   it("reopens the attempt: the agent's next report replaces the timeout failure", async () => {
     const { store, runtime, sent } = await setup({ step: "    timeout: 1h\n", startedAgo: 2 * 60 * MIN, activity: ago(MIN) });
-    await vi.waitFor(() => expect(store.get("run_x")!.steps.release!.status).toBe("reported"));
+    // The step is reported before the manager is woken: wait for the wake-up, or it lands after onTurnEnded below.
+    await vi.waitFor(() => expect(sent.at(-1)?.text).toMatch(/its report replaces the timeout failure/));
+    expect(sent.at(-1)!.agentId).toBe("m");
     let attempt = store.get("run_x")!.steps.release!.attempts[0]!;
+    expect(store.get("run_x")!.steps.release!.status).toBe("reported");
     expect(attempt).toMatchObject({ turnEnd: "timeout", report: { outcome: "failure", summary: "timed out after 60 min" } });
-    expect(sent.at(-1)!.text).toMatch(/its report replaces the timeout failure/);
     await runtime.onTurnEnded("m", "completed");
 
     await runtime.nudgeStep("run_x", "release", "Your PR is merged: report it.");

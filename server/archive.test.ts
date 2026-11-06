@@ -9,7 +9,9 @@ import { RunStore } from "./store";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
 const temps: string[] = [];
+const runtimes: Runtime[] = [];
 afterEach(async () => {
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -52,6 +54,7 @@ async function setup(roleExtra = "") {
   await store.create(newRun({ id: "run_x", playbook, workspaceId: "ws", workspaceDir: dir, projectId: "p", branch: null, managerAgentId: "m", inputs: {}, now: new Date().toISOString() }));
   const fake = fakePaseo();
   const runtime = new Runtime(store);
+  runtimes.push(runtime);
   await runtime.attach(fake.paseo as never);
   return { store, runtime, ...fake };
 }

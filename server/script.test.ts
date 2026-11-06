@@ -10,7 +10,7 @@ const EXAMPLES = path.resolve(__dirname, "..", "examples");
 const temps: string[] = [];
 const runtimes: Runtime[] = [];
 afterEach(async () => {
-  for (const runtime of runtimes.splice(0)) runtime.dispose();
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
