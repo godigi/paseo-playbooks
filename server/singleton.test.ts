@@ -266,6 +266,23 @@ describe("singleton pipelines: jobs through the stations", () => {
     expect(archived).toContain(first.managerAgentId);
   });
 
+  it("tell the handing-off run when its train waits for a human, and when that is decided", async () => {
+    const { store, runtime, sent } = await setup();
+    const pr = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });
+    await until(() => trainAt(store, "dev") !== undefined);
+    const dev = trainAt(store, "dev")!;
+    await runtime.requestGate(dev.managerAgentId, dev.id, "dev", "Applied?", "");
+    await until(() => sent.some((entry) => entry.agentId === "m1" && /waits for a human at gate dev/.test(entry.text)));
+    expect(sent.find((entry) => entry.agentId === "m1" && /waits for a human/.test(entry.text))!.text).toMatch(/Playbooks panel \(the "Apply" card\), not with resume/);
+    expect(store.get(pr.id)!.steps.apply!.attempts.at(-1)!.lastMessage).toMatch(/Waiting for a human at dev/);
+    await runtime.onManagerTurnEnded("m1");
+    await runtime.decideGate(dev.id, "dev", { decision: "approved", comment: "ship it", by: "louis", via: "panel", now: now() });
+    await until(() => sent.some((entry) => entry.agentId === "m1" && /dev of the "dev" train .* was decided: approved by louis: "ship it"/.test(entry.text)));
+    // Announced once: later ticks do not repeat it.
+    await until(() => trainAt(store, "prd") !== undefined);
+    expect(sent.filter((entry) => entry.agentId === "m1" && /waits for a human at gate dev/.test(entry.text))).toHaveLength(1);
+  });
+
   it("end a job early with an outcome: its run is told at once, the train goes on", async () => {
     const { store, runtime } = await setup();
     const pr = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });

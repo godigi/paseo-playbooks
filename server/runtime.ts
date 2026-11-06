@@ -177,6 +177,8 @@ export class Runtime {
   private paseo: PaseoApi | null = null;
   private reconciled: Promise<void> | null = null;
   private readonly busyManagers = new Set<string>();
+  /** Train gates announced to the runs of their jobs, as "<trainId>/<gateId>". */
+  private readonly trainGates = new Set<string>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Silence checks of running agent steps, by agent id. */
   private readonly watches = new Map<string, ReturnType<typeof setTimeout>>();
@@ -261,6 +263,11 @@ export class Runtime {
       await this.settleScripts(run.id);
       await this.wakeStalledManager(run.id);
       await this.deliver(run.id);
+    }
+    // Train gates open before the restart were announced then: only their decisions are left to tell.
+    for (const run of this.store.list()) {
+      if (!run.train || isTerminal(run.status)) continue;
+      for (const gate of run.gates) if (gate.status === "pending") this.trainGates.add(`${run.id}/${gate.id}`);
     }
     await this.admitQueued();
   }
@@ -493,6 +500,7 @@ export class Runtime {
         this.tickAgain = false;
         await this.startScripts();
         await this.startHandoffs();
+        await this.noticeTrainGates();
         await this.endTrains();
         await this.departTrains();
       } while (this.tickAgain);
@@ -665,6 +673,43 @@ export class Runtime {
     await manager.send(singletonKickoff(started, engine.readySteps(started)));
     this.busyManagers.add(manager.id);
     this.tickAgain = true;
+  }
+
+  /**
+   * Tells the runs whose jobs ride a train when it waits for a human (a gate or an ask), and
+   * again when that is decided (or the train ends first): their managers pass it on where they
+   * report. The decision stays with the train, in the Playbooks panel.
+   */
+  private async noticeTrainGates(): Promise<void> {
+    for (const train of this.store.list()) {
+      if (!train.train) continue;
+      const pipeline = this.store.get(train.train.pipelineId);
+      if (!pipeline) continue;
+      const jobs = pipeline.jobs.filter((job) => job.riding.some((ride) => ride.runId === train.id));
+      const where = `the "${train.train.station}" train (${train.id}) of "${pipeline.playbook.title}"`;
+      for (const gate of train.gates) {
+        const key = `${train.id}/${gate.id}`;
+        const pending = gate.status === "pending" && !isTerminal(train.status);
+        if (pending === this.trainGates.has(key)) continue;
+        let text: string;
+        if (pending) {
+          this.trainGates.add(key);
+          const others = jobs.length > 1 ? ` (and ${jobs.length - 1} other job(s))` : "";
+          text = `${where}, which carries your job${others}, waits for a human at ${gate.kind === "ask" ? "the ask of" : "gate"} ${gate.stepId}: ${gate.message} It is decided in the Playbooks panel (the "${pipeline.playbook.title}" card), not with resume: pass it on where you report. You are told when it is decided.`;
+        } else {
+          this.trainGates.delete(key);
+          const comment = gate.comment ? `: "${gate.comment}"` : "";
+          text = gate.status === "pending" ? `${gate.stepId} of ${where} no longer waits: the train ${train.status}.` : `${gate.stepId} of ${where} was decided: ${gate.status} by ${gate.decidedBy ?? "a human"}${comment}.`;
+        }
+        for (const runId of new Set(jobs.map((job) => job.fromRunId))) {
+          const from = this.store.get(runId);
+          if (!from || isTerminal(from.status)) continue;
+          await this.enqueue(runId, [text]);
+          await this.deliver(runId);
+        }
+        for (const job of jobs.filter((candidate) => candidate.status === "open")) await this.noteHandoff(job, pending ? `Waiting for a human at ${gate.stepId} of ${where} (Playbooks panel).` : `On ${where}.`);
+      }
+    }
   }
 
   /** Shows on the handing-off step where its job is. */
@@ -971,7 +1016,10 @@ export class Runtime {
 
   async requestGate(managerId: string, runId: string, stepId: string, summary: string, details: string) {
     const run = this.ownedRun(managerId, runId);
-    return this.store.mutate(run.id, (current) => engine.requestGate(current, stepId, summary, nowIso(), details));
+    const result = await this.store.mutate(run.id, (current) => engine.requestGate(current, stepId, summary, nowIso(), details));
+    // A train's gate is announced to the runs whose jobs it carries.
+    if (run.train) await this.tick();
+    return result;
   }
 
   /** A gate decision from the panel (wakes the manager) or from chat via resume (does not). */

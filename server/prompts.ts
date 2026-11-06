@@ -50,7 +50,10 @@ How to run a playbook:
    needs the whole run: get_run with view "full" gives it.
 9. Hand-off steps (\`handoff:\` instead of a role) are not yours either: the plugin hands
    their job to a singleton playbook, which runs it in its own run, and wakes you with the
-   result (the step's outcome and outputs) and what is ready next.
+   result (the step's outcome and outputs) and what is ready next. When a train carrying its
+   job waits for a human (a gate or an ask), you are told, and told again once it is decided:
+   pass it on where you report (a chat or thread), saying it is decided in the Playbooks
+   panel. It is not your gate: never call resume for it.
 10. Pause: a human may pause the run from the panel. While it is paused, start_step and
    nudge_step are refused and you are not woken; running steps finish their turn. End your
    turn. On resume you are woken with the ready steps and the reports that came in meanwhile.
