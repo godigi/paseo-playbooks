@@ -278,6 +278,55 @@ describe("singleton pipelines: jobs through the stations", () => {
     expect(archivedWorkspaces).toEqual(["wt1"]);
   });
 
+  it("settle jobs from a step's `settle` output when it completes, and refuse entries that do not apply", async () => {
+    const release = `
+title: Release
+singleton: { branch: main }
+inputs:
+  pr_url: { type: string, required: true }
+outputs:
+  report: { type: string }
+outcomes: [done, skipped_out]
+steps:
+  - id: dev
+    role: { name: reviewer, prompt: "{{ run.jobs }}" }
+    outputs: { job_results: {} }
+    outcomes: [success, empty]
+    settle: { output: job_results }
+    on:
+      empty: end
+`;
+    const handing = `
+title: PR
+inputs:
+  pr_url: { type: string, required: true }
+steps:
+  - id: apply
+    handoff: { name: release }
+    inputs: { pr_url: ~ }
+    on:
+      skipped_out: complete
+`;
+    expect(await errorsOf({ "r.yaml": release.replace("outputs: { job_results: {} }", "outputs: { job_results: { type: number } }") }, "r")).toMatch(/settle.output "job_results" must be a string output/);
+    expect(await errorsOf({ "r.yaml": release.replace("outputs: { job_results: {} }", "outputs: { other: {} }") }, "r")).toMatch(/settle.output "job_results" is not an output of the step/);
+    expect(await errorsOf({ "g.yaml": "title: G\nsteps:\n  - id: a\n    gate: { question: ok? }\n    settle: { output: x }\n" }, "g")).toMatch(/`settle` only applies to a role or script step/);
+
+    const { store, runtime } = await setup({ "release.yaml": release, "pr.yaml": handing });
+    const one = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });
+    await until(() => trainAt(store, "dev") !== undefined);
+    const dev = trainAt(store, "dev")!;
+    const job = dev.jobs[0]!.id;
+    await runtime.startStep(dev.managerAgentId, dev.id, "dev", "");
+    await expect(runtime.completeStep(dev.managerAgentId, dev.id, "dev", { outcome: "empty", outputs: { job_results: `job_nope: { outcome: skipped_out }` } })).rejects.toThrow(/settle.output "job_results" of "dev": job "job_nope" is not on this train/);
+    await expect(runtime.completeStep(dev.managerAgentId, dev.id, "dev", { outcome: "empty", outputs: { job_results: `${job}: { outcome: maybe }` } })).rejects.toThrow(/outcome "maybe" is not an outcome of "release"/);
+    expect(store.get(dev.id)!.steps.dev!.status).toBe("running");
+    // The manager does not call settle_job: the plugin ends the job from the output, then the train ends.
+    await runtime.completeStep(dev.managerAgentId, dev.id, "dev", { outcome: "empty", outputs: { job_results: `# nothing to deploy\n${job}:\n  outcome: skipped_out\n  reason: docs only` } });
+    await until(() => store.get(one.id)!.status === "completed");
+    expect(store.get(one.id)!.steps.apply!.attempts.at(-1)!.outcome).toBe("skipped_out");
+    expect(pipelineOf(store).jobs[0]).toMatchObject({ status: "settled", outcome: "skipped_out", summary: "docs only", passed: [] });
+  });
+
   it("tell the handing-off run when its train waits for a human, and when that is decided", async () => {
     const { store, runtime, sent } = await setup();
     const pr = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });

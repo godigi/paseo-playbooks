@@ -156,6 +156,9 @@ outputs set at earlier stations); the steps read them all through {{ run.jobs }}
 - without an outcome, to set a job's outputs (for example a release tag that later stations read);
 - with an outcome (for example "ejected"), to end a job now: the run that handed it off is told at once,
   and this train goes on with the others.
+A step with \`settle\` (see get_run) settles the jobs itself: when you complete it, the plugin applies its
+settle output (YAML per job id: outputs, and an outcome for a job that ends now), and complete_step refuses
+entries that do not apply. Do not call settle_job for those entries.
 When the train completes, its jobs still open pass this station and go on to the next ones. If the train
 fails, they wait here for the next train (within the station's retries), then fail.
 ${jobs ? `Jobs on this train:\n${jobs}` : "This train carries no job."}

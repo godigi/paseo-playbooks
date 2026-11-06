@@ -169,6 +169,14 @@ const RawStepSchema = z.object({
       })
       .strict()
       .optional(),
+    /** On a train of a singleton pipeline: the plugin settles the train's jobs from one of the step's outputs. */
+    settle: z
+      .object({
+        /** A string output holding YAML: per job id, `outputs` and, for a job that ends now, `outcome` (and `reason`). */
+        output: z.string(),
+      })
+      .strict()
+      .optional(),
     /** Runs the step only for these input values (one value or a list per input); otherwise it is skipped. */
     when: z.record(z.string(), z.union([RawScalarSchema, z.array(RawScalarSchema).min(1)])).optional(),
     inputs: z.union([z.array(z.string()), z.record(z.string(), z.string().nullable())]).optional(),
@@ -624,6 +632,9 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (task && rawStep.when !== undefined) err(`${where}: \`when\` does not apply to an after-task`);
     const when = task ? undefined : parseWhen(where, rawStep.when);
     const conditional = when ? { when } : {};
+    if (rawStep.settle !== undefined && (isGate || isBlock || isHandoff || task)) {
+      err(`${where}: \`settle\` only applies to a role or script step (its outputs settle the train's jobs)`);
+    }
     if (isBlock) {
       for (const field of ["outputs", "outcomes", "timeout"] as const) {
         if (rawStep[field] !== undefined) err(`${where}: \`${field}\` does not apply to a playbook step (the sub-playbook defines it)`);
@@ -857,6 +868,11 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       if (silenceMs === undefined) err(`${where}: role.silence: expected a duration such as 30m, or off`);
     }
     const stepRole = roleStep ? roles[roleStep.name] : undefined;
+    if (rawStep.settle !== undefined && !isGate && !task) {
+      const settled = outputs[rawStep.settle.output];
+      if (!settled) err(`${where}: settle.output "${rawStep.settle.output}" is not an output of the step (declare it under \`outputs\`)`);
+      else if (settled.type !== "string") err(`${where}: settle.output "${rawStep.settle.output}" must be a string output (YAML per job id)`);
+    }
     const step: Step = {
       id: rawStep.id,
       kind: isGate ? "gate" : isScript ? "script" : "agent",
@@ -878,6 +894,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (gateStep) step.gate = gateStep.question;
     if (script !== undefined) step.script = script;
     if (pollMs !== undefined) step.pollMs = pollMs;
+    if (rawStep.settle !== undefined && !isGate && !task) step.settle = { output: rawStep.settle.output };
     if (timeoutMs !== undefined && !isGate) step.timeoutMs = timeoutMs;
     if (timeoutTemplate !== undefined && !isGate) step.timeout = timeoutTemplate;
     if (silenceMs !== undefined && !isGate && !isScript) step.silenceMs = silenceMs;
