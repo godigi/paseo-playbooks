@@ -1,6 +1,6 @@
 # A singleton pipeline in the UI: its stations and its trains
 
-Status: Accepted
+Status: Superseded by `2026-11-06-pipeline-card-layout.md`
 
 Supersedes `2026-11-06-singleton-lanes-ui.md`.
 
