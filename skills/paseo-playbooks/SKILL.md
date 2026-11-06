@@ -141,6 +141,7 @@ steps:
 | `role` / `gate` / `playbook` / `script` / `handoff` | Exactly one, as a block: an agent step, a human gate, a sub-playbook, a script the plugin runs itself, or a hand-off to a singleton playbook (see "Step kinds" and "Singleton playbooks and hand-off steps" below). |
 | `when` | Run the step only for some values of the run's inputs: `{ env: prd }` or `{ env: [stg, prd] }`; otherwise it is skipped (see Conditional steps). |
 | `queue` | A singleton's stations only: `{ mode: fifo }` (default, one job per train) or `{ mode: merge }` (every waiting job per train). |
+| `settle` | Role or script steps: `{ output: <name> }`, a string output holding YAML per job id (`{ outputs: {...}, outcome?, reason? }`). When the step completes on a train of a singleton pipeline, the plugin settles those jobs itself, as `settle_job` would; `complete_step` refuses entries that do not apply. Has no effect outside a train. |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |
 | `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
@@ -330,7 +331,10 @@ steps:
   inside it works).
 - **Settling:** the train's manager calls `settle_job` for a job: without an outcome to set
   its outputs (a tag later stations read), with an outcome (`ejected`) to end it now.
-  A singleton's `outputs` need no source.
+  Better, a step can return them: `settle: { output: job_results }` makes the plugin apply
+  that output (YAML per job id) when the step completes, so no job is forgotten. A
+  singleton's `outputs` need no source; a hand-off gets them all only with the first outcome
+  (a job ended early brings what it has).
 - Every role a singleton uses must be `readonly` (trains share one checkout). A singleton
   cannot set `concurrency` or `after`, and cannot be a sub-playbook or an after-task. When no
   train is running, its workspace is fast-forwarded to `branch` and its playbook read again.

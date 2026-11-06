@@ -122,6 +122,8 @@ export const StepSchema = z.object({
   handoff: z.string().optional(),
   /** Runs the step only when every condition holds; otherwise it is skipped. Unset = always. */
   when: z.array(WhenSchema).optional(),
+  /** On a train of a singleton pipeline: the plugin settles its jobs from this output when the step completes. */
+  settle: z.object({ output: z.string() }).optional(),
   /** Script steps: rerun the script this often while it exits with SCRIPT_NOT_YET. Unset = run it once. */
   pollMs: z.number().int().positive().optional(),
   needs: z.array(z.string()),

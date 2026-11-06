@@ -179,6 +179,8 @@ export class Runtime {
   private readonly busyManagers = new Set<string>();
   /** Train gates announced to the runs of their jobs, as "<trainId>/<gateId>". */
   private readonly trainGates = new Set<string>();
+  /** Train step attempts whose `settle` output was applied, as "<trainId>/<stepId>/<attempt>". */
+  private readonly settledSteps = new Set<string>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Silence checks of running agent steps, by agent id. */
   private readonly watches = new Map<string, ReturnType<typeof setTimeout>>();
@@ -800,6 +802,67 @@ export class Runtime {
     return this.store.get(train.id)!;
   }
 
+  /**
+   * Checks a train step's `settle` output before the step completes: every entry must apply to
+   * the pipeline as it is (tried on a copy). Returns the entries; throws with what is wrong.
+   */
+  private checkSettle(train: Run, step: Step, value: unknown): engine.JobResult[] {
+    if (!train.train || !step.settle) return [];
+    const pipeline = this.store.get(train.train.pipelineId);
+    if (!pipeline) throw new UserError(`the pipeline of train ${train.id} no longer exists`);
+    const where = `settle.output "${step.settle.output}" of "${step.id}"`;
+    try {
+      const results = engine.parseJobResults(typeof value === "string" ? value : value === undefined || value === null ? "" : String(value));
+      const copy = structuredClone(pipeline);
+      for (const result of results) {
+        if (result.outcome === undefined && Object.keys(result.outputs).length === 0) continue;
+        engine.settleJob(copy, train.id, result.jobId, { ...result, now: nowIso() });
+      }
+      return results;
+    } catch (error) {
+      throw new UserError(`${where}: ${errorText(error)}. Fix the entries (one per job id: \`{ outputs: {...}, outcome?, reason? }\`) and complete the step again.`);
+    }
+  }
+
+  /**
+   * A train step with `settle` completed: the plugin settles its jobs from that output, as
+   * settle_job would (outputs set, or the job ended and its hand-off told). Returns problems.
+   */
+  private async applySettle(trainId: string, stepId: string, value?: unknown): Promise<string[]> {
+    const train = this.store.get(trainId);
+    if (!train?.train) return [];
+    const step = engine.stepDef(train, stepId);
+    if (!step.settle) return [];
+    const state = train.steps[stepId]!;
+    const attempt = state.attempts.at(-1);
+    if (!attempt?.outcome || !engine.completesStep(step, attempt.outcome)) return [];
+    const key = `${trainId}/${stepId}/${attempt.n}`;
+    if (this.settledSteps.has(key)) return [];
+    this.settledSteps.add(key);
+    const raw = value ?? state.outputs?.[step.settle.output] ?? attempt.report?.outputs?.[step.settle.output];
+    let results: engine.JobResult[];
+    try {
+      results = engine.parseJobResults(typeof raw === "string" ? raw : raw === undefined || raw === null ? "" : String(raw));
+    } catch (error) {
+      return [`Could not settle jobs from "${stepId}" (${step.settle.output}): ${errorText(error)}. Call settle_job for them.`];
+    }
+    const problems: string[] = [];
+    const settledIds: string[] = [];
+    for (const result of results) {
+      if (result.outcome === undefined && Object.keys(result.outputs).length === 0) continue;
+      try {
+        const settled = await this.store.mutate(train.train.pipelineId, (current) => engine.settleJob(current, trainId, result.jobId, { ...result, now: nowIso() }));
+        await this.store.mutate(trainId, (current) => engine.mirrorJob(current, settled.job));
+        if (settled.ended) await this.deliverJob(settled.job, { outcome: settled.job.outcome!, summary: settled.job.summary ?? "", outputs: settled.job.outputs });
+        settledIds.push(`${result.jobId}${result.outcome ? ` (${result.outcome})` : ""}`);
+      } catch (error) {
+        problems.push(`Could not settle ${result.jobId} from "${stepId}": ${errorText(error)}. Call settle_job for it.`);
+      }
+    }
+    if (settledIds.length > 0) problems.unshift(`The plugin settled from "${stepId}": ${settledIds.join(", ")}. Do not call settle_job for these again.`);
+    return problems;
+  }
+
   // ---------------------------------------------------------------- script steps
 
   /** Starts the ready script steps of every active, unpaused run: the plugin runs them, not the manager. */
@@ -935,6 +998,7 @@ export class Runtime {
         await this.enqueue(runId, [`${kind} "${step.id}" attempt ${attempt.n} ended ${report.outcome} but could not be completed (${errorText(error)}). Call complete_step for it.`]);
         continue;
       }
+      effects.notes.push(...(await this.applySettle(runId, step.id)));
       await this.applyEffects(runId, effects);
       await this.admitQueued();
       const after = this.store.get(runId)!;
@@ -1009,12 +1073,18 @@ export class Runtime {
 
   async completeStep(managerId: string, runId: string, stepId: string, input: { outcome: string; summary?: string; outputs?: Record<string, unknown> }): Promise<Run> {
     const run = this.ownedRun(managerId, runId);
+    // A train step with `settle`: its entries must apply before the step may complete.
+    const step = run.train ? engine.stepDef(run, stepId) : null;
+    const settles = step?.settle && engine.completesStep(step, input.outcome) ? step.settle.output : null;
+    const settleValue = settles ? (input.outputs?.[settles] ?? run.steps[stepId]?.attempts.at(-1)?.report?.outputs?.[settles]) : undefined;
+    if (settles && step) this.checkSettle(run, step, settleValue);
     const effects = await this.store.mutate(run.id, (current) => {
       const args: Parameters<typeof engine.completeStep>[2] = { outcome: input.outcome, now: nowIso() };
       if (input.summary !== undefined) args.summary = input.summary;
       if (input.outputs !== undefined) args.outputs = input.outputs;
       return engine.completeStep(current, stepId, args);
     });
+    if (settles) await this.enqueue(run.id, await this.applySettle(run.id, stepId, settleValue));
     await this.applyEffects(run.id, effects);
     await this.admitQueued(run.id);
     return this.store.get(run.id)!;
@@ -1031,6 +1101,11 @@ export class Runtime {
   /** A gate decision from the panel (wakes the manager) or from chat via resume (does not). */
   async decideGate(runId: string, gateId: string, decision: engine.GateDecision): Promise<{ alreadyDecided: boolean; gate: Run["gates"][number] }> {
     const result = await this.store.mutate(runId, (current) => engine.decideGate(current, gateId, decision));
+    // An ask choice with an outcome may complete a train step with `settle`.
+    if (!result.alreadyDecided) {
+      const problems = await this.applySettle(runId, result.gate.stepId);
+      if (problems.length > 0) await this.enqueue(runId, problems);
+    }
     await this.applyEffects(runId, result.effects);
     await this.admitQueued(runId);
     if (!result.alreadyDecided && decision.via === "panel") {

@@ -5,7 +5,7 @@
 import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
 import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
-import { stringify as toYaml } from "yaml";
+import { parse as parseYaml, stringify as toYaml } from "yaml";
 import type { AfterTask, AskChoice, Attempt, Gate, Job, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
 import { isActive, isAgentlessAttempt, isPaused, isPipeline, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, parseDuration, renderTemplate, replaceRefs, resolveValue, templateRefs } from "../shared/vars";
@@ -449,6 +449,14 @@ export function validateOutputs(
   return errors.length > 0 ? { ok: false, errors } : { ok: true, outputs: result };
 }
 
+/**
+ * A hand-off's outputs are the singleton's, all set only when its job leaves with the first
+ * outcome; a job ended early (no_deploy, stopped, ejected) brings what it has.
+ */
+function outputsRequired(step: Step, outcome: string): boolean {
+  return !(step.kind === "handoff" && outcome !== step.outcomes[0]);
+}
+
 /** The declared outputs a report gives with the right type; missing or wrong ones are left out. */
 function partialOutputs(step: Step, outputs: Record<string, unknown>): Record<string, VarValue> {
   const result: Record<string, VarValue> = {};
@@ -480,7 +488,9 @@ export function recordReport(
   let outputs: Record<string, VarValue> = {};
   const kind = defaultTransition(step, report.outcome).kind;
   // A failure, or a question for a human (`ask`), is not a result: no outputs expected.
-  if (report.outcome !== "failure" && kind !== "ask") {
+  if (report.outcome !== "failure" && kind !== "ask" && !outputsRequired(step, report.outcome)) {
+    outputs = partialOutputs(step, report.outputs);
+  } else if (report.outcome !== "failure" && kind !== "ask") {
     const checked = validateOutputs(step, report.outputs);
     if (!checked.ok) throw new EngineError(`report refused: ${checked.errors.join("; ")}. Fix these and call report_step_result again.`);
     outputs = checked.outputs;
@@ -924,9 +934,13 @@ export function completeStep(
 
   if (transition.kind === "complete" || transition.kind === "end" || transition.kind === "goto") {
     const merged = { ...(attempt.report?.outputs ?? {}), ...(input.outputs ?? {}) };
-    const checked = validateOutputs(step, merged);
-    if (!checked.ok) throw new EngineError(`cannot complete "${stepId}": ${checked.errors.join("; ")}`);
-    state.outputs = checked.outputs;
+    if (!outputsRequired(step, input.outcome)) {
+      state.outputs = partialOutputs(step, merged);
+    } else {
+      const checked = validateOutputs(step, merged);
+      if (!checked.ok) throw new EngineError(`cannot complete "${stepId}": ${checked.errors.join("; ")}`);
+      state.outputs = checked.outputs;
+    }
   }
   if (state.status === "running") {
     fx.cancelAgents.push(attempt.agentId);
@@ -1385,6 +1399,47 @@ export function settleJob(
   }
   endJob(pipeline, job, "settled", input.outcome, input.summary, checked.outputs, input.now);
   return { job, ended: true };
+}
+
+/** One entry of a step's `settle` output: a job's outputs and, for a job that ends now, its outcome. */
+export interface JobResult {
+  jobId: string;
+  outcome?: string | undefined;
+  summary: string;
+  outputs: Record<string, unknown>;
+}
+
+/**
+ * Reads a step's `settle` output: YAML with, per job id, `outputs` and optionally `outcome`
+ * and `reason`. Empty, `none` or `{}` settles nothing; YAML comments are ignored.
+ */
+export function parseJobResults(text: string): JobResult[] {
+  const trimmed = text.trim();
+  if (trimmed === "" || trimmed === "{}" || trimmed.toLowerCase() === "none") return [];
+  let data: unknown;
+  try {
+    data = parseYaml(trimmed);
+  } catch (error) {
+    throw new EngineError(`not valid YAML: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+  }
+  if (data === null || data === undefined) return [];
+  if (typeof data !== "object" || Array.isArray(data)) throw new EngineError("expected a mapping of job ids, e.g. `job_ab12: { outputs: { report: ... } }`");
+  return Object.entries(data as Record<string, unknown>).map(([jobId, entry]) => {
+    if (entry === null || entry === undefined) return { jobId, summary: "", outputs: {} };
+    if (typeof entry !== "object" || Array.isArray(entry)) throw new EngineError(`job ${jobId}: expected { outputs, outcome, reason }`);
+    const { outputs, outcome, reason, ...rest } = entry as Record<string, unknown>;
+    const unknown = Object.keys(rest);
+    if (unknown.length > 0) throw new EngineError(`job ${jobId}: unknown key(s) ${unknown.join(", ")} (use outputs, outcome, reason)`);
+    if (outputs !== undefined && outputs !== null && (typeof outputs !== "object" || Array.isArray(outputs))) throw new EngineError(`job ${jobId}: outputs must be a mapping`);
+    if (outcome !== undefined && outcome !== null && typeof outcome !== "string") throw new EngineError(`job ${jobId}: outcome must be a string`);
+    return { jobId, outcome: (outcome as string | null | undefined) ?? undefined, summary: typeof reason === "string" ? reason : "", outputs: (outputs ?? {}) as Record<string, unknown> };
+  });
+}
+
+/** True when this outcome completes the step (complete, end or goto): its outputs then count. */
+export function completesStep(step: Step, outcome: string): boolean {
+  const kind = defaultTransition(step, outcome).kind;
+  return kind === "complete" || kind === "end" || kind === "goto";
 }
 
 /**
