@@ -220,6 +220,69 @@ steps:
   });
 });
 
+const FORGET = `
+title: Forget
+inputs:
+  pr_url: { type: string, required: true }
+steps:
+  - id: apply
+    handoff: { name: apply, wait: false }
+    inputs: { pr_url: ~ }
+  - id: after
+    needs: [apply]
+    gate: { question: Next? }
+`;
+
+describe("singleton pipelines: hand-offs without waiting", () => {
+  it("drop the target's outputs, refuse `on` for its other outcomes and reading its outputs", async () => {
+    const { dir } = await setup({ "apply.yaml": APPLY, "forget.yaml": FORGET });
+    const forget = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "forget")!;
+    expect(forget.errors).toEqual([]);
+    expect(forget.playbook!.steps[0]).toMatchObject({ kind: "handoff", handoffWait: false, outputs: {} });
+    const onOther = await errorsOf({ "apply.yaml": APPLY, "f.yaml": FORGET.replace("    inputs: { pr_url: ~ }\n", "    inputs: { pr_url: ~ }\n    on: { rejected: fail }\n") }, "f");
+    expect(onOther).toMatch(/on.rejected: a hand-off with `wait: false` only ends with "done"/);
+    const reading = await errorsOf(
+      { "apply.yaml": APPLY, "f.yaml": FORGET.replace("    gate: { question: Next? }", "    role: { name: reviewer }\n    inputs: { report: \"{{ steps.apply.outputs.report }}\" }") },
+      "f",
+    );
+    expect(reading).toMatch(/step "apply" has no output "report" \(a hand-off with `wait: false` does not wait for its job, so it gives no outputs\)/);
+  });
+
+  it("complete at once, leave the job to the pipeline when the run ends, and never tell the run how it ends", async () => {
+    const { store, runtime, sent } = await setup({ "apply.yaml": APPLY, "forget.yaml": FORGET });
+    const run = await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "forget", { pr_url: "1" });
+    await until(() => store.get(run.id)!.steps.apply!.status === "completed");
+    expect(store.get(run.id)!.steps.apply!.attempts.at(-1)).toMatchObject({ outcome: "done", job: { runId: pipelineOf(store).id } });
+    expect(store.get(run.id)!.steps.after!.status).toBe("ready");
+    expect(pipelineOf(store).jobs[0]).toMatchObject({ status: "open", detached: true, fromRunId: run.id, fromStepId: "apply" });
+    await runtime.cancelRun(run.id, "moved on", null);
+    expect(pipelineOf(store).jobs[0]!.status).toBe("open");
+    // The train still carries it; a gate there is not announced to the canceled run, and ejecting it records on the pipeline only.
+    await until(() => trainAt(store, "dev") !== undefined);
+    const dev = trainAt(store, "dev")!;
+    expect(dev.jobs[0]!.detached).toBe(true);
+    await runtime.requestGate(dev.managerAgentId, dev.id, "dev", "Applied?", "");
+    await runtime.settleJob(dev.managerAgentId, dev.id, dev.jobs[0]!.id, { outcome: "rejected", summary: "broke dev", outputs: {} });
+    expect(pipelineOf(store).jobs[0]).toMatchObject({ status: "settled", outcome: "rejected" });
+    expect(store.get(run.id)!.status).toBe("canceled");
+    expect(sent.filter((entry) => entry.agentId === "m1" && /waits for a human|ended rejected/.test(entry.text))).toHaveLength(0);
+  });
+
+  it("let a train's manager start rework in a new workspace with start_playbook", async () => {
+    const { store, runtime, created, sent } = await setup({ "apply.yaml": APPLY, "forget.yaml": FORGET });
+    await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "forget", { pr_url: "1" });
+    await until(() => trainAt(store, "dev") !== undefined);
+    const dev = trainAt(store, "dev")!;
+    expect(sent.find((entry) => entry.agentId === dev.managerAgentId)!.text).toMatch(/start_playbook with newWorkspace: true/);
+    await expect(runtime.startPlaybook({ id: dev.managerAgentId, workspaceId: dev.workspaceId, cwd: "/" }, "forget", { pr_url: "1" })).rejects.toThrow(/already has an active run/);
+    const started = await runtime.startPlaybookElsewhere({ workspaceId: dev.workspaceId, cwd: "/" }, "forget", { pr_url: "1" });
+    expect(created).toHaveLength(2);
+    expect(created[1]).toMatchObject({ title: "Forget: 1", source: { kind: "worktree", action: "branch-off" } });
+    expect(runtime.hasReservation(started.workspaceId)).toBe(true);
+    await expect(runtime.startPlaybookElsewhere({ workspaceId: dev.workspaceId, cwd: "/" }, "apply", {})).rejects.toThrow(/is a singleton/);
+  });
+});
+
 describe("singleton pipelines: jobs through the stations", () => {
   it("create the pipeline and its workspace once, run each station's train, and deliver the job's result", async () => {
     const { store, runtime, created, sent } = await setup();

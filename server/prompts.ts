@@ -53,7 +53,9 @@ How to run a playbook:
    result (the step's outcome and outputs) and what is ready next. When a train carrying its
    job waits for a human (a gate or an ask), you are told, and told again once it is decided:
    pass it on where you report (a chat or thread), saying it is decided in the Playbooks
-   panel. It is not your gate: never call resume for it.
+   panel. It is not your gate: never call resume for it. A hand-off with \`wait: false\`
+   completes as soon as the singleton takes its job, with no outputs; you are not told
+   how the job ends.
 10. Pause: a human may pause the run from the panel. While it is paused, start_step and
    nudge_step are refused and you are not woken; running steps finish their turn. End your
    turn. On resume you are woken with the ready steps and the reports that came in meanwhile.
@@ -149,13 +151,15 @@ export function singletonKickoff(run: Run, ready: string[]): string {
 
 You are the Playbook Manager of run ${run.id}: a train of station "${run.train?.station ?? "?"}" of the singleton
 pipeline "${run.train?.playbook ?? run.playbook.id}", in the pipeline's shared workspace. The run already exists: do not
-call start_playbook.
+call start_playbook for it. To start another playbook (for example rework for a job you eject), call
+start_playbook with newWorkspace: true: it gets its own workspace and manager, and you do not manage it.
 
-This train carries jobs, handed off by other runs that wait for them. Each job has its own inputs (and the
+This train carries jobs, handed off by other runs (most wait for them; a job marked "detached" was handed
+off without waiting, so nobody is told how it ends but the pipeline). Each job has its own inputs (and the
 outputs set at earlier stations); the steps read them all through {{ run.jobs }}. Use settle_job:
 - without an outcome, to set a job's outputs (for example a release tag that later stations read);
-- with an outcome (for example "ejected"), to end a job now: the run that handed it off is told at once,
-  and this train goes on with the others.
+- with an outcome (for example "ejected"), to end a job now: the run that handed it off is told at once
+  (unless the job is detached), and this train goes on with the others.
 A step with \`settle\` (see get_run) settles the jobs itself: when you complete it, the plugin applies its
 settle output (YAML per job id: outputs, and an outcome for a job that ends now), and complete_step refuses
 entries that do not apply. Do not call settle_job for those entries.

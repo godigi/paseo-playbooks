@@ -120,6 +120,8 @@ export const StepSchema = z.object({
   script: z.string().optional(),
   /** Hand-off steps: the singleton playbook the step hands a job to. */
   handoff: z.string().optional(),
+  /** Hand-off steps: false = done with the first outcome once the job is in the pipeline, which keeps it (fire and forget). Unset = wait for its result. */
+  handoffWait: z.literal(false).optional(),
   /** Runs the step only when every condition holds; otherwise it is skipped. Unset = always. */
   when: z.array(WhenSchema).optional(),
   /** On a train of a singleton pipeline: the plugin settles its jobs from this output when the step completes. */
@@ -390,6 +392,8 @@ export const JobSchema = z.object({
   riding: z.array(z.object({ station: z.string(), runId: z.string(), since: z.string() })).default([]),
   /** Pipelines: failed trains it rode, by station (capped by the station's `retries`). */
   failedRides: z.record(z.string(), z.number().int()).default({}),
+  /** Handed off with `wait: false`: the pipeline owns it; its run is never told of it and never withdraws it. */
+  detached: z.boolean().default(false),
 });
 export type Job = z.infer<typeof JobSchema>;
 
