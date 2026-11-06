@@ -1,6 +1,7 @@
 # Panel: refresh runs on Paseo agent events, with run status dots
 
-Status: Accepted (#14). Supersedes the polling rule in section 7 of `2026-11-02-design.md`
+Status: Accepted (#14); its run dots rule is superseded by `2026-11-06-run-tabs-history.md`.
+Supersedes the polling rule in section 7 of `2026-11-02-design.md`
 (every 3 s while a run is active, every 30 s otherwise).
 
 ## Context

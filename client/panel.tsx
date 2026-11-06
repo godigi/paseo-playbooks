@@ -10,6 +10,7 @@ import { useAgentEvents } from "./events";
 import { Graph, useReduceMotion } from "./graph";
 import { Button, StepSheet } from "./sheet";
 import { StartForm, type StartTarget } from "./start-form";
+import { dotGroups, isRead, runTone, splitTabs, type DotGroup, type RunTone } from "./run-tabs";
 import { openJobsLabel, Stations, trainName } from "./stations";
 import { splitError } from "../shared/errors";
 import { runStatusColor, runStatusLabel, withAlpha, type Theme } from "./theme";
@@ -183,7 +184,9 @@ function PlaybookCard(props: {
   const tabs = card.runs.filter((candidate) => !isPipeline(candidate));
   // A selected run that disappeared (archived) falls back to the default tab.
   const current = selected === "definition" || tabs.some((candidate) => candidate.id === selected) ? selected : null;
-  const runId = current ?? tabs.find((candidate) => isActive(candidate))?.id ?? tabs[0]?.id ?? "definition";
+  // Active and unopened runs get tabs; finished ones already opened, or over a day old, go in History.
+  const { tabs: shown, more } = splitTabs(tabs, props.readRuns, current, Date.now());
+  const runId = current ?? shown.find((candidate) => isActive(candidate))?.id ?? shown[0]?.id ?? "definition";
   const run = runId === "definition" ? null : tabs.find((candidate) => candidate.id === runId) ?? null;
   const playbook: Playbook | null = run?.playbook ?? card.entry?.playbook ?? null;
   const title = pipeline?.playbook.title ?? playbook?.title ?? card.entry?.title ?? card.id;
@@ -217,7 +220,7 @@ function PlaybookCard(props: {
             onOpen={(run) => {
               setExpanded(true);
               setSelected(run.id);
-              if (run.status === "completed") props.onRead(run.id);
+              if (isTerminal(run.status)) props.onRead(run.id);
             }}
           />
         ) : null}
@@ -265,22 +268,33 @@ function PlaybookCard(props: {
               <Text style={{ color: runId === "definition" ? theme.colors.surface1 : theme.colors.foregroundMuted, fontSize: 11 }}>Definition</Text>
             </Pressable>
           ) : null}
-          {tabs.map((candidate) => (
+          {shown.map((candidate) => (
             <RunChip
               key={candidate.id}
               theme={theme}
               run={candidate}
-              label={candidate.train ? `${trainName(candidate)} · ${candidate.id.replace(/^run_/, "")}` : undefined}
+              label={runLabel(candidate)}
               selected={candidate.id === runId}
-              read={props.readRuns.includes(candidate.id)}
+              read={isRead(candidate, props.readRuns)}
               onSelect={() => {
                 setSelected(candidate.id);
-                if (candidate.status === "completed") props.onRead(candidate.id);
+                if (isTerminal(candidate.status)) props.onRead(candidate.id);
               }}
               onCanceled={() => void queryClient.invalidateQueries({ queryKey: ["playbooks"] })}
               onOpenManager={() => candidate.managerAgentId && props.onOpenAgent(candidate.managerAgentId)}
             />
           ))}
+          {more.length > 0 ? (
+            <HistoryMenu
+              theme={theme}
+              runs={more}
+              readRuns={props.readRuns}
+              onSelect={(candidate) => {
+                setSelected(candidate.id);
+                if (isTerminal(candidate.status)) props.onRead(candidate.id);
+              }}
+            />
+          ) : null}
         </View>
       ) : null}
       {expanded && run ? <RunBar theme={theme} run={run} hostLabel={props.hostLabel} /> : null}
@@ -441,10 +455,16 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
   return (
     <View style={{ zIndex: menu === "closed" ? 0 : 30 }}>
       <View style={{ flexDirection: "row", borderRadius: 10, borderWidth: 1, borderColor: border, backgroundColor: selected ? color : "transparent", overflow: "hidden" }}>
-        <Pressable accessibilityRole="tab" accessibilityState={{ selected }} onPress={props.onSelect} style={{ paddingLeft: 8, paddingRight: 6, paddingVertical: 2 }}>
+        <Pressable
+          accessibilityRole="tab"
+          accessibilityLabel={`${props.label ?? runLabel(run)}, ${runStatusLabel(run.status)}${wrapping ? ", wrapping up" : ""}${paused ? ", paused" : ""}`}
+          accessibilityState={{ selected }}
+          onPress={props.onSelect}
+          style={{ paddingLeft: 8, paddingRight: 6, paddingVertical: 2 }}
+        >
+          {/* The colour says the status; only what it cannot say is written. */}
           <Text style={{ color: text, fontSize: 11 }}>
-            {props.label ?? run.id.replace(/^run_/, "")}
-            {props.label && isPipeline(run) ? "" : ` · ${runStatusLabel(run.status)}`}
+            {props.label ?? runLabel(run)}
             {wrapping ? " · wrapping up" : ""}
             {paused ? " · paused" : ""}
           </Text>
@@ -653,30 +673,131 @@ function ErrorCallout(props: { theme: Theme; file: string; errors: string[] }) {
   );
 }
 
-/** Most runs shown as dots in a card header; older ones stay reachable through the run tabs. */
-const MAX_DOTS = 8;
+/** A run's tab label: its short id, after the train's name for a train. */
+function runLabel(run: Run): string {
+  const id = run.id.replace(/^run_/, "");
+  return run.train ? `${trainName(run)} · ${id}` : id;
+}
+
+function toneColor(theme: Theme, tone: RunTone): string {
+  switch (tone) {
+    case "waiting":
+      return theme.colors.statusWarning;
+    case "running":
+      return theme.colors.accent;
+    case "failed":
+      return theme.colors.statusDanger;
+    case "done":
+      return theme.colors.statusSuccess;
+    case "seen":
+      return theme.colors.foregroundMuted;
+  }
+}
+
+const TONE_LABELS: Record<RunTone, string> = {
+  waiting: "waiting for a decision",
+  running: "running",
+  failed: "failed or canceled",
+  done: "done, not opened yet",
+  seen: "done and opened",
+};
+
+/** The run tabs' last item: runs without a tab (finished and opened, over a day old, or past MAX_TABS), newest first. */
+function HistoryMenu(props: { theme: Theme; runs: Run[]; readRuns: string[]; onSelect(run: Run): void }) {
+  const { theme } = props;
+  const [open, setOpen] = useState(false);
+  const [hover, setHover] = useState<string | null>(null);
+  return (
+    <View style={{ zIndex: open ? 30 : 0 }}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`History, ${props.runs.length} more ${props.runs.length === 1 ? "run" : "runs"}`}
+        accessibilityState={{ expanded: open }}
+        onPress={() => setOpen((value) => !value)}
+        style={{ flexDirection: "row", alignItems: "center", gap: 4, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, paddingLeft: 8, paddingRight: 5, paddingVertical: 2 }}
+      >
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>History ({props.runs.length})</Text>
+        <Icon name="ChevronDown" size={12} color={theme.colors.foregroundMuted} />
+      </Pressable>
+      {open ? (
+        <View
+          accessibilityRole="menu"
+          style={{
+            position: "absolute",
+            top: 26,
+            left: 0,
+            minWidth: 240,
+            maxWidth: 360,
+            maxHeight: 320,
+            padding: 4,
+            borderRadius: 10,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            backgroundColor: theme.colors.surface2,
+            elevation: 6,
+          }}
+        >
+          <ScrollView>
+            {props.runs.map((run) => {
+              const tone = runTone(run, isRead(run, props.readRuns));
+              return (
+                <Pressable
+                  key={run.id}
+                  accessibilityRole="menuitem"
+                  accessibilityLabel={`${runLabel(run)}, ${runStatusLabel(run.status)}. Opens it.`}
+                  onPress={() => {
+                    setOpen(false);
+                    props.onSelect(run);
+                  }}
+                  onHoverIn={() => setHover(run.id)}
+                  onHoverOut={() => setHover((current) => (current === run.id ? null : current))}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 8,
+                    paddingHorizontal: 10,
+                    paddingVertical: 6,
+                    borderRadius: 6,
+                    backgroundColor: hover === run.id ? theme.colors.surface1 : "transparent",
+                  }}
+                >
+                  <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: toneColor(theme, tone) }} />
+                  <Text numberOfLines={1} style={{ flex: 1, color: theme.colors.foreground, fontSize: 12 }}>
+                    {runLabel(run)}
+                  </Text>
+                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{new Date(run.createdAt).toLocaleDateString()}</Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </View>
+      ) : null}
+    </View>
+  );
+}
 
 /**
- * One dot per run, left of Start, like Paseo's conversation dots: blue and pulsing while running,
- * yellow and pulsing while a gate waits, green when done and not yet opened, grey once opened,
- * red when failed or canceled. Pressing a dot opens the card on that run.
+ * The card's runs as one dot per status, left of Start, most urgent first, with a count when
+ * more than one: yellow and pulsing while a gate waits, blue and pulsing while running, red when
+ * failed or canceled, green when done and not yet opened, grey once opened. The row keeps its
+ * width however many runs there are. Pressing a dot opens the card on that status's first run.
  */
 function RunDots(props: { theme: Theme; runs: Run[]; readRuns: string[]; onOpen(run: Run): void }) {
-  const runs = [...props.runs].sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-MAX_DOTS);
+  const groups = dotGroups(props.runs, props.readRuns);
   return (
-    <View style={{ flexDirection: "row", alignItems: "center", gap: 4, marginRight: 4 }}>
-      {runs.map((run) => (
-        <RunDot key={run.id} theme={props.theme} run={run} read={props.readRuns.includes(run.id)} onPress={() => props.onOpen(run)} />
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginRight: 4 }}>
+      {groups.map((group) => (
+        <RunDot key={group.tone} theme={props.theme} group={group} onPress={() => props.onOpen(group.runs[0]!)} />
       ))}
     </View>
   );
 }
 
-function RunDot(props: { theme: Theme; run: Run; read: boolean; onPress(): void }) {
-  const { theme, run } = props;
+function RunDot(props: { theme: Theme; group: DotGroup; onPress(): void }) {
+  const { theme, group } = props;
   const reduceMotion = useReduceMotion();
-  const pulsing = isActive(run) && !isPaused(run) && !reduceMotion;
-  const color = run.status === "completed" && props.read ? theme.colors.foregroundMuted : runStatusColor(theme, run.status);
+  const pulsing = group.pulsing && !reduceMotion;
+  const color = toneColor(theme, group.tone);
   const pulse = useRef(new Animated.Value(1)).current;
   useEffect(() => {
     if (!pulsing) {
@@ -692,12 +813,10 @@ function RunDot(props: { theme: Theme; run: Run; read: boolean; onPress(): void 
     loop.start();
     return () => loop.stop();
   }, [pulsing, pulse]);
-  // Ended with after-tasks still running: the run's own colour, pulsing, "completed, wrapping up".
-  const wrapping = isActive(run) && isTerminal(run.status);
-  const state = wrapping ? `${runStatusLabel(run.status)}, wrapping up` : run.status === "completed" && !props.read ? "completed, not opened yet" : runStatusLabel(run.status);
-  const label = `Run ${run.id.replace(/^run_/, "")}, ${state}${isPaused(run) ? ", paused" : ""}. Opens it.`;
+  const count = group.runs.length;
+  const label = `${count} ${count === 1 ? "run" : "runs"} ${TONE_LABELS[group.tone]}. Opens ${count === 1 ? "it" : "the first"}.`;
   return (
-    <Pressable accessibilityRole="button" accessibilityLabel={label} hitSlop={6} onPress={props.onPress} style={{ padding: 3 }}>
+    <Pressable accessibilityRole="button" accessibilityLabel={label} hitSlop={6} onPress={props.onPress} style={{ flexDirection: "row", alignItems: "center", gap: 3, padding: 3 }}>
       <View style={{ width: 10, height: 10, alignItems: "center", justifyContent: "center" }}>
         {pulsing ? (
           <Animated.View
@@ -714,6 +833,7 @@ function RunDot(props: { theme: Theme; run: Run; read: boolean; onPress(): void 
         ) : null}
         <Animated.View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color, opacity: pulsing ? pulse.interpolate({ inputRange: [0.3, 1], outputRange: [0.6, 1] }) : 1 }} />
       </View>
+      {count > 1 ? <Text style={{ color, fontSize: 11, fontVariant: ["tabular-nums"] }}>{count}</Text> : null}
     </Pressable>
   );
 }
