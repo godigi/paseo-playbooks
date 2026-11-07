@@ -186,6 +186,11 @@ export class Runtime {
   private paseo: PaseoApi | null = null;
   private reconciled: Promise<void> | null = null;
   private readonly busyManagers = new Set<string>();
+  /**
+   * Managers of a station's previous train: archived once their turn ends, and never woken
+   * again (sending to an archived agent brings it back).
+   */
+  private readonly retiredManagers = new Set<string>();
   /** Train gates announced to the runs of their jobs, as "<trainId>/<gateId>". */
   private readonly trainGates = new Set<string>();
   /** Train step attempts whose `settle` output was applied, as "<trainId>/<stepId>/<attempt>". */
@@ -360,6 +365,7 @@ export class Runtime {
     const run = this.store.get(runId);
     // A pipeline has no manager: nothing to wake.
     if (!run || !run.managerAgentId || run.inbox.length === 0 || isPaused(run) || this.busyManagers.has(run.managerAgentId)) return;
+    if (this.retiredManagers.has(run.managerAgentId)) return;
     const text = await this.store.mutate(runId, (current) => {
       const merged = current.inbox.join("\n\n");
       current.inbox = [];
@@ -393,6 +399,7 @@ export class Runtime {
 
   async onManagerTurnEnded(agentId: string): Promise<void> {
     this.busyManagers.delete(agentId);
+    if (this.retiredManagers.has(agentId)) return this.archiveStepAgent(agentId);
     for (const run of this.runsOfManager(agentId)) await this.deliver(run.id);
   }
 
@@ -693,12 +700,21 @@ export class Runtime {
     await this.store.create(train);
     await this.store.mutate(pipelineId, (current) => engine.boardTrain(current, stationId, train.id, jobs.map((job) => job.id), nowIso()));
     // The station's previous train manager is done: one manager per station in the workspace.
-    if (previous && previous.managerAgentId !== manager.id) await this.archiveStepAgent(previous.managerAgentId);
+    if (previous && previous.managerAgentId !== manager.id) await this.retireManager(previous.managerAgentId);
     for (const job of jobs) await this.noteHandoff(job, `On the "${stationId}" train (${train.id}) of "${pipeline.playbook.title}", with ${jobs.length} job(s).`);
     const started = this.store.get(train.id)!;
     await manager.send(singletonKickoff(started, engine.readySteps(started)));
     this.busyManagers.add(manager.id);
     this.tickAgain = true;
+  }
+
+  /**
+   * Archives a previous train's manager, after its current turn: it is often still in the
+   * complete_step call that ended its train, and archiving it there fails that call.
+   */
+  private async retireManager(agentId: string): Promise<void> {
+    this.retiredManagers.add(agentId);
+    if (!this.busyManagers.has(agentId)) await this.archiveStepAgent(agentId);
   }
 
   /**
