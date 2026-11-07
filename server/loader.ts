@@ -8,6 +8,7 @@ import { stepLabel } from "../shared/labels";
 import type {
   AskChoice,
   GateChoice,
+  GateDecider,
   AgentSettings,
   InputWiring,
   Playbook,
@@ -46,6 +47,16 @@ const RawOutputSchema = RawVarDefSchema.extend({ value: z.string().optional() })
 
 const RawScalarSchema = z.union([z.string(), z.number(), z.boolean()]);
 
+/** Who decides a gate besides a human in the panel; absent = a human. */
+const RawDeciderSchema = z
+  .object({
+    by: z.enum(["human", "manager", "role"]),
+    /** With `by: role`: a readonly role of the folder's roles/. */
+    role: z.string().optional(),
+  })
+  .strict();
+type RawDecider = z.infer<typeof RawDeciderSchema>;
+
 const RawTransitionSchema = z.union([
   z.enum(["complete", "end", "fail"]),
   /** `end` with one of the playbook's `outcomes`: what a sub-playbook reports to its parent step's `on`. */
@@ -78,8 +89,11 @@ const RawTransitionSchema = z.union([
           .nullable(),
       )
       .optional(),
+    /** Who answers the ask (and the loop-limit gates of its choices). */
+    decider: RawDeciderSchema.optional(),
   }),
-  z.object({ goto: z.string(), max_loops: z.number().int().positive().optional() }),
+  /** `decider`: who decides the loop-limit gate `max_loops` opens. */
+  z.object({ goto: z.string(), max_loops: z.number().int().positive().optional(), decider: RawDeciderSchema.optional() }),
 ]);
 
 /**
@@ -127,6 +141,8 @@ const RawGateStepSchema = z
           .nullable(),
       )
       .optional(),
+    /** Who decides the gate besides a human in the panel. */
+    decider: RawDeciderSchema.optional(),
   })
   .strict();
 
@@ -641,11 +657,28 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
 
   // Roles used by agent steps.
   const roles: Record<string, Role> = {};
-  for (const roleId of new Set(rawAll.flatMap(({ raw: step }) => kindBlocks(step).role?.name ?? []))) {
+  const deciderRoles = rawAll.flatMap(({ raw: step }) => [kindBlocks(step).gate?.decider, ...Object.values(step.on ?? {}).map((transition) => (typeof transition === "object" && "decider" in transition ? transition.decider : undefined))].flatMap((decider) => (decider?.by === "role" && decider.role ? [decider.role] : [])));
+  for (const roleId of new Set([...rawAll.flatMap(({ raw: step }) => kindBlocks(step).role?.name ?? []), ...deciderRoles])) {
     const loaded = await role(roleId);
     if (loaded.role) roles[roleId] = loaded.role;
     else errors.push(...loaded.errors.map((message) => `${file}: role "${roleId}": ${message}`));
   }
+
+  /** A gate's `decider`: `role` goes with `by: role` only, and names a readonly role. */
+  const parseDecider = (at: string, raw: RawDecider | undefined): GateDecider | undefined => {
+    if (raw === undefined) return undefined;
+    if (raw.by !== "role") {
+      if (raw.role !== undefined) err(`${at}.role: only applies with \`by: role\``);
+      return { by: raw.by };
+    }
+    if (raw.role === undefined) {
+      err(`${at}: \`by: role\` needs a \`role\`: write \`decider: { by: role, role: <id> }\``);
+      return undefined;
+    }
+    const decider = roles[raw.role];
+    if (decider && !decider.readonly) err(`${at}.role: role "${raw.role}" decides gates, so it must be \`readonly: true\``);
+    return { by: "role", role: raw.role, agent: mergeAgent(defaults.agent, pb.agent, decider?.agent) };
+  };
 
   // Steps, first pass. A `playbook:` step is a placeholder until expansion below.
   const seen = new Set<string>();
@@ -857,12 +890,14 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
           return choice;
         });
         if (transition.choices !== undefined && askChoices.length === 0) err(`${where}: on.${outcome}.choices: declare at least one choice`);
+        const askDecider = parseDecider(`${where}: on.${outcome}.decider`, transition.decider);
         on[outcome] = {
           kind: "ask",
           ask: transition.ask,
           target: askChoices[0]?.target ?? target,
           ...(maxLoops !== undefined ? { maxLoops } : {}),
           ...(askChoices.length > 0 ? { choices: askChoices } : {}),
+          ...(askDecider ? { decider: askDecider } : {}),
         };
         continue;
       }
@@ -870,12 +905,20 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         on[outcome] = endTransition(`${where}: on.${outcome}`, transition.end);
         continue;
       }
-      on[outcome] =
-        typeof transition === "string"
-          ? { kind: transition }
-          : transition.max_loops !== undefined
-            ? { kind: "goto", target: transition.goto, maxLoops: transition.max_loops }
-            : { kind: "goto", target: transition.goto };
+      if (typeof transition === "string") {
+        on[outcome] = { kind: transition };
+        continue;
+      }
+      if (transition.decider !== undefined && transition.max_loops === undefined) {
+        err(`${where}: on.${outcome}.decider: a \`goto\` opens a gate only with \`max_loops\` (its loop-limit gate); add \`max_loops\` or remove \`decider\``);
+      }
+      const gotoDecider = parseDecider(`${where}: on.${outcome}.decider`, transition.decider);
+      on[outcome] = {
+        kind: "goto",
+        target: transition.goto,
+        ...(transition.max_loops !== undefined ? { maxLoops: transition.max_loops } : {}),
+        ...(gotoDecider && transition.max_loops !== undefined ? { decider: gotoDecider } : {}),
+      };
     }
     // One rule for agent steps and gates: the first outcome completes by default, `failure`
     // (agent steps) retries then fails, every other outcome needs an explicit `on` entry.
@@ -942,6 +985,8 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (rawStep.short_title !== undefined) step.shortTitle = rawStep.short_title;
     if (roleStep) step.role = roleStep.name;
     if (gateStep) step.gate = gateStep.question;
+    const gateDecider = gateStep ? parseDecider(`${where}: gate.decider`, gateStep.decider) : undefined;
+    if (gateDecider) step.decider = gateDecider;
     if (script !== undefined) step.script = script;
     if (pollMs !== undefined) step.pollMs = pollMs;
     if (rawStep.settle !== undefined && !isGate && !task) step.settle = { output: rawStep.settle.output };

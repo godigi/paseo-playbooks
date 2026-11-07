@@ -5,7 +5,7 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 
 /** The daemon API handed to plugin handlers (typed via the SDK, so the build needs no @getpaseo/client). */
 type PaseoApi = PluginHandlerContext["paseo"];
-import type { Attempt, Job, Playbook, Run, Step, VarValue } from "../shared/types";
+import type { Attempt, Gate, Job, Playbook, Run, Step, VarValue } from "../shared/types";
 import {
   SCRIPT_NOT_YET,
   attemptTimeoutMs,
@@ -25,7 +25,8 @@ import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "./defaults";
 import * as engine from "./engine";
 import { checkoutSnapshot, currentRef, defaultBranch, fastForward, freshRef, snapshotDiff } from "./git";
 import { loadPlaybooks } from "./loader";
-import { managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt } from "./prompts";
+import { gateDeciderPrompt, gateDeciderSystemPrompt, gateDecisionReminder, managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt } from "./prompts";
+import { askHumanText, choicesOfGate, waitsForHuman } from "../shared/gates";
 import type { RunStore } from "./store";
 import { holdsBlock, planAdmissions, slotHolders } from "../shared/slots";
 
@@ -48,6 +49,7 @@ export const MANAGER_TOOL_NAMES = [
   "settle_job",
 ];
 export const STEP_TOOL_NAMES = ["report_step_result"];
+export const GATE_TOOL_NAMES = ["report_gate_decision"];
 
 type AgentConfig = { provider: string; modeId?: string; thinkingOptionId?: string; options?: { allowedTools: string[] } };
 
@@ -60,6 +62,8 @@ function preapprove(config: AgentConfig, provider: string, tools: string[]): Age
 const MANAGER_LABEL = "playbooks/manager";
 export const STEP_LABEL = "playbooks/step";
 export const RUN_LABEL = "playbooks/run";
+/** On a gate's role decider agent: the gate id. */
+export const GATE_LABEL = "playbooks/gate";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -211,6 +215,10 @@ export class Runtime {
   /** The plugin's own work (scripts, hand-offs, departures) runs one pass at a time; a call during a pass asks for another. */
   private ticking = false;
   private tickAgain = false;
+  /** Role deciders reminded once to decide, by agent id. */
+  private readonly remindedDeciders = new Set<string>();
+  /** Role deciders of closed gates already stopped, by agent id. */
+  private readonly stoppedDeciders = new Set<string>();
 
   constructor(private readonly store: RunStore) {}
 
@@ -279,6 +287,7 @@ export class Runtime {
         await this.onStepTurnEnded(run.id, attempt.agentId, "lost");
       }
       await this.settleScripts(run.id);
+      await this.reconcileDeciders(run.id);
       await this.wakeStalledManager(run.id);
       await this.deliver(run.id);
     }
@@ -436,6 +445,133 @@ export class Runtime {
     }
   }
 
+  // ---------------------------------------------------------------- gate deciders
+
+  /** The pending or closed gate whose role decider is this agent. */
+  private deciderOf(agentId: string): { run: Run; gate: Gate } | null {
+    for (const run of this.store.list()) {
+      const gate = run.gates.find((candidate) => candidate.deciderAgentId === agentId);
+      if (gate) return { run, gate };
+    }
+    return null;
+  }
+
+  /** Starts the role decider of each open gate that has none yet, and stops those of gates closed without them. */
+  private async runDeciders(): Promise<void> {
+    for (const run of this.store.list()) {
+      for (const gate of run.gates) {
+        const agentId = gate.deciderAgentId;
+        // Its own decision is stopped when its turn ends, not during the tool call.
+        if (!agentId || gate.status === "pending" || gate.decidedVia === "role" || this.stoppedDeciders.has(agentId)) continue;
+        this.stoppedDeciders.add(agentId);
+        await this.archiveStepAgent(agentId);
+      }
+      if (!isActive(run) || isPaused(run) || isPipeline(run)) continue;
+      for (const gate of run.gates) {
+        if (gate.status !== "pending" || gate.decider.by !== "role" || gate.deciderAgentId || gate.escalated !== null) continue;
+        await this.startDecider(run.id, gate.id).catch((error: unknown) => this.escalate(run.id, gate.id, `its agent could not start: ${errorText(error)}`));
+      }
+    }
+  }
+
+  private async startDecider(runId: string, gateId: string): Promise<void> {
+    const run = this.store.get(runId)!;
+    const gate = run.gates.find((candidate) => candidate.id === gateId)!;
+    const role = run.playbook.roles[gate.decider.role ?? ""];
+    if (!role) throw new UserError(`role "${gate.decider.role}" is not in the run's playbook`);
+    const choices = choicesOfGate(gate, engine.stepDef(run, gate.stepId));
+    const config = await this.stepAgentConfig(run, { id: gate.stepId, agent: gate.decider.agent ?? role.agent }, GATE_TOOL_NAMES);
+    const agent = await this.api()
+      .workspaces.ref(run.workspaceId)
+      .agents.create({
+        config: { ...config, systemPrompt: gateDeciderSystemPrompt(run.playbook, gate, role, choices) },
+        parent: run.managerAgentId,
+        title: `${run.playbook.title} · ${role.title} · ${gate.id}`,
+        labels: { [RUN_LABEL]: run.id, [GATE_LABEL]: gate.id },
+      });
+    await this.store.mutate(runId, (current) => engine.startGateDecider(current, gateId, agent.id, nowIso()));
+    await agent.send(gateDeciderPrompt(run, gate, choices));
+  }
+
+  /** report_gate_decision: the role decider picks a choice, or leaves the gate to a human. */
+  async reportGateDecision(agentId: string, input: { decision: string; comment: string }): Promise<string> {
+    const found = this.deciderOf(agentId);
+    if (!found) throw new UserError("not found: you are not deciding a gate of a playbook run");
+    const { run, gate } = found;
+    if (gate.status !== "pending") return `Gate ${gate.id} is already decided (${gate.status}${gate.decidedVia ? ` via ${gate.decidedVia}` : ""}). Stop here: end your turn.`;
+    if (gate.escalated !== null) return `Gate ${gate.id} was already left to a human. Stop here: end your turn.`;
+    if (!input.comment.trim()) throw new UserError("comment: give your reason");
+    if (input.decision === "escalate") {
+      await this.escalate(run.id, gate.id, input.comment);
+      return `Gate ${gate.id} is left to a human. Stop here: end your turn.`;
+    }
+    const role = gate.decider.role ?? "?";
+    const result = await this.decideGate(run.id, gate.id, { decision: input.decision, comment: input.comment.trim(), by: role, via: "role", now: nowIso() });
+    if (!result.alreadyDecided) {
+      const current = this.store.get(run.id)!;
+      await this.enqueue(run.id, [
+        `Gate ${gate.stepId} ${input.decision} by role "${role}": "${input.comment.trim()}".`,
+        current.status === "running" ? `Ready: ${engine.readySteps(current).join(", ") || "none"}.` : `Run is ${current.status}.`,
+      ]);
+      await this.deliver(run.id);
+    }
+    return `Decision "${input.decision}" recorded for gate ${gate.id}. Stop here: end your turn.`;
+  }
+
+  /** The manager or role decider leaves the gate to a human: the manager is told to ask one. */
+  private async escalate(runId: string, gateId: string, reason: string): Promise<void> {
+    const escalated = await this.store.mutate(runId, (current) => engine.escalateGate(current, gateId, reason, nowIso()));
+    if (!escalated) return;
+    const run = this.store.get(runId)!;
+    const gate = run.gates.find((candidate) => candidate.id === gateId)!;
+    await this.enqueue(runId, [
+      `${engine.deciderText(gate.decider)} left gate ${gate.id} ("${gate.stepId}") to a human: ${gate.escalated}.`,
+      askHumanText(gate, choicesOfGate(gate, engine.stepDef(run, gate.stepId))),
+    ]);
+    await this.deliver(runId);
+    // A train's gate is now announced to the runs whose jobs it carries.
+    if (run.train) await this.tick();
+  }
+
+  private async onDeciderTurnEnded(runId: string, gateId: string, agentId: string, outcome: "completed" | "failed" | "canceled"): Promise<void> {
+    const run = this.store.get(runId);
+    const gate = run?.gates.find((candidate) => candidate.id === gateId);
+    if (!run || !gate) return;
+    if (gate.status === "pending" && gate.escalated === null) {
+      if (outcome === "completed" && !this.remindedDeciders.has(agentId) && !isPaused(run)) {
+        this.remindedDeciders.add(agentId);
+        const sent = await this.api()
+          .agents.ref(agentId)
+          .send(gateDecisionReminder(gate.id))
+          .then(() => true, () => false);
+        if (sent) return;
+      }
+      await this.escalate(runId, gateId, outcome === "completed" ? "its agent ended without a decision" : `its agent's turn ${outcome}`);
+    }
+    if (this.stoppedDeciders.has(agentId) || engine.stepDef(run, gate.stepId).archiveAgents === false) return;
+    this.stoppedDeciders.add(agentId);
+    await this.archiveStepAgent(agentId);
+  }
+
+  /** After a daemon restart: a role decider cut mid-turn is asked to carry on; one that is gone escalates. */
+  private async reconcileDeciders(runId: string): Promise<void> {
+    for (const gate of this.store.get(runId)?.gates ?? []) {
+      if (gate.status !== "pending" || !gate.deciderAgentId || gate.escalated !== null) continue;
+      const agent = await this.api().agents.ref(gate.deciderAgentId).refresh().catch(() => null);
+      if (agent?.agent.status === "running") continue;
+      if (!agent || agent.agent.archivedAt) {
+        await this.escalate(runId, gate.id, "its agent was lost in a daemon restart");
+        continue;
+      }
+      this.remindedDeciders.add(gate.deciderAgentId);
+      const sent = await this.api()
+        .agents.ref(gate.deciderAgentId)
+        .send(gateDecisionReminder(gate.id))
+        .then(() => true, () => false);
+      if (!sent) await this.escalate(runId, gate.id, "its agent could not be resumed after a daemon restart");
+    }
+  }
+
   // ---------------------------------------------------------------- manager tools
 
   async startPlaybook(
@@ -521,6 +657,7 @@ export class Runtime {
         this.tickAgain = false;
         await this.startScripts();
         await this.startHandoffs();
+        await this.runDeciders();
         await this.noticeTrainGates();
         await this.endTrains();
         await this.departTrains();
@@ -731,7 +868,8 @@ export class Runtime {
       const where = `the "${train.train.station}" train (${train.id}) of "${pipeline.playbook.title}"`;
       for (const gate of train.gates) {
         const key = `${train.id}/${gate.id}`;
-        const pending = gate.status === "pending" && !isTerminal(train.status);
+        // A gate its role decides is announced only if the role leaves it to a human.
+        const pending = waitsForHuman(gate) && !isTerminal(train.status);
         if (pending === this.trainGates.has(key)) continue;
         let text: string;
         if (pending) {
@@ -1096,7 +1234,7 @@ export class Runtime {
     return { agentId: agent.id, attempt: started.attempt.n };
   }
 
-  private async stepAgentConfig(run: Run, step: Step) {
+  private async stepAgentConfig(run: Run, step: Pick<Step, "id" | "agent">, tools = STEP_TOOL_NAMES) {
     const manager = await this.api().agents.ref(run.managerAgentId).refresh().catch(() => null);
     const provider = step.agent.provider ?? manager?.agent.provider ?? DEFAULT_PROVIDER;
     const model =
@@ -1105,7 +1243,7 @@ export class Runtime {
     const config: AgentConfig = { provider: `${provider}/${model}` };
     if (step.agent.mode) config.modeId = step.agent.mode;
     if (step.agent.thinking) config.thinkingOptionId = step.agent.thinking;
-    return preapprove(config, provider, STEP_TOOL_NAMES);
+    return preapprove(config, provider, tools);
   }
 
   async completeStep(managerId: string, runId: string, stepId: string, input: { outcome: string; summary?: string; outputs?: Record<string, unknown> }): Promise<Run> {
@@ -1130,9 +1268,9 @@ export class Runtime {
   async requestGate(managerId: string, runId: string, stepId: string, summary: string, details: string) {
     const run = this.ownedRun(managerId, runId);
     const result = await this.store.mutate(run.id, (current) => engine.requestGate(current, stepId, summary, nowIso(), details));
-    // A train's gate is announced to the runs whose jobs it carries.
-    if (run.train) await this.tick();
-    return result;
+    // A train's gate is announced to the runs whose jobs it carries; a role decider starts.
+    await this.tick();
+    return this.store.get(run.id)!.gates.find((gate) => gate.id === result.id) ?? result;
   }
 
   /** A gate decision from the panel (wakes the manager) or from chat via resume (does not). */
@@ -1522,6 +1660,8 @@ export class Runtime {
 
   /** Lifecycle hook: any agent's turn ended. */
   async onTurnEnded(agentId: string, outcome: "completed" | "failed" | "canceled"): Promise<void> {
+    const decider = this.deciderOf(agentId);
+    if (decider) return this.onDeciderTurnEnded(decider.run.id, decider.gate.id, agentId, outcome);
     const step = this.stepRunOf(agentId);
     if (step) await this.onStepTurnEnded(step.run.id, agentId, outcome);
     const handoff = this.pendingHandoffs.get(agentId);
@@ -1536,6 +1676,12 @@ export class Runtime {
 
   async onAgentArchived(agentId: string, parentAgentId: string | null = null): Promise<void> {
     this.pendingHandoffs.delete(agentId);
+    const decider = this.deciderOf(agentId);
+    if (decider) {
+      this.stoppedDeciders.add(agentId);
+      await this.escalate(decider.run.id, decider.gate.id, "its agent was archived before deciding");
+      return;
+    }
     const active = this.activeRunOfManager(agentId);
     if (active) {
       const adopted = parentAgentId !== null && (await this.archivedWithParent(parentAgentId)) && (await this.adoptOrphanedRun(active.id, parentAgentId));

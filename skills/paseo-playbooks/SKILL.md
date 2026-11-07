@@ -207,6 +207,7 @@ several lines:
 | `role.archive_agents` | When the step completes, or its run or after-task ends, its agents are archived, and an attempt's agent is archived when the next attempt starts (default `true`). `false` keeps them, e.g. to debug. |
 | `role.agent` | Step-level agent settings. |
 | `gate.question` | Required: the message shown on the gate. |
+| `gate.decider` | Who decides the gate besides a human in the panel: `{ by: human \| manager \| role, role: <id> }` (default `{ by: human }`). See "Who decides a gate". |
 | `gate.choices` | The buttons, in order. Each key is an outcome, with `label`, `comment: none \| optional \| required` and `color: primary \| neutral \| success \| warning \| danger` (theme colours; default primary for the first, neutral for the others). Without `choices`, the default Reject is `danger`. |
 | `script.run` | Required: an executable of `scripts/` (see "Script steps"). |
 | `script.poll` | Rerun the script this often (`30s`, `1m`) while it exits with 75. |
@@ -590,6 +591,35 @@ on:
       answered: {}                    # re-run QA with the evidence
       stop: { outcome: fail, comment: optional }
 ```
+
+### Who decides a gate
+
+Every gate is a human gate unless it names a `decider`: a gate step in its `gate:` block, an
+`ask` in its transition, and a loop-limit gate on the `goto` that has `max_loops`:
+
+```yaml
+- id: approve
+  gate: { question: Ship it?, decider: { by: role, role: gatekeeper } }
+# on an agent step:
+on:
+  unsure: { ask: "Which way?", decider: { by: manager } }
+  changes_requested: { goto: implement, max_loops: 3, decider: { by: role, role: gatekeeper } }
+```
+
+- `by: human` (the default): the manager asks the human in chat and relays the answer, or the
+  human decides in the panel.
+- `by: manager`: the manager may decide alone (`resume` with `byManager: true` and its reason
+  as comment, shown as "by the manager"), or ask a human as for a human gate.
+- `by: role`: the plugin starts an agent with that role (it must be `readonly`) when the gate
+  opens. It gets the gate, its choices, the run's inputs and the steps' summaries and
+  outputs, and calls `report_gate_decision` with a choice or `escalate`, and its reason.
+  Write in its `instructions.md` when it may decide and when it must leave the gate to a
+  human. If it escalates, ends without deciding (after one reminder), or is archived, the
+  gate goes to a human, with its reason in the gate's details.
+
+A human can always decide first in the panel. The loop-limit gate of an `ask` choice's
+`max_loops` follows the `ask`'s `decider`. `decider` on a `goto` without `max_loops` is an
+error.
 
 ### Rules the validator enforces
 

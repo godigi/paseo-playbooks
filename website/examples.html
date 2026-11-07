@@ -111,7 +111,7 @@ steps:
     outcomes: [ready, changes_requested]
     timeout: 2h
     on:
-      changes_requested: { goto: implement, max_loops: 3 }</code></pre>
+      changes_requested: { goto: implement, max_loops: 3, decider: { by: role, role: gatekeeper } }</code></pre>
 <p class="file">defaults/main.yaml</p>
 <pre><code># Repo-wide agent defaults. Precedence: step &gt; role &gt; playbook &gt; these &gt; the manager's own.
 agent:
@@ -134,6 +134,17 @@ them with the review findings and the local QA report.
 Choose the outcome `ready` when CI is green and nothing blocking remains. Choose
 `changes_requested` otherwise, and put every point the Implementer must fix in your
 summary. Do not edit files or push.</code></pre>
+<p class="file">roles/gatekeeper/role.yaml</p>
+<pre><code>title: Gatekeeper
+readonly: true</code></pre>
+<p class="file">roles/gatekeeper/instructions.md</p>
+<pre><code>You are the Gatekeeper of a pull-request playbook: you decide its loop-limit gate in place
+of a human when it is safe.
+
+Allow one more loop ("approved") when the remaining findings are minor (style, naming,
+docs, a flaky test) and each loop made progress. Leave the gate to a human ("escalate")
+when the same blocker came back twice, or the change touches security, authentication,
+billing or data migrations. Do not edit files or push.</code></pre>
 <p class="file">roles/implementer/role.yaml</p>
 <pre><code>title: Implementer
 readonly: false</code></pre>

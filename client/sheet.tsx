@@ -390,6 +390,15 @@ export function StepSheet(props: {
         ) : null}
         {pendingGate && run ? (
           <Section theme={theme} title="Decision">
+            {pendingGate.decider?.by === "role" && pendingGate.escalated === null ? (
+              <Line theme={theme} muted>
+                Role {pendingGate.decider.role} is deciding; you can still decide first.
+              </Line>
+            ) : pendingGate.decider?.by === "manager" && pendingGate.escalated === null ? (
+              <Line theme={theme} muted>
+                The manager may decide this gate; you can still decide first.
+              </Line>
+            ) : null}
             <GateActions theme={theme} run={run} gate={pendingGate} hostLabel={props.hostLabel} />
           </Section>
         ) : step.kind === "gate" && step.gate ? (
@@ -399,8 +408,8 @@ export function StepSheet(props: {
         ) : null}
         {decidedGates.map((gate) => (
           <Line key={gate.id} theme={theme} muted>
-            {gate.status} via {gate.decidedVia ?? "?"}
-            {gate.decidedBy ? ` by ${gate.decidedBy}` : ""}
+            {gate.status}
+            {gate.decidedVia === "role" ? ` by role ${gate.decidedBy ?? "?"}` : gate.decidedVia === "manager" ? " by the manager" : ` via ${gate.decidedVia ?? "?"}${gate.decidedBy ? ` by ${gate.decidedBy}` : ""}`}
             {gate.comment ? `: ${gate.comment}` : ""}
           </Line>
         ))}

@@ -1,4 +1,4 @@
-import type { Playbook, Role, Run, Step, VarValue } from "../shared/types";
+import type { Gate, GateChoice, Playbook, Role, Run, Step, VarValue } from "../shared/types";
 import { jobsText } from "./engine";
 
 /** How the manager works. Returned by list_playbooks and sent when Start creates a manager. */
@@ -40,6 +40,12 @@ How to run a playbook:
    decide in the Paseo panel instead: your question is then dismissed with the decision;
    end your turn and you are woken with what comes next. If a decision reaches you by
    chat some other way, call resume with it.
+   A gate may name another decider; each gate's message says which. With the manager as
+   decider, decide it yourself when the run gives you enough (resume with byManager: true
+   and your reason as comment), or ask a human as above. With a role as decider, the plugin
+   starts an agent that decides it or leaves it to a human: do not ask and do not call
+   resume, end your turn; you are woken with its decision, or told to ask a human. Never
+   decide a gate without byManager unless a human gave you the answer.
 7. When the run ends, tell the human the outcome and the run outputs. Do not start
    another playbook as a follow-up unless the human asks.
 8. After-tasks: a playbook may declare tasks that run once the run has ended (completed or
@@ -130,6 +136,49 @@ If you must wait for something (CI, a review, a deploy), wait inside your turn w
 foreground poll (a command that checks, sleeps and returns when done or after a time limit), then
 report. Never end your turn to wait on a Monitor, a background command or a timer: you may not be
 woken again.`;
+}
+
+/** System prompt for a gate's role decider: role instructions plus the decider protocol. */
+export function gateDeciderSystemPrompt(playbook: Playbook, gate: Gate, role: Role, choices: GateChoice[]): string {
+  return `${role.instructions}
+
+This role is READONLY: do not edit, create or delete tracked files, do not commit and do not switch branches.
+
+You decide gate "${gate.id}" (step "${gate.stepId}") of the playbook "${playbook.title}" in place of a human,
+when your instructions allow it. Otherwise leave it to a human: that is always allowed.
+
+When you are done, call the report_gate_decision tool exactly once, as your last action:
+- decision: one of ${choices.map((choice) => `"${choice.id}"`).join(", ")}, or "escalate" to leave the gate to a human
+- comment: your reason, in one or two sentences; a human reads it with the decision
+If the tool refuses your decision, fix what it says and call it again. Do not create other agents, and do
+not end your turn without calling it.`;
+}
+
+/** First message of a gate's role decider: the gate, its choices, and what the run did so far. */
+export function gateDeciderPrompt(run: Run, gate: Gate, choices: GateChoice[]): string {
+  const done = run.playbook.steps.filter((step) => run.steps[step.id]?.status === "completed" || step.id === gate.stepId);
+  const steps = done
+    .map((step) => {
+      const state = run.steps[step.id]!;
+      const outputs = Object.keys(state.outputs).length > 0 ? `\n  outputs: ${JSON.stringify(state.outputs)}` : "";
+      return `- ${step.id} (${state.status}): ${state.summary ?? "(no summary)"}${outputs}`;
+    })
+    .join("\n");
+  return [
+    `Gate ${gate.id}: ${gate.summary || gate.message}`,
+    gate.details ? `Details:\n${gate.details}` : "",
+    `Choices:\n${choices.map((choice) => `- "${choice.id}": ${choice.label}${choice.comment === "required" ? " (needs a comment)" : ""}`).join("\n")}`,
+    `Run inputs:\n${JSON.stringify(run.inputs, null, 2)}`,
+    steps ? `Steps so far:\n${steps}` : "",
+    "Decide, or escalate, with report_gate_decision.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/** Sent to a role decider whose turn ended without a decision. */
+export function gateDecisionReminder(gateId: string): string {
+  return `[playbooks] Your turn ended without a decision for gate "${gateId}". Call report_gate_decision now, with one of the gate's choices or "escalate", and your reason as comment.`;
 }
 
 /** Sent to a step agent whose turn ended without a report; the new prompt also restores its plugin tools. */
