@@ -82,4 +82,4 @@ steps:
     outcomes: [ready, changes_requested]
     timeout: 2h
     on:
-      changes_requested: { goto: implement, max_loops: 3 }
+      changes_requested: { goto: implement, max_loops: 3, decider: { by: role, role: gatekeeper } }

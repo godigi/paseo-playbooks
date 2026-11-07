@@ -6,7 +6,7 @@ import { descendantsOf } from "../shared/graph";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
 import { askChoices, askHumanText, askTransitionOf, choicesOfGate, outcomeTransition } from "../shared/gates";
 import { parse as parseYaml, stringify as toYaml } from "yaml";
-import type { AfterTask, AskChoice, Attempt, Gate, Job, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
+import type { AfterTask, AskChoice, Attempt, Gate, GateDecider, Job, Playbook, Run, RunStep, Step, Transition, VarValue } from "../shared/types";
 import { isActive, isAgentlessAttempt, isPaused, isPipeline, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, parseDuration, renderTemplate, replaceRefs, resolveValue, templateRefs } from "../shared/vars";
 
@@ -863,7 +863,7 @@ function performGoto(run: Run, source: string, target: string, feedback: string,
   if (queued.length > 0) fx.notes.push(queueNote(run, queued));
 }
 
-function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | undefined, feedback: string, now: string, fx: Effects): void {
+function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | undefined, feedback: string, now: string, fx: Effects, decider?: GateDecider): void {
   const key = `${step.id}->${target}`;
   const limit = maxLoops === undefined ? Infinity : maxLoops + (run.loopAllowance[key] ?? 0);
   if ((run.loops[key] ?? 0) < limit) {
@@ -886,10 +886,16 @@ function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | un
     decidedBy: null,
     decidedVia: null,
     decidedAt: null,
+    ...openDecider(decider),
   };
   run.gates.push(gate);
   log(run, now, "gate_opened", step.id, gate.id);
   fx.notes.push(`Loop limit reached for ${key}: a human gate (${gate.id}) is open in the panel. ${askHumanText(gate, choicesOfGate(gate, step))}`);
+}
+
+/** A new gate's decider fields: a human unless the playbook names a manager or role decider. */
+function openDecider(decider: GateDecider | undefined): Pick<Gate, "decider" | "deciderAgentId" | "escalated"> {
+  return { decider: decider ?? { by: "human" }, deciderAgentId: null, escalated: null };
 }
 
 /** An `ask` transition: the step waits while a human answers, then goes back to the target with the answer. */
@@ -911,6 +917,7 @@ function openAskGate(run: Run, step: Step, outcome: string, transition: Extract<
     decidedBy: null,
     decidedVia: null,
     decidedAt: null,
+    ...openDecider(transition.decider),
   };
   run.gates.push(gate);
   log(run, now, "gate_opened", step.id, gate.id);
@@ -989,7 +996,7 @@ function followOutcome(run: Run, step: Step, outcome: string, summary: string, n
       break;
     }
     case "goto":
-      gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, now, fx);
+      gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, now, fx, transition.decider);
       break;
     case "ask":
       openAskGate(run, step, outcome, transition, summary, now, fx);
@@ -1044,12 +1051,41 @@ export function requestGate(run: Run, stepId: string, summary: string, now: stri
     decidedBy: null,
     decidedVia: null,
     decidedAt: null,
+    ...openDecider(step.decider),
   };
   run.gates.push(gate);
   state.status = "waiting";
   log(run, now, "gate_opened", stepId, gate.id);
   updateStatus(run);
   return gate;
+}
+
+/** "a human", "the manager" or `role "x"`. */
+export function deciderText(decider: GateDecider): string {
+  return decider.by === "role" ? `role "${decider.role}"` : decider.by === "manager" ? "the manager" : "a human";
+}
+
+/**
+ * The manager or role decider of a pending gate leaves it to a human, with its reason: the
+ * gate then works as a human gate. Returns false when the gate is no longer pending.
+ */
+export function escalateGate(run: Run, ref: string, reason: string, now: string): boolean {
+  const gate = findGate(run, ref);
+  if (!gate || gate.status !== "pending" || gate.escalated !== null) return false;
+  gate.escalated = reason.trim() || "no reason given";
+  const note = `Left to a human by ${deciderText(gate.decider)}: ${gate.escalated}`;
+  gate.details = [gate.details, note].filter(Boolean).join("\n\n");
+  gate.message = [gate.message, note].filter(Boolean).join("\n\n");
+  log(run, now, "gate_escalated", gate.stepId, `${gate.id}: ${gate.escalated}`);
+  return true;
+}
+
+/** Records the agent a role decider runs as. */
+export function startGateDecider(run: Run, gateId: string, agentId: string, now: string): void {
+  const gate = run.gates.find((candidate) => candidate.id === gateId);
+  if (!gate) return;
+  gate.deciderAgentId = agentId;
+  log(run, now, "gate_decider_started", gate.stepId, `${gate.id}: ${deciderText(gate.decider)}, agent ${agentId}`);
 }
 
 /** Finds the pending gate for a step id or gate id. */
@@ -1065,7 +1101,7 @@ export interface GateDecision {
   decision: string;
   comment: string | null;
   by: string | null;
-  via: "panel" | "chat";
+  via: "panel" | "chat" | "manager" | "role";
   now: string;
 }
 
@@ -1080,6 +1116,13 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   const choice = choices.find((candidate) => candidate.id === decision.decision);
   if (!choice) throw new EngineError(`"${decision.decision}" is not a choice of gate "${gate.stepId}" (${choices.map((c) => c.id).join(", ")})`);
   if (choice.comment === "required" && !decision.comment?.trim()) throw new EngineError(`"${choice.label}" needs a comment`);
+  if (decision.via === "manager" || decision.via === "role") {
+    if (gate.decider.by !== decision.via) throw new EngineError(`gate "${gate.id}" is decided by ${deciderText(gate.decider)}, not by ${decision.via === "manager" ? "you" : "a role"}; ask a human`);
+    if (gate.escalated !== null) throw new EngineError(`gate "${gate.id}" was left to a human (${gate.escalated}); ask a human`);
+    if (!decision.comment?.trim()) throw new EngineError(`deciding gate "${gate.id}" without a human needs a comment with the reason`);
+  }
+  // A role agent still deciding stops once someone else decides.
+  if (gate.deciderAgentId && decision.via !== "role") fx.archiveAgents.push(gate.deciderAgentId);
   const step = stepDef(run, gate.stepId);
   const ask = gate.kind === "ask" ? askTransitionOf(gate, step) : null;
   const picked = ask ? askChoices(ask).find((candidate) => candidate.id === choice.id) : undefined;
@@ -1108,7 +1151,7 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
     // one the human picked; the single default "answered" passes the answer alone.
     const comment = decision.comment?.trim() ?? "";
     const feedback = ask?.choices?.length ? `The human answered "${choice.id}"${comment ? `: ${comment}` : "."}` : decision.comment ?? "";
-    gotoOrLimit(run, step, picked?.target ?? gate.gotoTarget!, picked?.maxLoops, feedback, decision.now, fx);
+    gotoOrLimit(run, step, picked?.target ?? gate.gotoTarget!, picked?.maxLoops, feedback, decision.now, fx, ask?.decider);
     updateStatus(run);
     return { gate, alreadyDecided: false, effects: fx };
   }
@@ -1135,7 +1178,7 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
       endFrom(run, gate.stepId, transition.outcome, decision.now, fx);
       break;
     case "goto":
-      gotoOrLimit(run, step, transition.target, transition.maxLoops, decision.comment ?? "", decision.now, fx);
+      gotoOrLimit(run, step, transition.target, transition.maxLoops, decision.comment ?? "", decision.now, fx, transition.decider);
       break;
     default:
       state.status = "failed";

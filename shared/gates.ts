@@ -51,10 +51,25 @@ export function choicesOfGate(gate: Gate, step: Step | undefined): GateChoice[] 
  * Tells the manager to ask the human in chat too: a question from the agent puts the workspace
  * in "needs input" (the yellow dot and a push), which an agent that just ends its turn does not.
  */
+/**
+ * An open gate a human may be asked for: not one a role decider still holds. A manager
+ * decider leaves a gate to a human just by asking, which the plugin cannot see, so its gates count.
+ */
+export function waitsForHuman(gate: Gate): boolean {
+  return gate.status === "pending" && !(gate.decider?.by === "role" && gate.escalated === null);
+}
+
 export function askHumanText(gate: Gate, choices: GateChoice[]): string {
   const options = choices
     .map((choice) => `"${choice.id}" (${choice.label}${choice.comment === "required" ? ", needs a comment" : ""})`)
     .join(", ");
+  const by = gate.decider?.by ?? "human";
+  if (by === "role" && gate.escalated === null) {
+    return `Role "${gate.decider.role}" decides this gate: the plugin started an agent for it. Do not ask a human and do not call resume. End your turn; you are woken with its decision, or with the gate if it leaves it to a human.`;
+  }
+  if (by === "manager" && gate.escalated === null) {
+    return `You may decide this gate yourself: if the run gives you enough to choose, call resume for gate ${gate.id} with byManager: true, one of ${options}, and your reason as comment. Otherwise leave it to a human: ask the human now with your tool for asking the user a question (AskUserQuestion, request_user_input or the like), the gate summary as the question and one option per choice, then call resume with the chosen id and their words as comment.`;
+  }
   return `Ask the human now with your tool for asking the user a question (AskUserQuestion, request_user_input or the like): the gate summary as the question, one option per choice: ${options}. Then call resume for gate ${gate.id} with the chosen id and their words as comment. If you have no such tool, tell the human and end your turn.`;
 }
 

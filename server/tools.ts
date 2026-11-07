@@ -348,22 +348,27 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
     }),
     defineAgentTool({
       name: "resume",
-      description: "Record a gate decision that reached you by chat (e.g. a Slack reply). If the panel already decided, returns that decision.",
+      description:
+        "Record a gate decision that reached you by chat (e.g. a Slack reply), or, with byManager, your own decision on a gate the playbook lets you decide. If the panel already decided, returns that decision.",
       input: z.object({
         runId: IdArg,
         stepId: z.string().describe("Gate step id or gate id"),
         decision: z.string().describe('One of the gate\'s choices (by default "approved" or "rejected"; an ask gate\'s are "answered" or its declared choices)'),
         comment: z.string().optional(),
         decidedBy: z.string().optional().describe("Who decided, e.g. a Slack user id"),
+        byManager: z
+          .boolean()
+          .default(false)
+          .describe("You decide yourself, without a human: only on a gate whose decider is the manager; comment (your reason) is then required"),
       }),
-      execute: ({ runId, stepId, decision, comment, decidedBy }, { agent }) =>
+      execute: ({ runId, stepId, decision, comment, decidedBy, byManager }, { agent }) =>
         guard(async () => {
           runtime.ownedRun(agent.id, runId);
           const result = await runtime.decideGate(runId, stepId, {
             decision,
             comment: comment ?? null,
-            by: decidedBy ?? null,
-            via: "chat",
+            by: byManager ? "manager" : decidedBy ?? null,
+            via: byManager ? "manager" : "chat",
             now: new Date().toISOString(),
           });
           const run = (await runtime.ownedRun(agent.id, runId))!;
@@ -586,5 +591,17 @@ export function stepTool(runtime: Runtime): AgentToolDefinition {
         const stepId = await runtime.report(agent.id, report);
         return ok(`Report for "${stepId}" recorded. Stop here: end your turn.`);
       }),
+  });
+}
+
+export function gateTool(runtime: Runtime): AgentToolDefinition {
+  return defineAgentTool({
+    name: "report_gate_decision",
+    description: "Decide the playbook gate you were started for, or leave it to a human. Call exactly once, as your last action.",
+    input: z.object({
+      decision: z.string().describe('One of the gate\'s choices, or "escalate" to leave it to a human'),
+      comment: z.string().describe("Your reason, in one or two sentences"),
+    }),
+    execute: (input, { agent }) => guard(async () => ok(await runtime.reportGateDecision(agent.id, input))),
   });
 }

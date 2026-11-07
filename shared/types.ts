@@ -41,6 +41,16 @@ export type GateChoice = z.infer<typeof GateChoiceSchema>;
  * again. `outputs` are templates over `gate.*`, `report.*` and `inputs.*`, merged over the
  * step's last report; `target` is then unused.
  */
+/** Who decides a gate: a human (the default), the manager, or an agent with a readonly role. Both may escalate to a human. */
+export const GateDeciderSchema = z.object({
+  by: z.enum(["human", "manager", "role"]),
+  /** With `by: role`: the role's id. */
+  role: z.string().optional(),
+  /** With `by: role`: its agent settings, merged as a step's (defaults, playbook, role). */
+  agent: AgentSettingsSchema.optional(),
+});
+export type GateDecider = z.infer<typeof GateDeciderSchema>;
+
 export const AskChoiceSchema = GateChoiceSchema.extend({
   target: z.string(),
   maxLoops: z.number().int().positive().optional(),
@@ -57,7 +67,8 @@ export const TransitionSchema = z.discriminatedUnion("kind", [
    */
   z.object({ kind: z.literal("end"), outcome: z.string().optional() }),
   z.object({ kind: z.literal("fail") }),
-  z.object({ kind: z.literal("goto"), target: z.string(), maxLoops: z.number().int().positive().optional() }),
+  /** `decider`: who decides the loop-limit gate `maxLoops` opens (unset = a human). */
+  z.object({ kind: z.literal("goto"), target: z.string(), maxLoops: z.number().int().positive().optional(), decider: GateDeciderSchema.optional() }),
   /**
    * Opens a human gate asking for an answer, then goes back to `target` with the answer as feedback.
    * With `choices`, each button goes to its own target; `target` is then the first choice's.
@@ -68,6 +79,8 @@ export const TransitionSchema = z.discriminatedUnion("kind", [
     target: z.string(),
     maxLoops: z.number().int().positive().optional(),
     choices: z.array(AskChoiceSchema).optional(),
+    /** Who answers the ask, and the loop-limit gates of its choices (unset = a human). */
+    decider: GateDeciderSchema.optional(),
   }),
 ]);
 export type Transition = z.infer<typeof TransitionSchema>;
@@ -149,6 +162,8 @@ export const StepSchema = z.object({
   on: z.record(z.string(), TransitionSchema),
   /** Gate steps: the choices offered, in order (empty = the default Approve / Reject). */
   choices: z.array(GateChoiceSchema).default([]),
+  /** Gate steps: who decides the gate (unset = a human). */
+  decider: GateDeciderSchema.optional(),
   /** Set on the steps of an after-task: the task's id. Unset = a step of the main graph. */
   afterTask: z.string().optional(),
 });
@@ -352,7 +367,14 @@ export const GateSchema = z.object({
   requestedAt: z.string(),
   comment: z.string().nullable(),
   decidedBy: z.string().nullable(),
-  decidedVia: z.enum(["panel", "chat"]).nullable(),
+  /** panel and chat: a human (chat = relayed by the manager); manager and role: a decider of the gate. */
+  decidedVia: z.enum(["panel", "chat", "manager", "role"]).nullable(),
+  /** Who may decide it besides a human in the panel; a human on gates opened before deciders. */
+  decider: GateDeciderSchema.default({ by: "human" }),
+  /** With a role decider: the agent deciding it, once started. */
+  deciderAgentId: z.string().nullable().default(null),
+  /** Set when the manager or role decider left the gate to a human: its reason. */
+  escalated: z.string().nullable().default(null),
   decidedAt: z.string().nullable(),
 });
 export type Gate = z.infer<typeof GateSchema>;

@@ -41,7 +41,12 @@ describe("loadPlaybooks", () => {
     expect(implement.timeoutMs).toBe(3_600_000);
     const babysit = playbook.steps.find((step) => step.id === "babysit")!;
     expect(babysit.inputs.review).toMatchObject({ auto: false, label: "review.findings" });
-    expect(babysit.on.changes_requested).toEqual({ kind: "goto", target: "implement", maxLoops: 3 });
+    expect(babysit.on.changes_requested).toEqual({
+      kind: "goto",
+      target: "implement",
+      maxLoops: 3,
+      decider: { by: "role", role: "gatekeeper", agent: { provider: "claude", model: "claude-opus-5-5", mode: "bypassPermissions" } },
+    });
     expect(playbook.outputs.pr_url).toMatchObject({ auto: true, label: "implement.pr_url" });
     expect(playbook.manager).toEqual({ provider: "claude", model: "claude-opus-5-5", mode: "default" });
     expect(playbook.roles.reviewer!.readonly).toBe(true);
