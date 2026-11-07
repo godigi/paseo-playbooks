@@ -122,6 +122,9 @@ export function stationPlaybook(pipeline: Playbook, stationId: string): Playbook
   const station = pipeline.singleton?.stations.find((candidate) => candidate.id === stationId);
   if (!station) throw new EngineError(`no station "${stationId}" in "${pipeline.id}"`);
   const own = new Set(station.steps);
+  const blocks = Object.fromEntries(Object.entries(pipeline.blocks).filter(([prefix]) => prefix === station.id || prefix.startsWith(`${station.id}.`)));
+  // A train's manager gets the repository's, the pipeline's and its station's sub-playbooks' instructions.
+  const used = new Set([pipeline.id, ...Object.values(blocks).map((block) => block.playbook)]);
   return {
     ...pipeline,
     id: `${pipeline.id}.${station.id}`,
@@ -131,7 +134,8 @@ export function stationPlaybook(pipeline: Playbook, stationId: string): Playbook
     outcomes: ["success"],
     steps: pipeline.steps.filter((step) => own.has(step.id)).map((step) => ({ ...step, needs: step.needs.filter((need) => own.has(need)) })),
     // The station's own block is the whole train: an `end` in it ends the train.
-    blocks: Object.fromEntries(Object.entries(pipeline.blocks).filter(([prefix]) => prefix.startsWith(`${station.id}.`))),
+    blocks: Object.fromEntries(Object.entries(blocks).filter(([prefix]) => prefix.startsWith(`${station.id}.`))),
+    managerInstructions: (pipeline.managerInstructions ?? []).filter((entry) => entry.playbook === null || used.has(entry.playbook)),
     after: [],
     singleton: undefined,
   };

@@ -463,6 +463,46 @@ steps:
     expect(first.errors.join("\n")).toMatch(/`next` was removed/);
   });
 
+  it("lists manager instructions: the repository's, the playbook's, then each sub-playbook's once", async () => {
+    const dir = await workspace({
+      "defaults/manager.md": "Post updates in #releases.\n",
+      "outer.yaml": `
+manager: { prompt: "Brief steps in French." }
+steps:
+  - { id: a, playbook: { name: inner } }
+  - { id: b, playbook: { name: inner }, needs: [a] }
+  - { id: c, playbook: { name: quiet }, needs: [b] }
+after:
+  - { id: retro, playbook: { name: retro } }
+`,
+      "inner.yaml": "manager:\n  prompt: |\n    Check the PR exists.\nsteps:\n  - { id: x, playbook: { name: deep } }\n",
+      "deep.yaml": "manager: { prompt: Read the CI logs. }\nsteps:\n  - { id: y, role: { name: reviewer } }\n",
+      "quiet.yaml": "manager: { prompt: \"  \" }\nsteps:\n  - { id: z, role: { name: reviewer } }\n",
+      "retro.yaml": "manager: { prompt: Keep the retro short. }\nsteps:\n  - { id: r, role: { name: reviewer } }\n",
+    });
+    const outer = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "outer")!;
+    expect(outer.errors).toEqual([]);
+    expect(outer.playbook!.managerInstructions).toEqual([
+      { playbook: null, text: "Post updates in #releases." },
+      { playbook: "outer", text: "Brief steps in French." },
+      { playbook: "inner", text: "Check the PR exists." },
+      { playbook: "deep", text: "Read the CI logs." },
+      { playbook: "retro", text: "Keep the retro short." },
+    ]);
+  });
+
+  it("has no manager instructions by default; refuses an empty defaults/manager.md and unknown manager keys", async () => {
+    const step = "steps:\n  - { id: a, role: { name: reviewer } }\n";
+    const plain = await workspace({ "pr.yaml": step });
+    expect((await loadPlaybooks(plain)).entries[0]!.playbook!.managerInstructions).toEqual([]);
+    const empty = await workspace({ "pr.yaml": step, "defaults/manager.md": "\n" });
+    expect((await loadPlaybooks(empty)).entries[0]!.errors.join("\n")).toMatch(/defaults\/manager\.md: empty/);
+    const unknown = await workspace({ "pr.yaml": `manager: { mode: default }\n${step}` });
+    const entry = (await loadPlaybooks(unknown)).entries[0]!;
+    expect(entry.playbook).toBeNull();
+    expect(entry.errors.join("\n")).toMatch(/manager/);
+  });
+
   it("also loads .paseo/playbooks/, with its own roles", async () => {
     const dir = await workspace({ "lite.yaml": "steps:\n  - { id: a, role: { name: reviewer } }\n" }, true, ".paseo/playbooks");
     expect(await hasPlaybooks(dir)).toBe(true);

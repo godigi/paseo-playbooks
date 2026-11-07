@@ -1,5 +1,7 @@
 title: Docs check
 description: Compare the docs with the code, fix the gaps, review and check in parallel, loop until clean, then a human gate.
+manager:
+  prompt: In the approve gate's details, list each changed document with one line on what changed.
 
 inputs:
   focus:

@@ -81,7 +81,10 @@ async function setup(files: Record<string, string> = { "apply.yaml": APPLY, "pr.
   const root = path.join(dir, ".paseo/plugins/playbooks");
   await mkdir(root, { recursive: true });
   await cp(path.join(EXAMPLES, ".paseo/plugins/playbooks/roles"), path.join(root, "roles"), { recursive: true });
-  for (const [name, body] of Object.entries(files)) await writeFile(path.join(root, name), body);
+  for (const [name, body] of Object.entries(files)) {
+    await mkdir(path.dirname(path.join(root, name)), { recursive: true });
+    await writeFile(path.join(root, name), body);
+  }
   const store = new RunStore(path.join(dir, "runs"));
   await store.init();
   const fake = fakePaseo(dir, pipelineDir);
@@ -280,6 +283,29 @@ describe("singleton pipelines: hand-offs without waiting", () => {
     expect(created[1]).toMatchObject({ title: "Forget: 1", source: { kind: "worktree", action: "branch-off" } });
     expect(runtime.hasReservation(started.workspaceId)).toBe(true);
     await expect(runtime.startPlaybookElsewhere({ workspaceId: dev.workspaceId, cwd: "/" }, "apply", {})).rejects.toThrow(/is a singleton/);
+  });
+  it("give a train's manager the repository's, the pipeline's and its own station's instructions only", async () => {
+    const { store, runtime, sent } = await setup({
+      "deploy.yaml": `
+title: Deploy
+singleton: {}
+inputs:
+  pr_url: { type: string, required: true }
+manager: { prompt: One train at a time. }
+steps:
+  - { id: dev, playbook: { name: on_dev } }
+  - { id: prd, playbook: { name: on_prd }, needs: [dev] }
+`,
+      "on_dev.yaml": "hidden: true\nmanager: { prompt: Dev is cheap. }\nsteps:\n  - id: ok\n    gate: { question: ok? }\n",
+      "on_prd.yaml": "hidden: true\nmanager: { prompt: Prd needs care. }\nsteps:\n  - id: ok\n    gate: { question: ok? }\n",
+      "pr.yaml": "title: PR\ninputs:\n  pr_url: { type: string, required: true }\nsteps:\n  - { id: deploy, handoff: { name: deploy }, inputs: { pr_url: ~ } }\n",
+      "defaults/manager.md": "Write in English.",
+    });
+    await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });
+    await until(() => trainAt(store, "dev") !== undefined);
+    const kickoff = sent.find((entry) => entry.agentId === trainAt(store, "dev")!.managerAgentId)!.text;
+    expect(kickoff).toContain("- repository: Write in English.\n- deploy: One train at a time.\n- on_dev: Dev is cheap.");
+    expect(kickoff).not.toContain("Prd needs care.");
   });
 });
 

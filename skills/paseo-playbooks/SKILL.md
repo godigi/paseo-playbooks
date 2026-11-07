@@ -20,7 +20,8 @@ Everything lives in the repository, under `.paseo/plugins/playbooks/` or the sho
 ```text
 .paseo/plugins/playbooks/
 ├── defaults/
-│   └── main.yaml              # optional: repo-wide agent defaults
+│   ├── main.yaml              # optional: repo-wide agent defaults
+│   └── manager.md             # optional: repo-wide instructions for every run's manager
 ├── pr.yaml                    # a playbook; its id is the file name ("pr")
 ├── release.yaml
 ├── roles/
@@ -34,7 +35,7 @@ Everything lives in the repository, under `.paseo/plugins/playbooks/` or the sho
 - Every top-level `*.yaml` or `*.yml` file is a playbook. Shared settings live in folders, so no file
   name is reserved.
 - Each of the two folders is self-contained: a playbook uses the `roles/` and
-  `defaults/main.yaml` (and `scripts/`) of its own folder. The same playbook id in both folders is an error.
+  `defaults/` (and `scripts/`) of its own folder. The same playbook id in both folders is an error.
 - Ids (playbooks, roles, steps, inputs, outputs) use lowercase letters, digits, `-` and `_`,
   and start with a letter.
 - A playbook refers to a role by its directory name. Roles are shared by playbooks.
@@ -57,6 +58,25 @@ role:                  # defaults for agent steps, in the shape of a step's `rol
 Agent settings (`provider`, `model`, `mode`, `thinking`) merge field by field. Precedence:
 step > role > playbook > `defaults/main.yaml` > the manager's own provider and model.
 Any mode is allowed; an unset mode uses the provider's default.
+
+## Manager instructions
+
+The Playbook Manager has no role: its protocol is fixed. A repository adds to it with
+`defaults/manager.md` (every run, non-empty), and a playbook with `manager: { prompt: | … }`.
+The manager gets them after its protocol, as a list: the repository's first, then the
+playbook's, then each sub-playbook's (steps and after-tasks, any depth, each playbook once):
+
+```text
+Instructions for this run (they add to the rules above, never replace them):
+- repository: <defaults/manager.md>
+- pr: <pr.yaml's manager.prompt>
+- release: <release.yaml's manager.prompt>
+```
+
+They arrive in `start_playbook`'s result, or in the kickoff when the panel hands a run to a
+manager. A train's manager gets the repository's, the singleton's and its own station's
+sub-playbooks'. Use them for how to run the playbook (what to check before accepting a step,
+what to tell the human), not for the steps' work: that goes in roles and step prompts.
 
 ## roles/<id>/role.yaml and instructions.md
 
@@ -81,6 +101,7 @@ title: Pull request
 description: Investigate, implement, open a PR and babysit it until it is green.
 agent: { model: claude-opus-5-5 }          # optional playbook-wide settings
 concurrency: 1                             # optional: max active runs (or held blocks) in the project
+manager: { prompt: Check the PR exists before accepting implement. }  # optional: added to the manager's instructions
 hidden: false                              # optional: true moves it to the panel's collapsed "Hidden playbooks" section (sub-playbook / after-task only)
 
 inputs:                                    # the Start form; the manager fills them from chat

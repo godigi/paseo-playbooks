@@ -215,6 +215,14 @@ const RawPlaybookSchema = z.object({
     /** Left out of the panel's list: for playbooks only meant as sub-playbooks or after-tasks. */
     hidden: z.boolean().default(false),
     agent: AgentSettingsSchema.optional(),
+    /** For the Playbook Manager of runs that use this playbook. */
+    manager: z
+      .object({
+        /** Instructions added after the manager's protocol. */
+        prompt: z.string().optional(),
+      })
+      .strict()
+      .optional(),
     inputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
     outputs: z.record(z.string(), RawOutputSchema.nullable()).optional(),
     /** Removed: playbooks compose only as sub-playbook steps. Kept here to refuse it clearly. */
@@ -355,6 +363,14 @@ function parseSilence(text: string): number | null {
   return text.trim() === "off" ? 0 : parseDuration(text);
 }
 
+/** `defaults/manager.md`: repo-wide instructions for every run's manager, or null when there is none. */
+async function loadManagerText(root: string, relDir: string): Promise<{ text: string | null; errors: string[] }> {
+  const text = await readText(path.join(root, "defaults", "manager.md"));
+  if (text === null) return { text: null, errors: [] };
+  if (text.trim() === "") return { text: null, errors: [`${relDir}/defaults/manager.md: empty`] };
+  return { text: text.trim(), errors: [] };
+}
+
 async function loadDefaults(root: string, relDir: string): Promise<{ defaults: RawDefaults; errors: string[] }> {
   const file = path.join(root, "defaults", "main.yaml");
   const rel = `${relDir}/defaults/main.yaml`;
@@ -376,6 +392,21 @@ async function loadDefaults(root: string, relDir: string): Promise<{ defaults: R
     errors.push(`${rel}: role.silence: expected a duration such as 30m, or off`);
   }
   return { defaults: parsed.data, errors };
+}
+
+/**
+ * The manager's added instructions: the repository's, this playbook's, then its sub-playbooks'
+ * (which already list theirs, nested ones included), each playbook once.
+ */
+function managerInstructions(repo: string | null, id: string, prompt: string | undefined, subs: Playbook[]): Playbook["managerInstructions"] {
+  const list: Playbook["managerInstructions"] = repo ? [{ playbook: null, text: repo }] : [];
+  if (prompt?.trim()) list.push({ playbook: id, text: prompt.trim() });
+  for (const sub of subs) {
+    for (const entry of sub.managerInstructions) {
+      if (entry.playbook !== null && !list.some((other) => other.playbook === entry.playbook)) list.push(entry);
+    }
+  }
+  return list;
 }
 
 /** A value written as YAML flow, for error messages: short scalars as they are, the rest as `…`. */
@@ -448,7 +479,9 @@ export async function loadPlaybooks(workspaceDir: string): Promise<LoadResult> {
     if (names === null) continue;
     roots.push(root);
     const files = names.filter((name) => /\.ya?ml$/.test(name)).sort();
-    const { defaults, errors: defaultsErrors } = await loadDefaults(root, relDir);
+    const { defaults, errors: mainErrors } = await loadDefaults(root, relDir);
+    const { text: managerText, errors: managerErrors } = await loadManagerText(root, relDir);
+    const defaultsErrors = [...mainErrors, ...managerErrors];
     const roleCache = new Map<string, Promise<RoleLoad>>();
     const role = (id: string) => {
       if (!roleCache.has(id)) roleCache.set(id, loadRole(root, relDir, id));
@@ -459,6 +492,7 @@ export async function loadPlaybooks(workspaceDir: string): Promise<LoadResult> {
       root,
       relDir,
       defaults,
+      managerText,
       role,
       ids: new Set(files.map((name) => name.replace(/\.ya?ml$/, ""))),
       load: (id, stack) => {
@@ -506,6 +540,8 @@ interface Folder {
   root: string;
   relDir: string;
   defaults: RawDefaults;
+  /** `defaults/manager.md`, trimmed. */
+  managerText: string | null;
   role: (id: string) => Promise<RoleLoad>;
   ids: Set<string>;
   /** `stack` holds the playbooks being expanded above this one, to refuse self-inclusion. */
@@ -1080,6 +1116,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     steps: finalSteps,
     roles,
     manager,
+    managerInstructions: managerInstructions(folder.managerText, id, pb.manager?.prompt, [...blocks.values()]),
     outcomes: playbookOutcomes,
     blocks: blockInfo,
     after: (pb.after ?? []).map((raw) => ({
