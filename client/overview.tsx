@@ -1,9 +1,9 @@
 import { usePaseo, useRpc, type PluginIconProps, type PluginScreenProps, type PluginSidebarItemProps } from "@getpaseo/plugin/client";
-import { Icon, ScrollView, SidebarRow } from "@getpaseo/plugin/client/ui";
+import { Icon, ScrollView, SidebarRow, useToast } from "@getpaseo/plugin/client/ui";
 import { useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Easing, Pressable, Text, View } from "react-native";
-import { markRunSeenRpc } from "../shared/contracts";
+import { archiveRunRpc, markRunSeenRpc } from "../shared/contracts";
 import { gateText } from "../shared/gates";
 import { isActive, isPaused, isPipeline, isTerminal, type Gate, type Run, type Step } from "../shared/types";
 import { useReduceMotion } from "./graph";
@@ -742,7 +742,7 @@ function PlaybookGroup(props: {
           {compact ? null : (
             <>
               <StepLabels theme={theme} columns={columns} />
-              <View style={{ width: 64 }} />
+              <View style={{ width: ACTIONS_WIDTH }} />
             </>
           )}
         </View>
@@ -900,7 +900,10 @@ function RunRow(props: {
   );
 }
 
-/** Open the run's Playbook Manager and its workspace: the right-hand buttons of a run or Needs you row. */
+/** Room for the right-hand buttons of a row: manager, workspace and archive. */
+const ACTIONS_WIDTH = 90;
+
+/** Open the run's Playbook Manager and its workspace, or archive a finished run: the right-hand buttons of a run or Needs you row. */
 function RunActions(props: {
   theme: Theme;
   run: Run;
@@ -910,21 +913,39 @@ function RunActions(props: {
   onOpenWorkspace?: (workspaceId: string) => void;
 }) {
   const { theme, run } = props;
+  const archive = useRpc(archiveRunRpc);
+  const refresh = useStoreRefresh();
+  const toast = useToast();
+  // Only a finished run whose after-tasks are done can be archived.
+  const archivable = isTerminal(run.status) && !isActive(run);
   return (
-    <View style={{ width: props.compact ? undefined : 64, flexDirection: "row", justifyContent: "flex-end", gap: 10 }}>
+    <View style={{ width: props.compact ? undefined : ACTIONS_WIDTH, flexDirection: "row", justifyContent: "flex-end", gap: 10 }}>
       {props.onOpenAgent ? (
         <IconButton theme={theme} icon="Bot" label={`Open the Playbook Manager of run ${shortId(run)}`} onPress={() => props.onOpenAgent!(run.managerAgentId)} />
       ) : null}
       {props.onOpenWorkspace ? (
         <IconButton theme={theme} icon="SquareArrowOutUpRight" label={`Open workspace ${props.workspace}`} onPress={() => props.onOpenWorkspace!(run.workspaceId)} />
       ) : null}
+      {archivable ? (
+        <IconButton
+          theme={theme}
+          icon="Archive"
+          label={`Archive run ${shortId(run)}`}
+          hint="Hides the run from this screen and its panel. Its agents and saved state are kept."
+          onPress={() =>
+            void archive({ runId: run.id })
+              .then(refresh)
+              .catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)))
+          }
+        />
+      ) : null}
     </View>
   );
 }
 
-function IconButton(props: { theme: Theme; icon: string; label: string; onPress(): void }) {
+function IconButton(props: { theme: Theme; icon: string; label: string; hint?: string; onPress(): void }) {
   return (
-    <Pressable accessibilityRole="button" accessibilityLabel={props.label} hitSlop={6} onPress={props.onPress}>
+    <Pressable accessibilityRole="button" accessibilityLabel={props.label} accessibilityHint={props.hint} hitSlop={6} onPress={props.onPress}>
       <Icon name={props.icon} size={15} color={props.theme.colors.foregroundMuted} />
     </Pressable>
   );
