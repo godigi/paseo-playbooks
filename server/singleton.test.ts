@@ -325,9 +325,28 @@ describe("singleton pipelines: jobs through the stations", () => {
     await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });
     await until(() => trainAt(store, "dev") !== undefined);
     await runtime.startPlaybook({ id: "m2", workspaceId: "ws2", cwd: "/" }, "pr", { pr_url: "2" });
+    // Its manager is idle: it is archived right away.
+    await runtime.onManagerTurnEnded(trainAt(store, "dev")!.managerAgentId);
     const first = await decide(runtime, store, "dev", "approved");
     await until(() => trainAt(store, "dev") !== undefined && trainAt(store, "dev")!.id !== first.id);
     expect(archived).toContain(first.managerAgentId);
+  });
+
+  it("archive a busy previous manager only when its turn ends, and never wake it again", async () => {
+    const { store, runtime, archived, sent } = await setup();
+    await runtime.startPlaybook({ id: "m1", workspaceId: "ws1", cwd: "/" }, "pr", { pr_url: "1" });
+    await until(() => trainAt(store, "dev") !== undefined);
+    await runtime.startPlaybook({ id: "m2", workspaceId: "ws2", cwd: "/" }, "pr", { pr_url: "2" });
+    // Its manager is still in its turn (here the kickoff's) when its train ends.
+    const first = trainAt(store, "dev")!;
+    await decide(runtime, store, "dev", "approved");
+    await until(() => trainAt(store, "dev") !== undefined && trainAt(store, "dev")!.id !== first.id);
+    expect(archived).not.toContain(first.managerAgentId);
+    await store.mutate(first.id, (run) => void run.inbox.push("late note"));
+    const before = sent.filter((entry) => entry.agentId === first.managerAgentId).length;
+    await runtime.onManagerTurnEnded(first.managerAgentId);
+    expect(archived).toContain(first.managerAgentId);
+    expect(sent.filter((entry) => entry.agentId === first.managerAgentId)).toHaveLength(before);
   });
 
   it("fail the hand-off and archive the new workspace when its branch has no such singleton", async () => {
