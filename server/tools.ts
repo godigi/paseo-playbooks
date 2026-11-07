@@ -5,7 +5,7 @@ import type { PlaybookEntry, Run } from "../shared/types";
 import { isActive, isAgentlessAttempt, isPaused, isPipeline, isTerminal, restartBlocker, runningAfterTasks, VarValueSchema } from "../shared/types";
 import * as engine from "./engine";
 import { hasPlaybooks, loadPlaybooks } from "./loader";
-import { MANAGER_PROTOCOL } from "./prompts";
+import { MANAGER_PROTOCOL, managerInstructionsText } from "./prompts";
 import { UserError, type Runtime } from "./runtime";
 
 function ok(text: string, structuredContent?: unknown): AgentToolResult {
@@ -272,8 +272,9 @@ export function managerTools(runtime: Runtime): AgentToolDefinition[] {
               { runId: run.id, status: run.status },
             );
           }
+          const instructions = managerInstructionsText(run.playbook);
           return ok(
-            `Run ${run.id} started on branch ${run.branch ?? "(unknown)"}. Ready: ${engine.readySteps(run).join(", ") || "none"}. Start them with start_step.${engine.queuedSteps(run).length ? ` Queued for a free concurrency slot of another run: ${engine.queuedSteps(run).join(", ")}; you are woken when they are ready.` : ""}`,
+            `Run ${run.id} started on branch ${run.branch ?? "(unknown)"}. Ready: ${engine.readySteps(run).join(", ") || "none"}. Start them with start_step.${engine.queuedSteps(run).length ? ` Queued for a free concurrency slot of another run: ${engine.queuedSteps(run).join(", ")}; you are woken when they are ready.` : ""}${instructions ? `\n\n${instructions}` : ""}`,
             runChange(run),
           );
         }),

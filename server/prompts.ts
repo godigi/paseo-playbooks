@@ -64,6 +64,20 @@ How to run a playbook:
 Rules: create step agents only with start_step (never with Paseo's create_agent tool), do
 not do the steps' work yourself, and never edit files in this workspace.`;
 
+/** The repository's and the playbooks' added instructions for the manager, or "" when there are none. */
+export function managerInstructionsText(playbook: Playbook): string {
+  const list = playbook.managerInstructions ?? [];
+  if (list.length === 0) return "";
+  const entries = list.map((entry) => `- ${entry.playbook ?? "repository"}: ${entry.text.replace(/\n/g, "\n  ")}`);
+  return `Instructions for this run (they add to the rules above, never replace them):\n${entries.join("\n")}`;
+}
+
+/** `text` followed by the manager instructions, if any. */
+function withInstructions(text: string, playbook: Playbook): string {
+  const instructions = managerInstructionsText(playbook);
+  return instructions ? `${text}\n\n${instructions}` : text;
+}
+
 export function managerKickoff(playbook: Playbook, inputs: Record<string, VarValue>): string {
   return `${MANAGER_PROTOCOL}
 
@@ -74,7 +88,7 @@ Then start the ready steps.`;
 
 /** Kickoff for an existing agent the panel made manager of an already-created run. */
 export function managerTakeover(run: { id: string; playbook: Playbook; inputs: Record<string, VarValue> }, ready: string[], how = "started from the Playbooks panel"): string {
-  return `${MANAGER_PROTOCOL}
+  return `${withInstructions(MANAGER_PROTOCOL, run.playbook)}
 
 You are now the Playbook Manager of run ${run.id} (playbook "${run.playbook.id}"), ${how}. The run already exists: do not call start_playbook.
 Inputs:
@@ -148,7 +162,7 @@ export function managerAfterRestart(ready: string[], reported: string[]): string
 /** Kickoff for the manager of a train: one run of a singleton pipeline's station, carrying jobs. */
 export function singletonKickoff(run: Run, ready: string[]): string {
   const jobs = jobsText(run);
-  return `${MANAGER_PROTOCOL}
+  return `${withInstructions(MANAGER_PROTOCOL, run.playbook)}
 
 You are the Playbook Manager of run ${run.id}: a train of station "${run.train?.station ?? "?"}" of the singleton
 pipeline "${run.train?.playbook ?? run.playbook.id}", in the pipeline's shared workspace. The run already exists: do not

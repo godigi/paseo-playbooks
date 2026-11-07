@@ -29,6 +29,8 @@
                   └───── changes_requested ────┘</code></pre><p class="file">pr.yaml</p>
 <pre><code>title: Pull request
 description: Investigate a request, implement it, open a PR and babysit it until it is green.
+manager:
+  prompt: Before you accept the implement step, check that its PR exists and targets the base branch.
 
 inputs:
   request:
@@ -118,6 +120,8 @@ agent:
   mode: bypassPermissions      # steps run unattended (shell commands included)
 manager:
   mode: default                # the manager never edits files</code></pre>
+<p class="file">defaults/manager.md</p>
+<pre><code>When a run ends, give the human the PR link first, then the outcome in one sentence.</code></pre>
 <p class="file">roles/babysitter/role.yaml</p>
 <pre><code>title: PR Babysitter
 readonly: true</code></pre>
@@ -261,6 +265,8 @@ steps:
                  └───────────────── rejected ─────────────┘</code></pre><p class="file">docs.yaml</p>
 <pre><code>title: Docs check
 description: Compare the docs with the code, fix the gaps, review and check in parallel, loop until clean, then a human gate.
+manager:
+  prompt: In the approve gate's details, list each changed document with one line on what changed.
 
 inputs:
   focus:

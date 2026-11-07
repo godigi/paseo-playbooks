@@ -217,6 +217,12 @@ export const PlaybookSchema = z.object({
   roles: z.record(z.string(), RoleSchema),
   manager: AgentSettingsSchema,
   /**
+   * Instructions added to the manager's protocol: `defaults/manager.md` (playbook null), then
+   * this playbook's and each sub-playbook's `manager.prompt`, non-empty ones only, each once.
+   * Unset on runs from before manager instructions.
+   */
+  managerInstructions: z.array(z.object({ playbook: z.string().nullable(), text: z.string() })).default([]),
+  /**
    * Sub-playbooks expanded into this one, by id prefix ("pr", or "release.deploy" when
    * nested): their steps are named "<prefix>.<step>". Used to draw a frame around them.
    */

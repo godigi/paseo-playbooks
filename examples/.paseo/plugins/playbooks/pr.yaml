@@ -1,5 +1,7 @@
 title: Pull request
 description: Investigate a request, implement it, open a PR and babysit it until it is green.
+manager:
+  prompt: Before you accept the implement step, check that its PR exists and targets the base branch.
 
 inputs:
   request:
