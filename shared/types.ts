@@ -500,8 +500,9 @@ export function isAgentlessAttempt(agentId: string): boolean {
 }
 
 /** A singleton's pipeline run: it keeps the waiting lists and jobs; its trains are other runs. */
-export function isPipeline(run: Run): boolean {
-  return run.playbook.singleton !== undefined && run.train === null;
+export function isPipeline(run: Run | RunSummary): boolean {
+  const singleton = "stations" in run.playbook ? run.playbook.stations !== null : run.playbook.singleton !== undefined;
+  return singleton && run.train === null;
 }
 
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["completed", "failed", "canceled"];
@@ -511,7 +512,7 @@ export function isTerminal(status: RunStatus): boolean {
 }
 
 /** After-tasks of the run that are running now ("wrapping up"). */
-export function runningAfterTasks(run: Run): string[] {
+export function runningAfterTasks(run: Pick<Run, "after"> | Pick<RunSummary, "after">): string[] {
   return Object.entries(run.after).filter(([, task]) => task.status === "running").map(([id]) => id);
 }
 
@@ -519,12 +520,12 @@ export function runningAfterTasks(run: Run): string[] {
  * Whether the run still has work going on: its main graph, or an after-task once it ended.
  * Use `isTerminal(run.status)` for the run's result, this for "can it still change".
  */
-export function isActive(run: Run): boolean {
+export function isActive(run: Pick<Run, "status" | "after"> | Pick<RunSummary, "status" | "after">): boolean {
   return !isTerminal(run.status) || runningAfterTasks(run).length > 0;
 }
 
 /** Paused by a human and still active. A pause left on a run that has since ended means nothing. */
-export function isPaused(run: Run): boolean {
+export function isPaused(run: Pick<Run, "status" | "after" | "pausedAt"> | Pick<RunSummary, "status" | "after" | "pausedAt">): boolean {
   return run.pausedAt !== null && isActive(run);
 }
 
@@ -556,3 +557,72 @@ export function isStepLive(run: Run, stepId: string): boolean {
   if (!step) return false;
   return step.afterTask ? run.after[step.afterTask]?.status === "running" : !isTerminal(run.status);
 }
+
+// ---------------------------------------------------------------- run summaries
+
+/** A pending gate as the Playbooks screen lists it; the full gate comes with the full run (`runs.get`). */
+export const GateSummarySchema = z.object({
+  id: z.string(),
+  kind: z.enum(["gate", "loop_limit", "ask"]),
+  stepId: z.string(),
+  requestedAt: z.string(),
+  /** The first line of the gate's one-sentence summary. */
+  summary: z.string(),
+});
+export type GateSummary = z.infer<typeof GateSummarySchema>;
+
+/** What the Playbooks screen draws of a step: its column. */
+export const StepSummarySchema = z.object({
+  id: z.string(),
+  title: z.string().optional(),
+  shortTitle: z.string().optional(),
+  afterTask: z.string().optional(),
+  /** The step has `when` conditions (it may be skipped). */
+  conditional: z.boolean().optional(),
+});
+export type StepSummary = z.infer<typeof StepSummarySchema>;
+
+export const PlaybookSummarySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  description: z.string(),
+  steps: z.array(StepSummarySchema),
+  stations: z.array(StationSchema).nullable(),
+});
+export type PlaybookSummary = z.infer<typeof PlaybookSummarySchema>;
+
+export const JobSummarySchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  status: JobSchema.shape.status,
+  waiting: JobSchema.shape.waiting,
+});
+export type JobSummary = z.infer<typeof JobSummarySchema>;
+
+/**
+ * A run reduced to what the Playbooks screen, its sidebar badge and the header use: no history,
+ * attempts, prompts or outputs (a run can weigh 200 KB). Open a run in full with `runs.get`.
+ */
+export const RunSummarySchema = z.object({
+  id: z.string(),
+  workspaceId: z.string(),
+  projectId: z.string(),
+  managerAgentId: z.string(),
+  name: z.string().nullable(),
+  status: RunStatusSchema,
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  seenAt: z.string().nullable(),
+  pausedAt: z.string().nullable(),
+  /** The first line of the run's first text input (the request), if any: its title in lists. */
+  inputTitle: z.string().nullable(),
+  playbook: PlaybookSummarySchema,
+  steps: z.record(z.string(), z.object({ status: StepStatusSchema })),
+  after: z.record(z.string(), z.object({ status: AfterTaskStatusSchema })),
+  /** Pending gates only. */
+  gates: z.array(GateSummarySchema),
+  jobs: z.array(JobSummarySchema),
+  train: RunSchema.shape.train,
+});
+export type RunSummary = z.infer<typeof RunSummarySchema>;
+

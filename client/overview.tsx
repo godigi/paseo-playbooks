@@ -3,9 +3,8 @@ import { Icon, ScrollView, SidebarRow, useToast } from "@getpaseo/plugin/client/
 import { useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Easing, Pressable, Text, View } from "react-native";
-import { archiveRunRpc, markRunSeenRpc } from "../shared/contracts";
-import { gateText } from "../shared/gates";
-import { isActive, isPaused, isPipeline, isTerminal, type Gate, type Run, type Step } from "../shared/types";
+import { archiveRunRpc, getRunRpc, markRunSeenRpc } from "../shared/contracts";
+import { isActive, isPaused, isPipeline, isTerminal, type GateSummary, type Run, type RunSummary, type StepSummary } from "../shared/types";
 import { useReduceMotion } from "./graph";
 import { LABEL_WIDTH, labelLayout, ROW_HEIGHT } from "./layout";
 import { useOverview, type OverviewStore } from "./overview-store";
@@ -143,22 +142,21 @@ function useWorkspaces(): WorkspaceInfo[] {
 
 /** Main-graph steps in declared order: the columns of a playbook's progression line. */
 /** The steps on a run's line: not after-tasks, nor steps its `when` skipped (a dev train has no prd go). */
-function mainSteps(run: Run): Step[] {
-  return run.playbook.steps.filter((step) => !step.afterTask && !(step.when && run.steps[step.id]?.status === "skipped"));
+function mainSteps(run: RunSummary): StepSummary[] {
+  return run.playbook.steps.filter((step) => !step.afterTask && !(step.conditional && run.steps[step.id]?.status === "skipped"));
 }
 
-function pendingGates(run: Run): Gate[] {
-  return run.gates.filter((gate) => gate.status === "pending");
+function pendingGates(run: RunSummary): GateSummary[] {
+  return run.gates;
 }
 
 /** A run's name in lists: its first text input (the request), else its id; a train's station and jobs. */
-function runTitle(run: Run): string {
+function runTitle(run: RunSummary): string {
   if (run.train) return `${trainName(run)} · ${run.jobs.length} ${run.jobs.length === 1 ? "job" : "jobs"}`;
-  const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
-  return text ? text.trim().split("\n")[0]! : run.id;
+  return run.inputTitle ?? run.id;
 }
 
-function shortId(run: Run): string {
+function shortId(run: RunSummary): string {
   return run.id.replace(/^run_/, "");
 }
 
@@ -170,7 +168,7 @@ function ago(iso: string): string {
   return `${Math.floor(seconds / 86_400)}d ago`;
 }
 
-function gateKindLabel(gate: Gate): string {
+function gateKindLabel(gate: GateSummary): string {
   return gate.kind === "ask" ? "Answer" : gate.kind === "loop_limit" ? "Loop limit" : "Decide";
 }
 
@@ -221,7 +219,7 @@ const LIVE = new Set(["running", "waiting", "reported", "queued", "ready", "fail
  * Where a run stands on its line: the column of its furthest live step (Done once completed),
  * the columns of every live step, and its tone.
  */
-function progress(run: Run): { position: number; marks: number[]; tone: Tone; status: string } {
+function progress(run: RunSummary): { position: number; marks: number[]; tone: Tone; status: string } {
   const steps = mainSteps(run);
   const done = steps.length;
 
@@ -311,7 +309,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   const byId = useMemo(() => new Map(workspaces.map((workspace) => [workspace.id, workspace])), [workspaces]);
   const names = useMemo(() => new Map(workspaces.map((workspace) => [workspace.id, workspace.label])), [workspaces]);
   const allRuns = overview.runs ?? [];
-  const projectOf = (run: Run) => byId.get(run.workspaceId)?.projectId ?? run.projectId;
+  const projectOf = (run: RunSummary) => byId.get(run.workspaceId)?.projectId ?? run.projectId;
   // Two levels of chips, from every run not archived (working, waiting, failed or done): a project
   // or workspace without one is not listed.
   const projects = chipsOf(allRuns, projectOf, (run) => byId.get(run.workspaceId)?.projectLabel ?? run.projectId);
@@ -320,15 +318,15 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   const workspaceChips = project ? chipsOf(inProject, (run) => run.workspaceId, (run) => names.get(run.workspaceId) ?? run.workspaceId) : [];
   const scope = workspaceFilter && workspaceChips.some((chip) => chip.id === workspaceFilter) ? workspaceFilter : null;
   const inScope = inProject.filter((run) => !scope || run.workspaceId === scope);
-  const isDone = (run: Run) => run.status === "completed" && !isActive(run);
+  const isDone = (run: RunSummary) => run.status === "completed" && !isActive(run);
   // Done runs, opened or not, are listed with Show done; everything else (working, waiting, failed) always.
   const runs = inScope.filter((run) => showDone || !isDone(run)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 
   const needs = runs.flatMap((run) => pendingGates(run).map((gate) => ({ run, gate })));
   const groups = useMemo(() => {
-    const byPlaybook = new Map<string, Run[]>();
+    const byPlaybook = new Map<string, RunSummary[]>();
     // A singleton's trains go under the singleton; its pipeline shows as its stations.
-    const key = (run: Run) => run.train?.playbook ?? run.playbook.id;
+    const key = (run: RunSummary) => run.train?.playbook ?? run.playbook.id;
     for (const run of runs) byPlaybook.set(key(run), [...(byPlaybook.get(key(run)) ?? []), run]);
     const pipelines = overview.runs?.filter(isPipeline) ?? [];
     return [...byPlaybook.entries()].map(([id, list]) => ({ id, runs: list, playbook: list[0]!.playbook, pipeline: pipelines.find((run) => run.playbook.id === id && !isTerminal(run.status)) }));
@@ -479,7 +477,7 @@ interface ChipInfo {
 }
 
 /** One chip per distinct key among these runs, with the gates pending in its runs, sorted by label. */
-function chipsOf(runs: Run[], key: (run: Run) => string, label: (run: Run) => string): ChipInfo[] {
+function chipsOf(runs: RunSummary[], key: (run: RunSummary) => string, label: (run: RunSummary) => string): ChipInfo[] {
   const chips = new Map<string, ChipInfo>();
   for (const run of runs) {
     const id = key(run);
@@ -539,8 +537,8 @@ function SectionTitle(props: { theme: Theme; title: string; count?: number; icon
 /** A pending gate: what it asks, where it is, and Review, which opens the gate's choices in place. */
 function NeedsYouRow(props: {
   theme: Theme;
-  run: Run;
-  gate: Gate;
+  run: RunSummary;
+  gate: GateSummary;
   first: boolean;
   workspace: string;
   hostLabel: string;
@@ -550,9 +548,26 @@ function NeedsYouRow(props: {
 }) {
   const { theme, run, gate } = props;
   const [open, setOpen] = useState(false);
+  /** The gate's choices need the run's playbook in full: fetched when Review opens, not listed with the summaries. */
+  const getRun = useRpc(getRunRpc);
+  const [full, setFull] = useState<{ run: Run | null; error: string | null } | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let current = true;
+    setFull(null);
+    getRun({ runId: run.id })
+      .then(({ run: fullRun }) => current && setFull({ run: fullRun, error: null }))
+      .catch((error: unknown) => current && setFull({ run: null, error: error instanceof Error ? error.message : String(error) }));
+    return () => {
+      current = false;
+    };
+    // Refetch when the gate itself changes, not on every summary refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, run.id, gate.id]);
+  const fullGate = full?.run?.gates.find((candidate) => candidate.id === gate.id && candidate.status === "pending");
   const refresh = useStoreRefresh();
   const warning = theme.colors.statusWarning;
-  const summary = gateText(gate).summary.split("\n")[0] || `${stepTitleOf(run.playbook, gate.stepId)} is waiting`;
+  const summary = gate.summary || `${stepTitleOf(run.playbook, gate.stepId)} is waiting`;
   return (
     <View style={{ borderTopWidth: props.first ? 0 : 1, borderTopColor: theme.colors.border }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 10 }}>
@@ -584,7 +599,13 @@ function NeedsYouRow(props: {
       </View>
       {open ? (
         <View style={{ paddingHorizontal: 12, paddingBottom: 12, paddingLeft: props.compact ? 12 : 116, maxWidth: 760 }}>
-          <GateActions theme={theme} run={run} gate={gate} hostLabel={props.hostLabel} onDecided={refresh} />
+          {full?.run && fullGate ? (
+            <GateActions theme={theme} run={full.run} gate={fullGate} hostLabel={props.hostLabel} onDecided={refresh} />
+          ) : (
+            <Text style={{ color: full?.error ? theme.colors.statusDanger : theme.colors.foregroundMuted, fontSize: 12 }}>
+              {full === null ? "Loading…" : (full.error ?? "This gate is no longer waiting.")}
+            </Text>
+          )}
         </View>
       ) : null}
     </View>
@@ -606,10 +627,10 @@ const SORTS: ReadonlyArray<{ key: SortKey; label: string; hint: string }> = [
 const TONE_RANK: Record<Tone, number> = { waiting: 0, running: 1, failed: 2, done: 3, paused: 4, seen: 5 };
 
 /** Runs in the chosen order; ties go to the most recent activity. */
-function sortRuns(runs: Run[], key: SortKey): Run[] {
-  const byUpdate = (a: Run, b: Run) => b.updatedAt.localeCompare(a.updatedAt);
+function sortRuns(runs: RunSummary[], key: SortKey): RunSummary[] {
+  const byUpdate = (a: RunSummary, b: RunSummary) => b.updatedAt.localeCompare(a.updatedAt);
   const facts = new Map(runs.map((run) => [run.id, progress(run)]));
-  const compare = (a: Run, b: Run): number => {
+  const compare = (a: RunSummary, b: RunSummary): number => {
     switch (key) {
       case "started":
         return b.createdAt.localeCompare(a.createdAt);
@@ -617,7 +638,7 @@ function sortRuns(runs: Run[], key: SortKey): Run[] {
         return TONE_RANK[facts.get(a.id)!.tone] - TONE_RANK[facts.get(b.id)!.tone];
       case "progress": {
         // Share of the line covered, so runs of an edited playbook with more or fewer steps compare fairly.
-        const share = (run: Run) => facts.get(run.id)!.position / Math.max(1, mainSteps(run).length);
+        const share = (run: RunSummary) => facts.get(run.id)!.position / Math.max(1, mainSteps(run).length);
         return share(b) - share(a);
       }
       default:
@@ -696,10 +717,10 @@ function PlaybookGroup(props: {
   zIndex: number;
   theme: Theme;
   compact: boolean;
-  runs: Run[];
+  runs: RunSummary[];
   /** A singleton's active pipeline: shown as its stations, its trains as the rows. */
-  pipeline?: Run | undefined;
-  allRuns: Run[];
+  pipeline?: RunSummary | undefined;
+  allRuns: RunSummary[];
   names: Map<string, string>;
   onOpenWorkspace?: (workspaceId: string) => void;
   onOpenAgent?: (agentId: string) => void;
@@ -805,7 +826,7 @@ function StepLabels(props: { theme: Theme; columns: string[] }) {
 
 function RunRow(props: {
   theme: Theme;
-  run: Run;
+  run: RunSummary;
   first: boolean;
   compact: boolean;
   workspace: string;
@@ -906,7 +927,7 @@ const ACTIONS_WIDTH = 90;
 /** Open the run's Playbook Manager and its workspace, or archive a finished run: the right-hand buttons of a run or Needs you row. */
 function RunActions(props: {
   theme: Theme;
-  run: Run;
+  run: RunSummary;
   workspace: string;
   compact: boolean;
   onOpenAgent?: (agentId: string) => void;

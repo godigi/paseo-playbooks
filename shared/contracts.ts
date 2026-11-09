@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { PlaybookEntrySchema, RunSchema, VarValueSchema } from "./types";
+import { PlaybookEntrySchema, RunSchema, RunSummarySchema, VarValueSchema } from "./types";
 
 export const listPlaybooks = defineRpc({
   name: "playbooks.list",
@@ -128,11 +128,22 @@ export const restartRunRpc = defineRpc({
   output: z.object({ status: z.string() }),
 });
 
-/** For the Playbooks screen: the runs of every workspace on this host that are not archived, whatever their status. */
+/**
+ * For the Playbooks screen: a summary of the runs of every workspace on this host that are not
+ * archived, whatever their status. `version` identifies the list; send it back as `since` and,
+ * when nothing changed, `runs` comes back null instead of the list.
+ */
 export const overviewStateRpc = defineRpc({
   name: "overview.state",
-  input: z.object({}),
-  output: z.object({ runs: z.array(RunSchema) }),
+  input: z.object({ since: z.string().nullable().default(null) }),
+  output: z.object({ version: z.string(), runs: z.array(RunSummarySchema).nullable() }),
+});
+
+/** One run in full (steps, attempts, history), for what the summaries leave out: a gate's choices. */
+export const getRunRpc = defineRpc({
+  name: "runs.get",
+  input: z.object({ runId: z.string() }),
+  output: z.object({ run: RunSchema.nullable() }),
 });
 
 /** Marks a finished run as seen (opened from the Playbooks screen). */

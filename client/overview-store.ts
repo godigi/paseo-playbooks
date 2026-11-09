@@ -1,11 +1,14 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { useSyncExternalStore } from "react";
 import { needsYouRpc, overviewStateRpc } from "../shared/contracts";
-import type { Run } from "../shared/types";
+import type { RunSummary } from "../shared/types";
 import { watchAgents } from "./events";
 
-/** Agent events across every workspace are batched over this long before one refresh. */
-const EVENTS_BATCH_MS = 1_000;
+/**
+ * Agent events across every workspace are batched over this long before one refresh. Most events
+ * (tokens, tool calls) do not change the run list: the refresh then costs a version check only.
+ */
+const EVENTS_BATCH_MS = 3_000;
 /** Fallback refresh, for changes with no agent activity (a step timeout firing on the daemon). */
 const FALLBACK_MS = 60_000;
 
@@ -13,7 +16,7 @@ export interface OverviewSnapshot {
   /** Gates waiting for a human on this host: the sidebar badge. */
   count: number;
   /** Runs not archived, while a Playbooks screen is open; null before the first load or when none is. */
-  runs: Run[] | null;
+  runs: RunSummary[] | null;
   error: string | null;
 }
 
@@ -37,6 +40,8 @@ export function createOverviewStore(client: PluginClientContext): OverviewStore 
   let screens = 0;
   let inFlight = false;
   let again = false;
+  /** Version of the runs held, sent back so the server skips the list when it is unchanged. */
+  let version: string | null = null;
   let stop: (() => void) | null = null;
 
   const set = (next: Partial<OverviewSnapshot>) => {
@@ -53,15 +58,19 @@ export function createOverviewStore(client: PluginClientContext): OverviewStore 
     inFlight = true;
     const withRuns = screens > 0;
     const request = withRuns
-      ? client.rpc(overviewStateRpc, {}).then(({ runs }) => ({
-          runs,
-          count: runs.reduce((count, run) => count + run.gates.filter((gate) => gate.status === "pending").length, 0),
-        }))
+      ? client.rpc(overviewStateRpc, { since: snapshot.runs ? version : null }).then((state) => {
+          version = state.version;
+          // Unchanged: keep what we hold.
+          if (state.runs === null) return {};
+          return { runs: state.runs, count: state.runs.reduce((count, run) => count + run.gates.length, 0) };
+        })
       : client.rpc(needsYouRpc, {}).then(({ count }) => ({ count }));
     void request
       .then((result) => {
+        if (!stop) return;
         // A screen that closed meanwhile does not get its runs back.
-        if (stop) set({ ...result, ...(withRuns && screens === 0 ? { runs: null } : {}), error: null });
+        if (withRuns && screens === 0) version = null;
+        set({ ...result, ...(withRuns && screens === 0 ? { runs: null } : {}), error: null });
       })
       .catch((error: unknown) => {
         console.error("[playbooks] overview refresh failed", error);
@@ -106,7 +115,10 @@ export function createOverviewStore(client: PluginClientContext): OverviewStore 
       refresh();
       return () => {
         screens -= 1;
-        if (screens === 0) set({ runs: null });
+        if (screens === 0) {
+          version = null;
+          set({ runs: null });
+        }
       };
     },
     refresh,
