@@ -10,6 +10,7 @@ import {
   pauseRunRpc,
   resumeRunRpc,
   decideGateRpc,
+  getRunRpc,
   headerStateRpc,
   needsYouRpc,
   overviewStateRpc,
@@ -23,6 +24,8 @@ import {
   startAfterTaskRpc,
   startRun,
 } from "./shared/contracts";
+import { createHash } from "node:crypto";
+import { summarizeRun } from "./shared/summary";
 import { hasPlaybooks, loadPlaybooks } from "./server/loader";
 import { GATE_LABEL, Runtime, STEP_LABEL, UserError } from "./server/runtime";
 import { defaultRunsDir, RunStore } from "./server/store";
@@ -119,7 +122,16 @@ export default function contribute(server: PluginServerContext) {
       .map((run) => run.workspaceId);
     return { withPlaybooks, waiting: [...new Set(waiting)] };
   });
-  handle(overviewStateRpc, async () => ({ runs: store.list().filter((run) => !run.archivedAt) }));
+  handle(overviewStateRpc, async ({ since }) => {
+    const runs = store
+      .list()
+      .filter((run) => !run.archivedAt)
+      .map(summarizeRun);
+    // The version is a hash of the summaries: the same list, the same version, whatever bumped the runs.
+    const version = createHash("sha1").update(JSON.stringify(runs)).digest("hex").slice(0, 16);
+    return { version, runs: since === version ? null : runs };
+  });
+  handle(getRunRpc, async ({ runId }) => ({ run: store.get(runId) ?? null }));
   handle(markRunSeenRpc, async ({ runId }) => ({ seenAt: await runtime.markSeen(runId) }));
   handle(needsYouRpc, async () => ({
     count: store.list().reduce((count, run) => count + (run.archivedAt ? 0 : run.gates.filter(waitsForHuman).length), 0),

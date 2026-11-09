@@ -1,15 +1,15 @@
 import { Fragment } from "react";
 import { Pressable, Text, View } from "react-native";
-import { isTerminal, type Run } from "../shared/types";
+import { isTerminal, type RunSummary } from "../shared/types";
 import type { Theme } from "./theme";
 
 /** The trains of a pipeline, newest first. */
-export function trainsOf(pipeline: Run, runs: readonly Run[]): Run[] {
+export function trainsOf(pipeline: RunSummary, runs: readonly RunSummary[]): RunSummary[] {
   return runs.filter((run) => run.train?.pipelineId === pipeline.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 /** A train's name, from its station: "Dev train". */
-export function trainName(run: Run): string {
+export function trainName(run: { playbook: { title: string }; train: { station: string } | null }): string {
   const title = run.playbook.title;
   const cut = title.lastIndexOf(" · ");
   return `${cut === -1 ? (run.train?.station ?? title) : title.slice(cut + 3)} train`;
@@ -21,7 +21,7 @@ function jobsLabel(count: number): string {
 }
 
 /** Jobs not ended yet, on a pipeline: "1 job", "3 jobs". */
-export function openJobsLabel(pipeline: Run): string {
+export function openJobsLabel(pipeline: { jobs: ReadonlyArray<{ status: string }> }): string {
   return jobsLabel(pipeline.jobs.filter((job) => job.status === "open").length);
 }
 
@@ -29,9 +29,9 @@ export function openJobsLabel(pipeline: Run): string {
  * A singleton pipeline's stations, in `needs` order: each one's waiting list (the jobs waiting
  * there, oldest first) and its current train.
  */
-export function Stations(props: { theme: Theme; pipeline: Run; runs: readonly Run[]; onOpenTrain?: (run: Run) => void }) {
+export function Stations(props: { theme: Theme; pipeline: RunSummary; runs: readonly RunSummary[]; onOpenTrain?: (run: RunSummary) => void }) {
   const { theme, pipeline } = props;
-  const stations = pipeline.playbook.singleton?.stations ?? [];
+  const stations = pipeline.playbook.stations ?? [];
   const trains = trainsOf(pipeline, props.runs);
   return (
     // The stations share the row's width, with an arrow between each one and the next.

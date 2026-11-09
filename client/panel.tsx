@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Pressable, Text, View } from "react-native";
 import { archiveRunRpc, cancelRunRpc, listPlaybooks, listRuns, pauseRunRpc, resumeRunRpc } from "../shared/contracts";
+import { summarizeRun } from "../shared/summary";
 import { isActive, isPaused, isPipeline, isTerminal, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
 import { useAgentEvents } from "./events";
 import { Graph, useReduceMotion } from "./graph";
@@ -248,7 +249,7 @@ function PlaybookCard(props: {
               onOpenManager={() => undefined}
             />
           </View>
-          <Stations theme={theme} pipeline={pipeline} runs={card.runs} onOpenTrain={(train) => setSelected(train.id)} />
+          <Stations theme={theme} pipeline={summarizeRun(pipeline)} runs={card.runs.map(summarizeRun)} onOpenTrain={(train) => setSelected(train.id)} />
         </View>
       ) : null}
       {expanded && (tabs.length > 0 || pipeline) ? (
