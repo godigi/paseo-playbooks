@@ -138,7 +138,7 @@ export default function contribute(server: PluginServerContext) {
   );
 
   handle(listPlaybooks, async ({ workspaceId }) => {
-    const workspace = await runtime.lookupWorkspace(workspaceId);
+    const workspace = await runtime.peekWorkspace(workspaceId);
     if (!workspace) throw new UserError("workspace not found");
     const loaded = await loadPlaybooks(workspace.workspaceDirectory ?? workspace.projectRootPath, { projectId: workspace.projectId });
     // The profiles on offer come from the project's main checkout, the same for every workspace of the project.
@@ -150,7 +150,7 @@ export default function contribute(server: PluginServerContext) {
     const projects = new Map<string, { projectId: string; label: string; root: string }>();
     for (const { projectId, workspaceId } of workspaces) {
       if (projects.has(projectId)) continue;
-      const workspace = await runtime.lookupWorkspace(workspaceId).catch(() => null);
+      const workspace = await runtime.peekWorkspace(workspaceId).catch(() => null);
       if (workspace) projects.set(projectId, { projectId, label: workspace.projectDisplayName || path.basename(workspace.projectRootPath), root: workspace.projectRootPath });
     }
     return { projects: await Promise.all([...projects.values()].map(async ({ projectId, label, root }) => ({ projectId, label, ...(await projectProfiles(root, projectId)) }))) };
@@ -172,7 +172,7 @@ export default function contribute(server: PluginServerContext) {
   const withPlaybooksOf = async (workspaceIds: string[]) => {
     const withPlaybooks: string[] = [];
     for (const workspaceId of workspaceIds) {
-      const workspace = await runtime.lookupWorkspace(workspaceId).catch(() => null);
+      const workspace = await runtime.peekWorkspace(workspaceId).catch(() => null);
       const dir = workspace?.workspaceDirectory ?? workspace?.projectRootPath;
       if (dir && (await hasPlaybooks(dir))) withPlaybooks.push(workspaceId);
     }

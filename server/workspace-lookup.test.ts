@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type * as Lookup from "./workspace-lookup";
 
 // The setup file replaces the module for the other tests; this one tests the real thing.
-const { fetchAllWorkspaces, WorkspaceLookup } = await vi.importActual<typeof Lookup>("./workspace-lookup");
+const { fetchAllWorkspaces, WorkspaceLookup, BACKGROUND_UNSUPPORTED } = await vi.importActual<typeof Lookup>("./workspace-lookup");
 type WorkspaceInfo = Lookup.WorkspaceInfo;
 
 const ws = (id: string) => ({ id, projectId: "p", projectRootPath: "/p" }) as unknown as WorkspaceInfo;
@@ -53,6 +53,26 @@ describe("WorkspaceLookup", () => {
     expect(fetchAll).toHaveBeenCalledTimes(3);
   });
 
+  it("a throttled miss is uncertain: a confirmed lookup fetches fresh and finds a workspace restored without an event", async () => {
+    const { lookup, fetchAll, set } = setup(["a"]);
+    await lookup.get("a");
+    set(["a", "c"]);
+    expect(await lookup.get("c")).toBeNull();
+    expect(fetchAll).toHaveBeenCalledTimes(1);
+    expect((await lookup.get("c", { confirm: true }))?.id).toBe("c");
+    expect(fetchAll).toHaveBeenCalledTimes(2);
+    // Confirmed absence is a fresh fetch's answer.
+    expect(await lookup.get("zzz", { confirm: true })).toBeNull();
+    expect(fetchAll).toHaveBeenCalledTimes(3);
+  });
+
+  it("a confirmed hit costs no fetch", async () => {
+    const { lookup, fetchAll } = setup(["a"]);
+    await lookup.get("a");
+    expect((await lookup.get("a", { confirm: true }))?.id).toBe("a");
+    expect(fetchAll).toHaveBeenCalledTimes(1);
+  });
+
   it("invalidate (create, archive) makes the next lookup fetch again", async () => {
     const { lookup, fetchAll, set } = setup();
     expect((await lookup.get("a"))?.id).toBe("a");
@@ -97,11 +117,21 @@ describe("fetchAllWorkspaces", () => {
     expect(list.mock.calls[0]![0]).toMatchObject({ filter: { includeBackground: true } });
   });
 
-  it("falls back to the plain list when the daemon rejects the background filter", async () => {
+  it("falls back to the plain list only when the client says the host has no background workspaces", async () => {
     const list = vi.fn(async (options: { filter?: unknown }) => {
-      if (options.filter) throw new Error("unsupported");
+      if (options.filter) throw new Error(BACKGROUND_UNSUPPORTED);
       return { entries: [ws("a")], pageInfo: { nextCursor: null } };
     });
     expect((await fetchAllWorkspaces({ workspaces: { list } } as never)).map((w) => w.id)).toEqual(["a"]);
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates an operational failure (timeout, network) instead of retrying without the background workspaces", async () => {
+    const list = vi.fn(async (options: { filter?: unknown }) => {
+      if (options.filter) throw new Error("Timed out waiting for fetch_workspaces_response");
+      return { entries: [ws("visible")], pageInfo: { nextCursor: null } };
+    });
+    await expect(fetchAllWorkspaces({ workspaces: { list } } as never)).rejects.toThrow(/Timed out/);
+    expect(list).toHaveBeenCalledTimes(1);
   });
 });

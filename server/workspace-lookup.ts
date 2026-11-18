@@ -17,6 +17,13 @@ export const WORKSPACE_TTL_MS = 15_000;
 export const WORKSPACE_MISS_REFETCH_MS = 3_000;
 const PAGE_SIZE = 200;
 
+/**
+ * What `@getpaseo/client` throws, before sending anything, when asked for background workspaces of a host that lacks
+ * them (`requireBackgroundWorkspaces` in daemon-client.js; the SDK's own `ref().refresh()` checks
+ * `supportsBackgroundWorkspaces()` for the same condition). The only error that permits the unfiltered request.
+ */
+export const BACKGROUND_UNSUPPORTED = "Update the host to use background workspaces.";
+
 /** Every workspace the daemon lists, background ones included when the daemon supports them (as `ref().refresh()` does). */
 export async function fetchAllWorkspaces(paseo: PaseoApi): Promise<WorkspaceInfo[]> {
   const listAll = async (filter: { includeBackground: true } | undefined) => {
@@ -29,8 +36,12 @@ export async function fetchAllWorkspaces(paseo: PaseoApi): Promise<WorkspaceInfo
     } while (cursor);
     return all;
   };
-  // A daemon without background workspaces may reject the filter.
-  return listAll({ includeBackground: true }).catch(() => listAll(undefined));
+  // Only a host that positively lacks background workspaces gets the plain list. Any other failure (timeout, network)
+  // propagates: the plain list omits hidden Sidekick workspaces, and a partial list must never stand for the whole.
+  return listAll({ includeBackground: true }).catch((error: unknown) => {
+    if (error instanceof Error && error.message === BACKGROUND_UNSUPPORTED) return listAll(undefined);
+    throw error;
+  });
 }
 
 export class WorkspaceLookup {
@@ -48,8 +59,12 @@ export class WorkspaceLookup {
     return (this.options.now ?? Date.now)();
   }
 
-  /** The workspace, or null when the daemon does not list it. Rejects when the daemon cannot be asked. */
-  async get(id: string): Promise<WorkspaceInfo | null> {
+  /**
+   * The workspace, or null when it is not listed. Rejects when the daemon cannot be asked.
+   * Without `confirm`, a null may be a throttled miss (the cached list is younger than `missRefetchMs`): fine for hot,
+   * non-critical paths. With `confirm`, a null always comes from a fresh fetch, so it is safe to act on as "does not exist".
+   */
+  async get(id: string, options: { confirm?: boolean } = {}): Promise<WorkspaceInfo | null> {
     const ttl = this.options.ttlMs ?? WORKSPACE_TTL_MS;
     const missGap = this.options.missRefetchMs ?? WORKSPACE_MISS_REFETCH_MS;
     const cached = this.cache;
@@ -57,7 +72,7 @@ export class WorkspaceLookup {
       const hit = cached.byId.get(id);
       if (hit) return hit;
       // Not listed: maybe created since. Look again, but not on every miss.
-      if (this.now() - cached.at < missGap) return null;
+      if (!options.confirm && this.now() - cached.at < missGap) return null;
     }
     return (await this.load()).get(id) ?? null;
   }

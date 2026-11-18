@@ -29,3 +29,13 @@ A workspace's descriptor can be up to 15 s old (title, branch, directory). The f
 (`projectId`, `projectRootPath`, `workspaceDirectory`, `projectDisplayName`) do not change for a workspace's life.
 A workspace archived by something other than the plugin is dropped from the cache by the `workspace.archived` event.
 The plugin has no workspace rename call; if one is added, invalidate after it.
+
+## Review amendments (godigi.2)
+
+- The background-workspace filter falls back to the plain list only on the client's own "Update the host to use
+  background workspaces." error (the host lacks the feature). Every other failure propagates and nothing is cached:
+  the plain list omits hidden Sidekick workspaces, and a partial list had let the cross-project guard be skipped.
+- A throttled miss is uncertain, not "does not exist". `lookupWorkspace` (start, restart, "gone" reports, auto-archive,
+  Sidekick reuse) confirms a miss with a fresh fetch; `peekWorkspace` keeps the 3 s throttle for hot panel reads. A hit
+  is never refetched, so the flood fix is unchanged.
+- `startPlaybookInWorkspace` fails closed when the caller's own workspace/project cannot be determined.

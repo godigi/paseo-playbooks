@@ -3511,8 +3511,13 @@ export class Runtime {
     return { run: this.store.get(runId)!, newManager: replacement !== null || (takeOver !== undefined && takeOver.id !== run.managerAgentId) };
   }
 
-  /** The workspace from the shared lookup (one cached list for every id), or null when the daemon does not list it. Rejects when the daemon cannot be asked, as `ref().refresh()` did. */
+  /** The workspace from the shared lookup (one cached list for every id), or null when a fresh list does not have it: safe to act on as "gone". Rejects when the daemon cannot be asked, as `ref().refresh()` did. */
   lookupWorkspace(workspaceId: string) {
+    return this.workspaces.get(workspaceId, { confirm: true });
+  }
+
+  /** Like `lookupWorkspace`, but a miss inside the miss-refetch gap is null without asking the daemon (it may be uncertain): for hot, non-critical reads only. */
+  peekWorkspace(workspaceId: string) {
     return this.workspaces.get(workspaceId);
   }
 
@@ -3539,9 +3544,9 @@ export class Runtime {
     this.workspaces.invalidate();
   }
 
-  /** The workspace, or null when it no longer exists. */
+  /** The workspace, or null when a fresh list does not have it. Rejects when the daemon cannot be asked: that is not "gone". */
   private async workspaceOf(workspaceId: string) {
-    return (await this.lookupWorkspace(workspaceId).catch(() => null)) ?? null;
+    return (await this.lookupWorkspace(workspaceId)) ?? null;
   }
 
   /** A new Playbook Manager in the run's workspace, created without a prompt so it cannot look for the run before the run is its own. */
@@ -4083,7 +4088,8 @@ export class Runtime {
   private async archiveCause(agentId: string, parentAgentId: string | null, workspaceId: string): Promise<string> {
     const parts = [`manager ${agentId} was archived; the host does not say by whom (an agent, the UI, a workspace archive or a cleanup)`];
     if (parentAgentId) parts.push(`its parent ${parentAgentId} is ${(await this.archivedWithParent(parentAgentId)) ? "archived too" : "still active"}`);
-    parts.push(`workspace ${workspaceId} ${(await this.workspaceOf(workspaceId)) ? "still exists" : "is gone"}`);
+    const origin = await this.workspaceOf(workspaceId).then((found) => (found ? "still exists" : "is gone"), () => "could not be checked");
+    parts.push(`workspace ${workspaceId} ${origin}`);
     const now = Date.now();
     const together = this.recentArchives.filter((entry) => entry.id !== agentId && now - entry.at < 2000 && this.runsOfManager(entry.id).length > 0).map((entry) => entry.id);
     if (together.length > 0) parts.push(`other managers archived within 2 s: ${together.join(", ")} (one batch, probably one source)`);
@@ -4356,8 +4362,11 @@ export class Runtime {
     if (!input.newWorkspace && !(await this.isIsolatedPlaybook(baseId, input.playbook))) throw new UserError(`"${input.playbook}" has no \`isolation: { mode: worktree }\`: it starts in a new workspace, never in an existing one`);
     const workspace = await this.lookupWorkspace(baseId);
     if (!workspace) throw new UserError(isSidekick && !input.workspaceId ? "the Sidekick's own workspace is gone, so there is no project root to branch the new workspace off: pass workspaceId (list_workspaces)" : `workspace "${baseId}" not found (list_workspaces lists them)`);
-    const callerProject = await this.projectIdOf(caller.workspaceId);
-    if (callerProject && workspace.projectId !== callerProject) throw new UserError("that workspace belongs to another project");
+    // Fail closed: when the caller's project cannot be determined, nothing says the workspace is the caller's own.
+    if (!caller.workspaceId) throw new UserError("cannot check that workspace against the caller's project: the caller has no workspace");
+    const callerProject = (await this.lookupWorkspace(caller.workspaceId))?.projectId;
+    if (!callerProject) throw new UserError("cannot check that workspace against the caller's project: the caller's own workspace is not listed (list_workspaces)");
+    if (workspace.projectId !== callerProject) throw new UserError("that workspace belongs to another project");
     const started = await this.startFromPanel({ workspaceId: workspace.id, playbook: input.playbook, inputs: input.inputs, force: false, sameWorkspace: !input.newWorkspace, autoStart: input.autoStart !== false, workspaceName: input.workspaceName });
     if (started.status === "duplicate") throw new UserError(`${started.message} Not started again.`);
     return started;
