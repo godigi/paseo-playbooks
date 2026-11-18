@@ -44,7 +44,8 @@ function WaitingIcon(props: PluginButtonIconProps) {
  * Playbooks tab and shows a dot while a run there waits for a gate decision.
  */
 export function contributeHeaderButtons(client: PluginClientContext): () => void {
-  const buttons = new Map<string, { registration: PluginButtonRegistration; visible: boolean; waiting: boolean }>();
+  type Button = { registration: PluginButtonRegistration; visible: boolean; waiting: boolean };
+  const buttons = new Map<string, Button>();
   const lifetime = new AbortController();
 
   const add = (workspaceId: string) => {
@@ -79,12 +80,12 @@ export function contributeHeaderButtons(client: PluginClientContext): () => void
   let refreshAll = false;
   let batchTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const apply = (queried: string[], state: { withPlaybooks: string[]; waiting: string[] }) => {
+  const apply = (queried: Map<string, Button>, state: { withPlaybooks: string[]; waiting: string[] }) => {
     const withPlaybooks = new Set(state.withPlaybooks);
     const waiting = new Set(state.waiting);
-    for (const workspaceId of queried) {
-      const button = buttons.get(workspaceId);
-      if (!button) continue;
+    for (const [workspaceId, button] of queried) {
+      // A workspace removed and added again meanwhile is a new button: this answer is about the old one.
+      if (buttons.get(workspaceId) !== button) continue;
       const visible = withPlaybooks.has(workspaceId);
       const isWaiting = waiting.has(workspaceId);
       if (visible === button.visible && isWaiting === button.waiting) continue;
@@ -97,17 +98,20 @@ export function contributeHeaderButtons(client: PluginClientContext): () => void
   /** One request at a time: asks about every workspace when `refreshAll`, else only the unknown ones. */
   const flush = async () => {
     if (lifetime.signal.aborted || buttons.size === 0) return;
+    // A background tab keeps what it wants to know and asks when it shows again.
+    if (isHidden()) return;
     if (inFlight) {
       again = true;
       return;
     }
-    const queried = refreshAll ? [...buttons.keys()] : [...unknown].filter((id) => buttons.has(id));
+    const ids = refreshAll ? [...buttons.keys()] : [...unknown].filter((id) => buttons.has(id));
     refreshAll = false;
     unknown.clear();
-    if (queried.length === 0) return;
+    if (ids.length === 0) return;
+    const queried = new Map(ids.map((id) => [id, buttons.get(id)!] as const));
     inFlight = true;
     try {
-      apply(queried, await client.rpc(headerStateRpc, { workspaceIds: queried }));
+      apply(queried, await client.rpc(headerStateRpc, { workspaceIds: ids }));
     } catch (error) {
       if (!lifetime.signal.aborted) console.error("[playbooks] header state failed", error);
     } finally {

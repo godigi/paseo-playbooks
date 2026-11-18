@@ -91,6 +91,8 @@ describe("overview store", () => {
       expect(calls).toHaveLength(2);
       for (const listener of listeners) listener();
       expect(calls).toHaveLength(2);
+      store.dispose();
+      expect(listeners.size).toBe(0);
     } finally {
       vi.unstubAllGlobals();
     }

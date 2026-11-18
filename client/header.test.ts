@@ -129,4 +129,48 @@ describe("header buttons", () => {
     expect(requests).toEqual([["a", "b"]]);
     stop();
   });
+
+  it("keeps the pending question while the tab turns hidden, and sends it when the tab shows again", async () => {
+    const { client, requests, handlers } = fakeClient();
+    let state = "visible";
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("document", {
+      get visibilityState() {
+        return state;
+      },
+      addEventListener: (_: string, l: () => void) => listeners.add(l),
+      removeEventListener: (_: string, l: () => void) => listeners.delete(l),
+    });
+    const stop = contributeHeaderButtons(client);
+    await vi.advanceTimersByTimeAsync(0);
+    handlers().snapshot({ entries: [{ id: "a" }] });
+    state = "hidden";
+    await vi.advanceTimersByTimeAsync(400);
+    expect(requests).toHaveLength(0);
+    state = "visible";
+    for (const listener of listeners) listener();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(requests).toEqual([["a"]]);
+    stop();
+  });
+
+  it("ignores an answer about a workspace that was removed and added again meanwhile", async () => {
+    const { client, updates, handlers } = fakeClient();
+    const resolvers: Array<(value: unknown) => void> = [];
+    (client as unknown as { rpc: unknown }).rpc = () => new Promise((resolve) => resolvers.push(resolve));
+    const stop = contributeHeaderButtons(client);
+    await vi.advanceTimersByTimeAsync(0);
+    handlers().snapshot({ entries: [{ id: "a" }] });
+    await vi.advanceTimersByTimeAsync(400);
+    handlers().snapshot({ entries: [] });
+    handlers().snapshot({ entries: [{ id: "a" }] });
+    resolvers[0]!({ withPlaybooks: ["a"], waiting: ["a"] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updates).toEqual([]);
+    await vi.advanceTimersByTimeAsync(400);
+    resolvers[1]!({ withPlaybooks: ["a"], waiting: [] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updates).toEqual([expect.objectContaining({ id: "a", visible: true })]);
+    stop();
+  });
 });
