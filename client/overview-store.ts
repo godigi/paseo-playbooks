@@ -4,6 +4,7 @@ import { needsYouRpc, overviewStateRpc } from "../shared/contracts";
 import { waitsForHuman } from "../shared/gates";
 import type { RunSummary } from "../shared/types";
 import { watchAgents } from "./events";
+import { isHidden, onVisible } from "./visibility";
 
 /** Agent events across every workspace are batched over this long before one refresh. */
 const EVENTS_BATCH_MS = 1_000;
@@ -38,6 +39,8 @@ export function createOverviewStore(client: PluginClientContext): OverviewStore 
   let screens = 0;
   let inFlight = false;
   let again = false;
+  /** A refresh was skipped while the page was in the background; the page shows again, it runs. */
+  let missed = false;
   let stop: (() => void) | null = null;
 
   const set = (next: Partial<OverviewSnapshot>) => {
@@ -47,6 +50,11 @@ export function createOverviewStore(client: PluginClientContext): OverviewStore 
 
   const refresh = () => {
     if (!stop) return;
+    // A background tab still receives every agent event; it refreshes once when it shows again.
+    if (isHidden()) {
+      missed = true;
+      return;
+    }
     if (inFlight) {
       again = true;
       return;
@@ -81,9 +89,15 @@ export function createOverviewStore(client: PluginClientContext): OverviewStore 
   const start = () => {
     const unwatch = watchAgents(client.paseo, null, refresh, EVENTS_BATCH_MS);
     const timer = setInterval(refresh, FALLBACK_MS);
+    const unwatchVisible = onVisible(() => {
+      if (!missed) return;
+      missed = false;
+      refresh();
+    });
     stop = () => {
       unwatch();
       clearInterval(timer);
+      unwatchVisible();
     };
     refresh();
   };
