@@ -2,11 +2,18 @@ import type { PluginButtonIconProps, PluginButtonRegistration, PluginClientConte
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { View } from "react-native";
 import { headerStateRpc } from "../shared/contracts";
+import { isHidden, onVisible } from "./visibility";
 
 const TITLE = "Playbooks";
 const WAITING_TITLE = "Playbooks: a run is waiting for your decision";
 /** How often the buttons refresh which workspaces have playbooks or a waiting gate. */
 const POLL_MS = 10_000;
+/**
+ * Workspace events arrive in a burst (a fresh connection upserts every workspace, and a git
+ * refresh on the host follows each one), so new workspaces wait this long and are asked about in
+ * one request.
+ */
+const NEW_WORKSPACES_BATCH_MS = 300;
 
 /** The Playbooks icon with a dot in the theme's warning colour: a run waits for a decision. */
 function WaitingIcon(props: PluginButtonIconProps) {
@@ -58,29 +65,69 @@ export function contributeHeaderButtons(client: PluginClientContext): () => void
       },
     });
     buttons.set(workspaceId, { registration, visible: false, waiting: false });
+    unknown.add(workspaceId);
   };
   const drop = (workspaceId: string) => {
     buttons.get(workspaceId)?.registration.remove();
     buttons.delete(workspaceId);
   };
 
-  const refresh = async () => {
+  /** Workspaces whose state is not known yet: the next request asks about these only. */
+  const unknown = new Set<string>();
+  let inFlight = false;
+  let again = false;
+  let refreshAll = false;
+  let batchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const apply = (queried: string[], state: { withPlaybooks: string[]; waiting: string[] }) => {
+    const withPlaybooks = new Set(state.withPlaybooks);
+    const waiting = new Set(state.waiting);
+    for (const workspaceId of queried) {
+      const button = buttons.get(workspaceId);
+      if (!button) continue;
+      const visible = withPlaybooks.has(workspaceId);
+      const isWaiting = waiting.has(workspaceId);
+      if (visible === button.visible && isWaiting === button.waiting) continue;
+      button.registration.update({ visible, icon: isWaiting ? WaitingIcon : "Workflow", title: isWaiting ? WAITING_TITLE : TITLE });
+      button.visible = visible;
+      button.waiting = isWaiting;
+    }
+  };
+
+  /** One request at a time: asks about every workspace when `refreshAll`, else only the unknown ones. */
+  const flush = async () => {
     if (lifetime.signal.aborted || buttons.size === 0) return;
+    if (inFlight) {
+      again = true;
+      return;
+    }
+    const queried = refreshAll ? [...buttons.keys()] : [...unknown].filter((id) => buttons.has(id));
+    refreshAll = false;
+    unknown.clear();
+    if (queried.length === 0) return;
+    inFlight = true;
     try {
-      const state = await client.rpc(headerStateRpc, { workspaceIds: [...buttons.keys()] });
-      const withPlaybooks = new Set(state.withPlaybooks);
-      const waiting = new Set(state.waiting);
-      for (const [workspaceId, button] of buttons) {
-        const visible = withPlaybooks.has(workspaceId);
-        const isWaiting = waiting.has(workspaceId);
-        if (visible === button.visible && isWaiting === button.waiting) continue;
-        button.registration.update({ visible, icon: isWaiting ? WaitingIcon : "Workflow", title: isWaiting ? WAITING_TITLE : TITLE });
-        button.visible = visible;
-        button.waiting = isWaiting;
-      }
+      apply(queried, await client.rpc(headerStateRpc, { workspaceIds: queried }));
     } catch (error) {
       if (!lifetime.signal.aborted) console.error("[playbooks] header state failed", error);
+    } finally {
+      inFlight = false;
+      if (again) {
+        again = false;
+        void flush();
+      }
     }
+  };
+
+  /** Sends one request after the burst of workspace events settles: all workspaces with `all`, else the unknown ones. */
+  const refresh = (all: boolean) => {
+    if (all) refreshAll = true;
+    else if (unknown.size === 0) return;
+    if (batchTimer !== null) return;
+    batchTimer = setTimeout(() => {
+      batchTimer = null;
+      void flush();
+    }, NEW_WORKSPACES_BATCH_MS);
   };
 
   // An owned list subscription delivers existing workspaces, then updates, and a fresh snapshot after a reconnect.
@@ -93,14 +140,16 @@ export function contributeHeaderButtons(client: PluginClientContext): () => void
           const ids = new Set(entries.map((workspace) => workspace.id));
           for (const workspaceId of [...buttons.keys()]) if (!ids.has(workspaceId)) drop(workspaceId);
           for (const id of ids) add(id);
-          void refresh();
+          // A reconnect's snapshot lists workspaces already known: only the new ones need a request.
+          refresh(false);
         },
         update: (message) => {
           if (message.type !== "workspace_update") return;
           const update = message.payload;
           if (update.kind === "upsert") {
+            // An upsert of a known workspace (a git or agent change) leaves what the button shows to the poll.
             add(update.workspace.id);
-            void refresh();
+            refresh(false);
           } else {
             drop(update.id);
           }
@@ -116,10 +165,16 @@ export function contributeHeaderButtons(client: PluginClientContext): () => void
       if (!lifetime.signal.aborted) console.error("[playbooks] workspace observation failed", error);
     });
 
-  const timer = setInterval(() => void refresh(), POLL_MS);
+  // The poll keeps the waiting dots fresh; a background tab skips it and catches up when it shows again.
+  const timer = setInterval(() => {
+    if (!isHidden()) refresh(true);
+  }, POLL_MS);
+  const stopVisible = onVisible(() => refresh(true));
   return () => {
     lifetime.abort();
     clearInterval(timer);
+    stopVisible();
+    if (batchTimer !== null) clearTimeout(batchTimer);
     for (const workspaceId of [...buttons.keys()]) drop(workspaceId);
   };
 }

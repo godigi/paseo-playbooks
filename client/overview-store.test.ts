@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { createOverviewStore } from "./overview-store";
 
@@ -64,5 +64,35 @@ describe("overview store", () => {
     calls[1]!.resolve({ runs: [{ id: "r", gates: [gate(null), gate("needs a human")] }] });
     await tick();
     expect(store.get().count).toBe(1);
+  });
+
+  it("does not refresh while the tab is in the background, and catches up once when it shows again", async () => {
+    let state = "visible";
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("document", {
+      get visibilityState() {
+        return state;
+      },
+      addEventListener: (_: string, l: () => void) => listeners.add(l),
+      removeEventListener: (_: string, l: () => void) => listeners.delete(l),
+    });
+    try {
+      const { client, calls } = fakeClient();
+      const store = createOverviewStore(client);
+      store.subscribe(() => undefined);
+      calls[0]!.resolve({ count: 0 });
+      await tick();
+      state = "hidden";
+      store.refresh();
+      store.refresh();
+      expect(calls).toHaveLength(1);
+      state = "visible";
+      for (const listener of listeners) listener();
+      expect(calls).toHaveLength(2);
+      for (const listener of listeners) listener();
+      expect(calls).toHaveLength(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
