@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by 2026-11-19-codex-question-clarifications.md
 
 ## Context
 
