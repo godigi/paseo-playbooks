@@ -136,6 +136,29 @@ describe("dynamic capacity from quota headroom", () => {
     expect(await internals.rateCheck(store.get("r0")!, "r0/b", true, "b")).toMatchObject({ kind: "quota", provider: "claude" });
   });
 
+  it("pauses an admitted run between steps when the pace no longer fits it, never a running step, and resumes it when capacity returns", async () => {
+    const { runtime, store, internals, usage, read } = await setup(pacing("playbook"), { current: claude(10) });
+    await read();
+    await runtime.startStep("m", "r0", "a", "go");
+    // Usage jumps ahead of the pace: 28.87 - 25 = 3.87 free, the run still needs 10.
+    usage.current = claude(25);
+    await read();
+    // The jump came from outside the plugin: none of it counts as this run's own use.
+    const inner = runtime as unknown as { reservedQuota: Map<string, { spent: Record<string, number> }>; attemptUse: Map<string, unknown> };
+    for (const entry of inner.reservedQuota.values()) entry.spent = {};
+    inner.attemptUse.clear();
+    // A step is running: it is not interrupted and the run is not paused yet.
+    expect(await internals.rateCheck(store.get("r0")!, "", true)).toBeNull();
+    await store.mutate("r0", (run) => void ((run.steps.a!.status = "completed"), (run.steps.b!.status = "ready")));
+    expect(await internals.rateCheck(store.get("r0")!, "r0/b", true, "b")).toMatchObject({ kind: "pace", position: 1, provider: "claude", window: "weekly" });
+    expect(store.get("r0")!.rateHold).toMatchObject({ kind: "pace" });
+    // The pace relaxes (usage back down): the run resumes by itself.
+    usage.current = claude(5);
+    await read();
+    await internals.releaseHolds();
+    expect(store.get("r0")!.rateHold).toBeNull();
+  });
+
   it("a higher priority goes first (a run's own priority overrides the playbook's); a lower one is held", async () => {
     const { runtime, store, read } = await setup(pacing("playbook"), { current: claude(10) });
     await store.mutate("r1", (run) => void (run.priority = 5));
@@ -197,7 +220,7 @@ describe("dynamic capacity from quota headroom", () => {
     await runtime.startStep("m", "r1", "a", "go");
     expect(store.get("r1")!.rateHold).toBeNull();
     const now = Date.now();
-    for (const id of ["r0", "r1"]) await store.mutate(id, (run) => void ((run.steps.a!.attempts[0]!.endedAt = new Date(now).toISOString()), (run.steps.a!.status = "completed")));
+    for (const id of ["r0", "r1"]) await store.mutate(id, (run) => void (((run.steps.a!.attempts[0]!.startedAt = new Date(now - 30_000).toISOString()), (run.steps.a!.attempts[0]!.endedAt = new Date(now).toISOString())), (run.steps.a!.status = "completed")));
     const window = (used: number) => ({ id: "weekly", label: "weekly", usedPct: used, resetsAt: weekly(0).resetsAt });
     internals.observeUsage([{ provider: "claude", before: { entry: { providerId: "claude", windows: [window(20)] }, at: now - 60_000 }, after: { entry: { providerId: "claude", windows: [window(24)] }, at: now } }]);
     // Two steps shared 4 points: 2 each. From now on the estimate comes from history.
@@ -209,7 +232,7 @@ describe("dynamic capacity from quota headroom", () => {
     await read();
     await runtime.startStep("m", "r0", "a", "go");
     const now = Date.now();
-    await store.mutate("r0", (run) => void ((run.steps.a!.attempts[0]!.endedAt = new Date(now).toISOString()), (run.steps.a!.status = "completed")));
+    await store.mutate("r0", (run) => void (((run.steps.a!.attempts[0]!.startedAt = new Date(now - 30_000).toISOString()), (run.steps.a!.attempts[0]!.endedAt = new Date(now).toISOString())), (run.steps.a!.status = "completed")));
     const window = (used: number) => ({ id: "weekly", label: "weekly", usedPct: used, resetsAt: weekly(0).resetsAt });
     internals.observeUsage([{ provider: "claude", before: { entry: { providerId: "claude", windows: [window(10)] }, at: now - 60_000 }, after: { entry: { providerId: "claude", windows: [window(13)] }, at: now } }]);
     expect(internals.costs.stepCost("work", "claude", "weekly")).toBeCloseTo(3, 1);
