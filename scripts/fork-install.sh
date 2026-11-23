@@ -8,7 +8,7 @@ set -euo pipefail
 DRY=0; if [ "${1:-}" = "--dry-run" ]; then DRY=1; shift; fi
 SHA="${1:?usage: fork-install.sh [--dry-run] <full sha>}"
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full 40-char sha" >&2; exit 2; }
-ID=paseo-playbooks; FORK_REPO=godigi/paseo-playbooks; FORK_URL="https://github.com/$FORK_REPO.git"
+ID=paseo-playbooks; FORK_REPO=godigi/paseo-playbooks; FORK_URL="${FORK_URL:-https://github.com/$FORK_REPO.git}"   # FORK_URL: tests point it at a local repo
 PH="${PASEO_HOME:-$HOME/.paseo}"; PP=(paseo plugin); H=(--home "$PH")
 POLL_SECS="${POLL_SECS:-90}"
 say() { echo "[fork-install] $*"; }
@@ -23,6 +23,23 @@ wait_running() {
   done
   return 1
 }
+
+# ---- automatic rollback once `remove` has run; also cleans $TMP. Set before any early exit so nothing leaks.
+TMP="$(mktemp -d)"; BK="(no backup yet)"; ROLLBACK_REPOS=()
+REMOVED=0; DONE=0
+rollback() {
+  local rc=$1; rm -rf "$TMP"
+  [ "$REMOVED" = 1 ] && [ "$DONE" = 0 ] || exit "$rc"
+  say "FAILED (exit $rc) after remove: reinstalling $PREV_SHA"
+  local ok=0 repo
+  for repo in "${ROLLBACK_REPOS[@]}"; do
+    "${PP[@]}" remove "$ID" "${H[@]}" >/dev/null 2>&1 || true   # clear any half-installed copy
+    if "${PP[@]}" install "git:$repo" --id "$ID" --ref "$PREV_SHA" "${H[@]}" && wait_running; then ok=1; break; fi
+  done
+  if [ "$ok" = 1 ]; then say "ROLLBACK OK: $PREV_SHA is running again"; else say "ROLLBACK FAILED. Reinstall by hand: ${PP[*]} install git:$FORK_REPO --id $ID --ref $PREV_SHA ${H[*]}; backup in $BK"; fi
+  exit "$([ "$rc" -ne 0 ] && echo "$rc" || echo 1)"
+}
+trap 'rollback $?' EXIT   # one EXIT trap covers set -e failures too
 
 # ---- 1. what is installed now (recorded BEFORE anything changes; the rollback target)
 CUR_JSON="$("${PP[@]}" ls "$ID" "${H[@]}" --json)"
@@ -48,7 +65,8 @@ files = glob.glob(sys.argv[1] + "/*.json")
 if not files: sys.exit("no run files found")
 for f in files:
     d = json.load(open(f))  # unreadable -> traceback -> non-zero
-    if d.get("status") in ("running", "waiting_gate") or walk(d.get("steps")) or walk(d.get("after")):
+    # fail closed: only the terminal statuses count as idle; anything else (or a missing status) is active
+    if d.get("status") not in ("completed", "failed", "canceled") or walk(d.get("steps")) or walk(d.get("after")):
         active.append((f.rsplit("/", 1)[-1], d.get("status")))
 if active:
     print("active runs:", active, file=sys.stderr); sys.exit(1)
@@ -61,7 +79,6 @@ idle_check || {
 }
 
 # ---- 3. the target and the rollback commit must both be fetchable from the fork
-TMP="$(mktemp -d)"
 git clone -q --filter=blob:none --no-checkout "$FORK_URL" "$TMP/r"
 git -C "$TMP/r" merge-base --is-ancestor "$SHA" origin/main || { echo "$SHA is not on $FORK_REPO main" >&2; exit 4; }
 WANT="$(git -C "$TMP/r" show "$SHA:package.json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
@@ -78,24 +95,9 @@ if [ "$DRY" = 1 ]; then say "DRY-RUN would back up to $BK: plugins/sources.json,
   say "backup: $BK"
 fi
 
-# ---- 5. automatic rollback once `remove` has run
-REMOVED=0; DONE=0
-rollback() {
-  local rc=$1; rm -rf "$TMP"
-  [ "$REMOVED" = 1 ] && [ "$DONE" = 0 ] || exit "$rc"
-  say "FAILED (exit $rc) after remove: reinstalling $PREV_SHA"
-  local ok=0 repo
-  for repo in "${ROLLBACK_REPOS[@]}"; do
-    "${PP[@]}" remove "$ID" "${H[@]}" >/dev/null 2>&1 || true   # clear any half-installed copy
-    if "${PP[@]}" install "git:$repo" --id "$ID" --ref "$PREV_SHA" "${H[@]}" && wait_running; then ok=1; break; fi
-  done
-  if [ "$ok" = 1 ]; then say "ROLLBACK OK: $PREV_SHA is running again"; else say "ROLLBACK FAILED. Reinstall by hand: ${PP[*]} install git:$FORK_REPO --id $ID --ref $PREV_SHA ${H[*]}; backup in $BK"; fi
-  exit "$([ "$rc" -ne 0 ] && echo "$rc" || echo 1)"
-}
-trap 'rollback $?' EXIT   # one EXIT trap covers set -e failures too
-
 # ---- 6. swap
-run "${PP[@]}" remove "$ID" "${H[@]}"; [ "$DRY" = 1 ] || REMOVED=1
+[ "$DRY" = 1 ] || REMOVED=1   # before remove: a failure or kill during remove must still roll back
+run "${PP[@]}" remove "$ID" "${H[@]}"
 run "${PP[@]}" install "git:$FORK_REPO" --id "$ID" --ref "$SHA" "${H[@]}"
 
 # ---- 7. verify (polls for running)
