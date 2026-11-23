@@ -16,8 +16,22 @@ import { attentionText } from "./overseer";
 import { MANAGER_PROTOCOL, managerAddedText, worktreePreamble } from "./prompts";
 import { UserError, type ModelChoice, type RefreshResult, type Runtime } from "./runtime";
 
+/**
+ * Claude Code shows a tool's `structuredContent` and drops the content text when both exist, so a structured result that
+ * lacks the main output hides it from Claude callers. The text therefore rides inside the structured result as `text`
+ * (godigi fork). Left alone: a result that already has its own `text` (set deliberately), and one whose text only
+ * repeats the result as JSON.
+ */
+export function withText(text: string, structured: unknown): unknown {
+  if (structured === null || typeof structured !== "object" || Array.isArray(structured)) return { text, result: structured };
+  const record = structured as Record<string, unknown>;
+  if ("text" in record) return structured;
+  if (text === JSON.stringify(structured) || text === JSON.stringify(structured, null, 2)) return structured;
+  return { ...record, text };
+}
+
 function ok(text: string, structuredContent?: unknown): AgentToolResult {
-  return structuredContent === undefined ? { text } : { text, structuredContent };
+  return structuredContent === undefined ? { text } : { text, structuredContent: withText(text, structuredContent) };
 }
 
 /** Turns refusals into tool errors the model can act on; unexpected errors are logged. */
@@ -866,8 +880,9 @@ export function runTools(runtime: Runtime): AgentToolDefinition[] {
         guard(async () => {
           const page = await runtime.readTimeline(agentId, { limit, before });
           const text = conversationText(page.entries as never, { includeReasoning, includeToolDetail, maxChars });
-          const result = { agentId, hasOlder: page.hasOlder, before: page.hasOlder ? page.startCursor : null, entries: page.entries.length };
-          return ok(`${text || "(nothing to show in these entries)"}\n\n${JSON.stringify(result)}`, result);
+          const shown = text || "(nothing to show in these entries)";
+          const result = { agentId, hasOlder: page.hasOlder, before: page.hasOlder ? page.startCursor : null, entries: page.entries.length, text: shown };
+          return ok(`${shown}\n\n${JSON.stringify({ ...result, text: undefined })}`, result);
         }),
     }),
     defineAgentTool({
