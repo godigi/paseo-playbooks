@@ -2,8 +2,14 @@
  "schema_version": 1,
  "allow_no_ci": true,
  "required_checks": [],
- "deploy_instructions": "PROPOSAL, needs owner approval before use (reverses the 2026-11-18 'merge only, no plugin swap' rule; a live plugin swap is HIGH-risk, so run with --owner-gate). After merge: update /home/brian/code/paseo-playbooks to merged main (`git checkout main && git pull --ff-only`, never discard local edits), then run `scripts/fork-install.sh <merged sha>` (backs up, swaps the plugin source to godigi/paseo-playbooks at that commit, checks status/commit/version/remote). Then, from a NEW agent session, call list_runs and confirm it answers; report version and sha. Roll back with the command the script prints.",
- "verify_argv": ["bash", "-euo", "pipefail", "-c", "cd /home/brian/code/paseo-playbooks && npm run typecheck && npx vitest run"],
+ "deploy_instructions": "Owner decision 2026-11-23: scripted fork installs replace the 2026-11-18 'merge only, no plugin swap' rule (ADR 2026-11-23-scripted-fork-install). HIGH-risk live plugin swap, so run with --owner-gate. PRECONDITION: no Playbooks run may be active (running, waiting_gate or a running step); the script refuses otherwise, and so must you: wait, never force. After merge: update /home/brian/code/paseo-playbooks to merged main (`git checkout main && git pull --ff-only`, never discard local edits), run `scripts/fork-install.sh --dry-run <merged sha>` and read it, then `scripts/fork-install.sh <merged sha>`. It backs up, removes, installs from godigi/paseo-playbooks at that commit, and polls up to 90 s for running. ROLLBACK ON FAILURE is automatic: if anything fails after the remove, it reinstalls the previously installed commit and checks that it runs; exit is non-zero either way. If it reports ROLLBACK FAILED, stop and report with the printed manual command. Finally, from a NEW agent session, call list_runs and confirm it answers; report version and sha.",
+ "verify_argv": [
+  "bash",
+  "-euo",
+  "pipefail",
+  "-c",
+  "cd /home/brian/code/paseo-playbooks && npm run typecheck && npx vitest run"
+ ],
  "revision_relation": "contains",
  "version_repository": "/home/brian/code/paseo-playbooks"
 }
