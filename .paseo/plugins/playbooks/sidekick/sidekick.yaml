@@ -1,3 +1,4 @@
+# Optional: use sidekick: { tier: worker, subagents: { tier: worker } } with tiers in this repository defaults/main.yaml.
 # The Sidekick of this repository (lerenn/paseo-playbooks): a coordinator that reads and delegates.
 sidekick:
   provider: claude
@@ -9,4 +10,4 @@ sidekick:
   # Triage of a failed run or a gate is short reasoning; keep it cheap.
   thinking: medium
   # The three escalation events: a gate nobody answered, a failed run, a lost manager.
-  watch: [gate.escalated, run.failed, run.manager_lost]
+  watch: [gate.escalated, gate.returned, run.failed, run.manager_lost, step.waiting_manager_stuck, manager.question_pending, run.held, run.released]

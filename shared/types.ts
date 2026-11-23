@@ -21,6 +21,11 @@ export const VarDefSchema = z.object({
 });
 export type VarDef = z.infer<typeof VarDefSchema>;
 
+/** `authorize`: the plugin allows a run agent's permission request for the human; `escalate`: it becomes a gate; `deny`: refused. */
+export const PermissionPolicySchema = z.enum(["authorize", "escalate", "deny"]);
+export type PermissionPolicy = z.infer<typeof PermissionPolicySchema>;
+export const DEFAULT_PERMISSION_POLICY: PermissionPolicy = "authorize";
+
 /** One provider/model an agent may run on. */
 export const AgentTargetSchema = z.object({
   provider: z.string().optional(),
@@ -54,6 +59,127 @@ export const ManagerModeSchema = z.enum(["always_on", "none"]);
 export type ManagerMode = z.infer<typeof ManagerModeSchema>;
 /** Used when neither the playbook nor `defaults/main.yaml` sets `manager.mode`. */
 export const DEFAULT_MANAGER_MODE: ManagerMode = "always_on";
+
+/**
+ * The watchdog for a reported step the manager has not acted on (`manager.nudge`): after `afterMs` of waiting, with the
+ * manager idle, the plugin prompts it; again after twice as long, and so on, up to `maxIntervalMs` between prompts.
+ */
+export const ManagerNudgeSchema = z.object({ enabled: z.boolean(), afterMs: z.number().int().positive(), maxIntervalMs: z.number().int().positive() });
+export type ManagerNudge = z.infer<typeof ManagerNudgeSchema>;
+export const DEFAULT_MANAGER_NUDGE: ManagerNudge = { enabled: true, afterMs: 3 * 60_000, maxIntervalMs: 30 * 60_000 };
+
+/** What the manager watchdog remembers about a run (see `server/manager-watch.ts`); survives a restart. */
+export const ManagerWatchSchema = z.object({
+  /** Per reported step: the report it counts from (the attempt's `endedAt`), the prompts sent since, when the last went out, and whether `step.waiting_manager_stuck` was emitted. */
+  steps: z.record(z.string(), z.object({ reportedAt: z.string(), count: z.number().int().min(0), lastAt: z.string().nullable(), stuckEmitted: z.boolean() })).default({}),
+  /** While the manager has a question or permission request open: since when, and whether `manager.question_pending` was emitted. */
+  question: z.object({ since: z.string(), emitted: z.boolean() }).nullable().default(null),
+});
+export type ManagerWatch = z.infer<typeof ManagerWatchSchema>;
+
+/**
+ * The warden (`warden`; ADR 2026-11-18-warden): one periodic, deterministic pass over the active runs. OFF unless
+ * `enabled: true`: with no block it does nothing at all (no timer, scan, event, notice or Sidekick message).
+ */
+export const WARDEN_ACTIONS = ["report", "refresh_scripts", "none"] as const;
+export const WardenActionSchema = z.enum(WARDEN_ACTIONS);
+export type WardenAction = z.infer<typeof WardenActionSchema>;
+export const WardenConfigSchema = z.object({
+  enabled: z.boolean(),
+  intervalMs: z.number().int().positive(),
+  cooldownMs: z.number().int().positive(),
+  checks: z.object({
+    /** A run pinned to an older definition than origin/<base> (or read from the workspace checkout), for longer than `afterMs` (default 12h; the checkout case is not aged). `refresh_scripts`: only isolated runs. */
+    staleDefinition: z.object({ action: WardenActionSchema, afterMs: z.number().int().positive().default(12 * 3_600_000) }).default({ action: "report", afterMs: 12 * 3_600_000 }),
+    /** A manager that is gone or idle while its run has an open gate nobody else can decide. */
+    managerBlocked: z.object({ action: WardenActionSchema }),
+    /** A goto edge fired more than `above` times. */
+    loops: z.object({ above: z.number().int().min(1), action: WardenActionSchema }),
+    /** A running step slower than its baseline (the slow-step warning). */
+    slow: z.object({ action: WardenActionSchema }),
+    /** A gate open longer than `afterMs`. */
+    gateOpen: z.object({ afterMs: z.number().int().positive(), action: WardenActionSchema }),
+    /** An active run with no running, ready or queued step and no open gate for longer than `afterMs` (ADR 2026-11-23-warden-stalled-and-repeat-suppression). */
+    stalled: z.object({ afterMs: z.number().int().positive().default(30 * 60_000), action: WardenActionSchema }).default({ afterMs: 30 * 60_000, action: "report" }),
+    /** An active run held for quota (not paused by a human) for longer than `afterMs` (ADR 2026-11-23-warden-held-check). */
+    held: z.object({ afterMs: z.number().int().positive().default(2 * 3_600_000), action: WardenActionSchema }).default({ afterMs: 2 * 3_600_000, action: "report" }),
+  }),
+});
+export type WardenConfig = z.infer<typeof WardenConfigSchema>;
+export const WARDEN_RUN_CHECKS = ["stale_definition", "manager_blocked", "loops", "slow", "gate_open", "stalled", "held"] as const;
+/** The PR-level checks (ADR 2026-11-20-warden-pr-checks): over the project's open pull requests, each off unless configured. */
+export const WARDEN_PR_CHECKS = ["pr_no_reviewer", "pr_conflicting", "pr_review_stale", "pr_required_checks", "pr_review_findings", "pr_unowned", "pr_draft_idle", "run_failed"] as const;
+export const WARDEN_CHECKS = [...WARDEN_RUN_CHECKS, ...WARDEN_PR_CHECKS] as const;
+export type WardenCheck = (typeof WARDEN_CHECKS)[number];
+export const DEFAULT_WARDEN: WardenConfig = {
+  enabled: false,
+  intervalMs: 15 * 60_000,
+  cooldownMs: 60 * 60_000,
+  checks: {
+    staleDefinition: { action: "report", afterMs: 12 * 3_600_000 },
+    managerBlocked: { action: "report" },
+    loops: { above: 5, action: "report" },
+    slow: { action: "report" },
+    gateOpen: { afterMs: 30 * 60_000, action: "report" },
+    stalled: { afterMs: 30 * 60_000, action: "report" },
+    held: { afterMs: 2 * 3_600_000, action: "report" },
+  },
+};
+
+/**
+ * `warden.pr_checks` (repo-wide, `defaults/main.yaml` only): the checks over open pull requests. A check is on only when its
+ * block is set; everything provider-specific (logins, comment patterns, commands) comes from here, none is built in.
+ */
+export const WardenPrConfigSchema = z.object({
+  /** The step of a run that fixes its PR (conflicts, review findings): named in proposals, and "running" means a fix is under way. */
+  fixStep: z.string().nullable(),
+  /** The automated reviewer: its login, a regex its receipt comment or review body matches, and what re-triggers it (text, used in proposals). */
+  reviewBot: z.object({ author: z.string(), receipt: z.string(), retrigger: z.string().nullable() }).nullable(),
+  noReviewer: z.object({ required: z.array(z.string()).min(1) }).nullable(),
+  conflicting: z.object({}).nullable(),
+  reviewStale: z.object({ afterMs: z.number().int().positive() }).nullable(),
+  /**
+   * `names`: checks (or workflows) that must have run on the head commit; `fromRuleset`: also the ones the base branch's ruleset
+   * requires (`gh api repos/<repo>/rules/branches/<base>`); `workflows`: check name -> workflow, named in the proposal;
+   * `dispatch`: a command template ({sha} {branch} {pr} {name} {workflow} {repo}) proposed when one is missing.
+   */
+  requiredChecks: z.object({ names: z.array(z.string()), fromRuleset: z.boolean(), workflows: z.record(z.string(), z.string()), dispatch: z.string().nullable() }).nullable(),
+  /** `marker`: a machine-readable marker in the review bot's latest comment or review: `pattern` (a regex with one capture) and `truthy` (a regex the captured text matches when findings are open). Null: CHANGES_REQUESTED reviews. */
+  reviewFindings: z.object({ marker: z.object({ pattern: z.string(), truthy: z.string() }).nullable() }).nullable(),
+  unowned: z.object({}).nullable(),
+  draftIdle: z.object({ afterMs: z.number().int().positive() }).nullable(),
+  /** The repositories to scan (`gh pr list --repo`): listed `names`, plus, with `fromRuns`, the ones the project's runs have PR URLs of. Null: the project root's repository. */
+  repos: z.object({ names: z.array(z.string()), fromRuns: z.boolean() }).nullable(),
+  /** A run of one of these playbooks (id) that failed, or has a failed step, within `withinMs`. */
+  failedRuns: z.object({ playbooks: z.array(z.string()).min(1), withinMs: z.number().int().positive() }).nullable(),
+});
+export type WardenPrConfig = z.infer<typeof WardenPrConfigSchema>;
+
+/** What the warden remembers about a run (server/warden.ts): the findings it reported and still sees; survives a restart. */
+export const WardenFindingSchema = z.object({
+  check: z.enum(WARDEN_CHECKS),
+  /** The step, gate, edge or PR (`#12`) the finding is about (null: the run). */
+  subject: z.string().nullable(),
+  /** A change of it makes a new finding (a new origin sha, a new step run). */
+  signature: z.string(),
+  detail: z.string(),
+  since: z.string(),
+  /** When it was last reported (event, summary); it is reported again after the cooldown while still true. */
+  reportedAt: z.string(),
+  /** The action taken when it was first reported (`refresh_scripts` runs once per finding). */
+  acted: z.enum(["refresh_scripts"]).nullable().default(null),
+  /** PR checks: the run that owns the PR (null: none), the PR, and the action the warden proposes (it never takes it itself). */
+  runId: z.string().nullable().default(null),
+  pr: z.object({ number: z.number(), url: z.string() }).nullable().default(null),
+  proposed: z.string().nullable().default(null),
+  /** The count or value (loop count, idle minutes) when it was last reported: it is reported again only once it has doubled. Null: not measured. */
+  value: z.number().nullable().default(null),
+  /** The run state when it was last reported: it is reported again when this changes (after the cooldown). Null: not tracked. */
+  state: z.string().nullable().default(null),
+});
+export type WardenFinding = z.infer<typeof WardenFindingSchema>;
+export const WardenStateSchema = z.object({ findings: z.record(z.string(), WardenFindingSchema).default({}) });
+export type WardenState = z.infer<typeof WardenStateSchema>;
 
 /** Used when neither the playbook nor `defaults/main.yaml` sets `manager.compact`. */
 export const DEFAULT_MANAGER_COMPACT: ManagerCompact = { above_tokens: 150_000 };
@@ -111,8 +237,11 @@ export const TransitionSchema = z.discriminatedUnion("kind", [
    */
   z.object({ kind: z.literal("end"), outcome: z.string().optional() }),
   z.object({ kind: z.literal("fail") }),
-  /** `decider`: who decides the loop-limit gate `maxLoops` opens (unset = a human). */
-  z.object({ kind: z.literal("goto"), target: z.string(), maxLoops: z.number().int().positive().optional(), decider: GateDeciderSchema.optional() }),
+  /**
+   * `decider`: who decides the loop-limit gate `maxLoops` opens (unset = a human).
+   * `delayMs`: the target starts only this long after the outcome (unset = at once).
+   */
+  z.object({ kind: z.literal("goto"), target: z.string(), maxLoops: z.number().int().positive().optional(), decider: GateDeciderSchema.optional(), delayMs: z.number().int().positive().optional() }),
   /**
    * Opens a human gate asking for an answer, then goes back to `target` with the answer as feedback.
    * With `choices`, each button goes to its own target; `target` is then the first choice's.
@@ -226,6 +355,8 @@ export const StepSchema = z.object({
           maxRefills: z.number().int().positive(),
           /** A pass starts once the oldest unhandled child ending is this old (0 = at once). */
           debounceMs: z.number().int().min(0),
+          /** The pool waits, open, instead of ending when a pass says items remain but are blocked (ADR 2026-11-18-pool-wait-accepts-items). Unset = it ends. */
+          idle: z.object({ output: z.string(), pollMs: z.number().int().positive() }).optional(),
         })
         .optional(),
     })
@@ -348,8 +479,22 @@ export const RunWorktreeSchema = z.object({
   workspaceSnapshot: z.string().nullable(),
   /** active: exists; removed: the plugin deleted it; kept: it stays on disk (the history says why). */
   state: z.enum(["active", "removed", "kept"]),
+  /** failed: kept only for the failure retention window (ADR 2026-11-17-worktree-auto-cleanup): removed once it passes or the disk is under pressure. */
+  keptFor: z.literal("failed").nullable().optional(),
 });
 export type RunWorktree = z.infer<typeof RunWorktreeSchema>;
+
+/** The refreshed script copy of a run (ADR 2026-11-13-refresh-run-scripts). */
+export const RunScriptsSchema = z.object({
+  /** The commit of origin/<branch> the scripts were copied from. */
+  sha: z.string(),
+  /** The directory holding the copy: script paths (`<relDir>/scripts/<name>`) resolve inside it. */
+  dir: z.string(),
+  refreshedAt: z.string(),
+  /** Where the copy was taken from: `origin` (the fetched origin/<branch>) or `workspace` (the checkout, when origin's playbook is invalid). Runs from before read as origin. */
+  source: z.enum(["origin", "workspace"]).default("origin"),
+});
+export type RunScripts = z.infer<typeof RunScriptsSchema>;
 
 /** Where an isolated run's playbook definition (and roles) came from: see ADR 2026-11-10-playbooks-from-fresh-main. */
 export const RunDefinitionSchema = z.object({
@@ -360,6 +505,8 @@ export const RunDefinitionSchema = z.object({
   sha: z.string().nullable().default(null),
   /** Why the workspace checkout was used instead (workspace only). */
   note: z.string().nullable().default(null),
+  /** Set when the workspace checkout was used although origin was the intended source: "definition read from the workspace checkout because origin/<branch> is invalid: <reason>". Null on origin and on runs from before. */
+  warning: z.string().nullable().default(null),
 });
 export type RunDefinition = z.infer<typeof RunDefinitionSchema>;
 
@@ -393,6 +540,20 @@ export const PlaybookSchema = z.object({
   manager: AgentSettingsSchema,
   /** When the manager is compacted (`manager.compact`). Unset on runs from before it. */
   managerCompact: ManagerCompactSchema.default(DEFAULT_MANAGER_COMPACT),
+  /** `manager.nudge`: the watchdog for reported steps the manager has not acted on. Unset on runs from before it (= the defaults). */
+  managerNudge: ManagerNudgeSchema.default(DEFAULT_MANAGER_NUDGE),
+  /** `warden`: the periodic checks. Unset on runs from before it (= off). */
+  warden: WardenConfigSchema.default(DEFAULT_WARDEN),
+  /** `quota_limit` (was `rate_limit`): the queue priority of the playbook's runs when rate limiting holds work (higher first) (costs come only from measured history). Unset on runs from before it (= 0). */
+  rateLimit: z.object({ priority: z.number() }).default({ priority: 0 }),
+  /** `quota_limits` of the playbook's `defaults/main.yaml` (ADR 2026-11-23-quota-limits-in-defaults): the fields it sets; the run's effective limits are these over the user config over the built-in defaults. Unset on runs from before it (= nothing set). */
+  quotaLimits: z
+    .object({
+      steps: z.number().nullable().optional(),
+      playbooks: z.number().nullable().optional(),
+      quota: z.object({ pacing: z.boolean().optional(), usablePercent: z.number().optional(), closedHours: z.object({ timezone: z.string().nullable(), slots: z.array(z.object({ days: z.array(z.number()), fromMin: z.number(), toMin: z.number() })) }).nullable().optional(), refreshMs: z.number().optional(), maxAgeMs: z.number().optional() }).optional(),
+    })
+    .default({}),
   /** `manager.mode`: `none` = no manager agent, the plugin drives the run. Unset on runs from before it (= always_on). */
   managerMode: ManagerModeSchema.default(DEFAULT_MANAGER_MODE),
   /** How long an exhausted `provider/model` is skipped before it is tried again (`providers.exhausted_for`), in ms. */
@@ -407,10 +568,16 @@ export const PlaybookSchema = z.object({
   usageCheck: z.boolean().default(true),
   /** The percentage of a usage window at which a target is skipped (`providers.usage.threshold`). */
   usageThreshold: z.number().default(100),
-  /** Whether the plugin archives the workspace it created for a run once the run ends. */
+  /** What the plugin does with a tool permission request of an agent of the run (`permissions.on_request`). */
+  permissions: z.object({ onRequest: PermissionPolicySchema }).default({ onRequest: "authorize" }),
+  /** Whether the plugin archives the workspace it created for a run once the run ends; `title` is the template of its title (`workspace.title`), null for the default. */
   workspace: z
-    .object({ archive: z.enum(["never", "on_end"]), keepFailed: z.boolean() })
-    .default({ archive: "never", keepFailed: true }),
+    .object({ archive: z.enum(["never", "on_end"]), keepFailed: z.boolean(), archiveWithRun: z.boolean().default(false), archiveAfterMs: z.number().nullable().default(null), title: z.string().nullable().default(null) })
+    .default({ archive: "never", keepFailed: true, archiveWithRun: false, archiveAfterMs: null, title: null }),
+  /** `auto_archive`: the plugin archives a finished run (and its idle manager) `afterMs` after it ended. Off unless `enabled`. Unset on runs from before it (= off). */
+  autoArchive: z
+    .object({ enabled: z.boolean(), afterMs: z.number().int().positive(), keepFailedWorkspaceMs: z.number().int().positive().default(24 * 3_600_000) })
+    .default({ enabled: false, afterMs: 30 * 60_000, keepFailedWorkspaceMs: 24 * 3_600_000 }),
   /**
    * Where the run's agents work: the workspace checkout (`none`), or a private git worktree the
    * plugin creates for the run (`worktree`). Unset on runs from before isolation.
@@ -422,6 +589,14 @@ export const PlaybookSchema = z.object({
    * Unset on runs from before manager instructions.
    */
   managerInstructions: z.array(z.object({ playbook: z.string().nullable(), text: z.string() })).default([]),
+  /**
+   * `agent_rules`: house rules for every agent of the run, from `defaults/main.yaml`, then this
+   * playbook's and its sub-playbooks', each once. Rendered into prompts when an agent starts.
+   * Unset on runs from before agent rules.
+   */
+  agentRules: z.array(z.string()).default([]),
+  /** `manager_recovery`: null = not set here, so the user config (`manager_recovery` of config.yaml) and then the defaults (retry on, no fallback) apply. */
+  managerRecovery: z.object({ retry: z.boolean().nullable().default(null), fallback: z.object({ provider: z.string(), model: z.string() }).nullable().default(null) }).default({ retry: null, fallback: null }),
   /** `slow_warning`: how the slow-step warning is computed (ADR 2026-11-12-slow-step-warning). */
   slowWarning: z.object({ runs: z.number().int().min(3), factor: z.number().gt(1) }).default({ runs: 10, factor: 2 }),
   /**
@@ -678,6 +853,10 @@ export const PoolPassSchema = z.object({
   skipped: z.number().int().default(0),
   /** What the pass decided: its items output as it gave it (cut short). */
   output: z.string().nullable().default(null),
+  /** Pools with `idle`: the pass said items remain but are blocked, so the pool waits instead of ending. */
+  waiting: z.boolean().default(false),
+  /** Whether the pass counts against `max_refills`: false for a re-plan of a waiting pool (poll or added item), which would starve the pool. */
+  counted: z.boolean().default(true),
 });
 export type PoolPass = z.infer<typeof PoolPassSchema>;
 
@@ -691,6 +870,8 @@ export const PoolStateSchema = z.object({
   added: z.number().int().min(0).default(0),
   /** Keys of ending children already accounted for by a completed pass. */
   handled: z.array(z.string()).default([]),
+  /** A waiting pool: when an item was added (the oldest one not yet re-planned), asking for a re-plan. Cleared when a pass begins. */
+  wakeAt: z.string().nullable().default(null),
   /** open: refilling as children end; stopped: a pass failed or `max_refills` was reached, no more passes (running children go on). */
   status: z.enum(["open", "stopped"]).default("open"),
   stopReason: z.string().nullable().default(null),
@@ -730,6 +911,8 @@ export const RunStepSchema = z.object({
   fanout: FanoutStateSchema.nullable().default(null),
   /** Fan-out steps: the children of earlier passes and attempts, oldest first (the last MAX_FANOUT_PAST kept). */
   fanoutPast: z.array(FanoutStateSchema).default([]),
+  /** A goto with `delay` sent the run back to this step: it becomes ready only at this time (ISO); null when it is not waiting for a delay. */
+  waitUntil: z.string().nullable().default(null),
   /** When the step started waiting for a free `concurrency` slot of its block (orders the queue). */
   queuedAt: z.string().nullable().default(null),
   /** The `model` restart_run gave for this step: its next attempt runs on it unless start_step passes its own. Null when none. */
@@ -737,9 +920,39 @@ export const RunStepSchema = z.object({
 });
 export type RunStep = z.infer<typeof RunStepSchema>;
 
+/**
+ * What a deferred gate waits for. `manual`: nothing is tracked, a human or the Sidekick brings it back (an optional `remindAt` only
+ * reminds). `date`: back at `at`. `run_ended`: back when another run `runId` is completed, failed or canceled.
+ * `gate_decided`: back when gate `gateId` of run `runId` is decided. Only these are tracked by the plugin, from run state, never from chat.
+ */
+export const GateWaitConditionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("manual"), note: z.string().default("") }),
+  z.object({ kind: z.literal("date"), at: z.string() }),
+  z.object({ kind: z.literal("run_ended"), runId: z.string() }),
+  z.object({ kind: z.literal("gate_decided"), runId: z.string(), gateId: z.string() }),
+]);
+export type GateWaitCondition = z.infer<typeof GateWaitConditionSchema>;
+
+/** A gate a human reviewed and set aside. It stays open (decisions work unchanged); it only leaves the "needs review" count. */
+export const GateDeferralSchema = z.object({
+  /** Why it is not decided now: required. */
+  reason: z.string(),
+  condition: GateWaitConditionSchema,
+  /** A reminder date (any condition): back to review at that time. Null: none. */
+  remindAt: z.string().nullable().default(null),
+  deferredAt: z.string(),
+  deferredBy: z.string(),
+  /** Set when it came back to review; null while deferred. */
+  returnedAt: z.string().nullable().default(null),
+  /** "human" (brought back by hand), "agent" (the Sidekick), or what tracked it: "date", "reminder", "run_ended", "gate_decided". */
+  returnedBy: z.string().nullable().default(null),
+  returnNote: z.string().nullable().default(null),
+});
+export type GateDeferral = z.infer<typeof GateDeferralSchema>;
+
 export const GateSchema = z.object({
   id: z.string(),
-  kind: z.enum(["gate", "loop_limit", "ask", "admission"]),
+  kind: z.enum(["gate", "loop_limit", "ask", "admission", "permission", "manager_question"]),
   /** An `admission` gate: the stage it is about (its `stepId`) and the held job it asks about. Null on the other kinds. */
   jobId: z.string().nullable().default(null),
   stepId: z.string(),
@@ -770,10 +983,19 @@ export const GateSchema = z.object({
   escalated: z.string().nullable().default(null),
   /** When it was escalated. */
   escalatedAt: z.string().nullable().default(null),
+  /** A `permission` gate: the agent whose tool permission request it holds, and that request. Null on the other kinds. */
+  permission: z.object({ agentId: z.string(), requestId: z.string(), tool: z.string() }).nullable().optional(),
+  /**
+   * A `manager_question` gate (the Playbook Manager's open AskUserQuestion-style request; `permission` holds its agent and request):
+   * the question, its options, and whether the panel can answer it (one single-choice question; several questions or a multi-select are answered in the manager's conversation).
+   */
+  question: z.object({ text: z.string(), options: z.array(z.object({ label: z.string(), description: z.string().default("") })).default([]), answerable: z.boolean().default(true) }).nullable().optional(),
   /** A run with no manager: the step agent the plugin asked to put this gate's question to the human in its own conversation. */
   chatAgentId: z.string().nullable().optional(),
   /** Set once the gate is closed and that conversation was told (its open question dismissed when the panel decided). */
   chatClosed: z.boolean().optional(),
+  /** Deferred to Waiting (or back from it: `returnedAt`); null on a gate never deferred. */
+  deferral: GateDeferralSchema.nullable().optional(),
   decidedAt: z.string().nullable(),
 });
 export type Gate = z.infer<typeof GateSchema>;
@@ -848,6 +1070,13 @@ export const JobSchema = z.object({
    * (ADR 2026-11-12-pending-follow-ups).
    */
   followUps: z.array(z.object({ runId: z.string().nullable(), note: z.string().nullable(), by: z.string().nullable(), at: z.string() })).default([]),
+  /**
+   * Pipelines: every time `requeue_job` put the job back (ADR 2026-11-13-requeue-settled-jobs), with how it had ended, the caller's
+   * reason and the follow-ups recorded before. Append-only; its length is the manual requeue count (not charged to `queue.max_requeues`).
+   */
+  reopens: z
+    .array(z.object({ status: z.enum(["failed", "settled"]), outcome: z.string().nullable(), summary: z.string().nullable(), reason: z.string(), followUps: z.array(z.object({ runId: z.string().nullable(), note: z.string().nullable(), by: z.string().nullable(), at: z.string() })).default([]), at: z.string() }))
+    .default([]),
 });
 export type Job = z.infer<typeof JobSchema>;
 
@@ -886,6 +1115,41 @@ export const ScriptOutputSchema = z.object({
 });
 export type ScriptOutput = z.infer<typeof ScriptOutputSchema>;
 
+/**
+ * Why the plugin holds a run's new steps (rate limiting, ADR 2026-11-20-rate-limiting). Running steps are never
+ * interrupted: the hold applies between steps and at admission, and the plugin lifts it by itself.
+ */
+export const RateHoldSchema = z.object({
+  /**
+   * `steps`: the step cap is full; `playbooks`: the run cap does not admit this run; `quota`: a provider's usage is at its usable
+   * share, or unreadable; `headroom`: the quota headroom does not cover the estimated cost yet (ADR 2026-11-20-dynamic-rate-limits).
+   */
+  kind: z.enum(["steps", "playbooks", "quota", "headroom", "pace"]),
+  /** One line for humans and agents ("waiting for quota data", "claude weekly at 41% above its allowance so far 36%"). */
+  reason: z.string(),
+  /** The provider whose quota holds the run (quota holds), else null. */
+  provider: z.string().nullable().default(null),
+  /** The usage window that holds it (`weekly`, `five_hour`), else null. */
+  window: z.string().nullable().default(null),
+  since: z.string(),
+  /** When the plugin looks again or expects room (ISO); null when it waits for another run to end or a limit to rise. */
+  retryAt: z.string().nullable().default(null),
+  /** Headroom holds: the estimated cost of what waits to start (quota points of the window), the headroom now, and the run's place in the queue (1 = next). */
+  estimatedCost: z.number().nullable().default(null),
+  headroom: z.number().nullable().default(null),
+  position: z.number().int().nullable().default(null),
+  /** The run's priority when it was held (higher goes first). */
+  priority: z.number().nullable().default(null),
+});
+export type RateHold = z.infer<typeof RateHoldSchema>;
+
+/**
+ * Whether a hold only waits for a provider's usage reading (ADR 2026-11-23-provider-usage-unavailable): a `quota` hold on a
+ * provider with no window. That is a condition of the provider's reading, not of the run: its manager is never told of it, and a
+ * switch between it and another quota hold of the same run does not start a new hold.
+ */
+export const isUnavailableHold = (hold: Pick<RateHold, "kind" | "provider" | "window">): boolean => hold.kind === "quota" && hold.provider !== null && hold.window === null;
+
 /** A stage's admission check (`queue.admit`), live in memory: running or waiting, the last outcome and the last failure. */
 export const AdmissionStatusSchema = z.object({
   /** A check is running now. */
@@ -909,6 +1173,20 @@ export const AdmissionStatusSchema = z.object({
 });
 export type AdmissionStatus = z.infer<typeof AdmissionStatusSchema>;
 
+/** A review finding dismissed with a rationale: keyed by `pr` (normalised `owner/repo#N`) and `signature` (server/findings.ts). */
+export const DismissedFindingSchema = z.object({
+  pr: z.string(),
+  signature: z.string(),
+  file: z.string(),
+  text: z.string(),
+  severity: z.string(),
+  category: z.string(),
+  rationale: z.string(),
+  by: z.string(),
+  at: z.string(),
+});
+export type DismissedFinding = z.infer<typeof DismissedFindingSchema>;
+
 export const RunSchema = z.object({
   version: z.literal(1),
   id: z.string(),
@@ -918,6 +1196,15 @@ export const RunSchema = z.object({
   projectId: z.string(),
   branch: z.string().nullable(),
   managerAgentId: z.string(),
+  /** Durable manager-only handoffs; no step or gate is restarted. */
+  managerRecoveries: z.array(z.object({
+    from: z.string(), to: z.string(), target: z.string(), thinking: z.string().nullable(),
+    reason: z.string(), at: z.string(),
+  })).default([]),
+  /** Suppresses wake-ups while this manager is quota-blocked, including across daemon restarts. */
+  managerQuotaBlockedId: z.string().nullable().default(null),
+  /** Takeover brief persisted before sending, separately from the existing inbox. */
+  managerRecoveryPrompt: z.string().nullable().default(null),
   /** What the manager's agent spent while this run was its active one. */
   managerUsage: UsageSchema.nullable().optional(),
   /** Usage is recorded as per-turn deltas (v0.66.1+). Runs without it hold a cumulative-summed, inflated `managerUsage`, which analytics ignores. */
@@ -930,6 +1217,8 @@ export const RunSchema = z.object({
   exhausted: z.array(ExhaustedEntrySchema).default([]),
   /** The run's private git worktree (`isolation: worktree`); null when it works in the workspace checkout. */
   worktree: RunWorktreeSchema.nullable().default(null),
+  /** A copy of the run's `<relDir>/scripts/` tree from origin/<branch>, taken by `refresh_scripts`; script steps run it before the worktree's. Null until refreshed. */
+  scripts: RunScriptsSchema.nullable().default(null),
   /** Where the playbook definition came from (isolated runs); null on other runs and runs from before. */
   definition: RunDefinitionSchema.nullable().default(null),
   /** A short name the Playbook Manager gave the run (e.g. "login-redirect-fix"): its tab label. */
@@ -946,6 +1235,26 @@ export const RunSchema = z.object({
   seenAt: z.string().nullable().default(null),
   /** Set while a human has paused the run: no step starts and the manager is not woken until resume. */
   pausedAt: z.string().nullable().default(null),
+  /** Set while rate limiting holds the run's new steps (limits or quota pacing); null otherwise. */
+  rateHold: RateHoldSchema.nullable().default(null),
+  /** A warning about pacing, set while a provider the run uses reports no usage (so its work is not paced); null otherwise. */
+  rateNote: z.string().nullable().default(null),
+  /** The priority `start_playbook` gave this run, overriding the playbook's `quota_limit.priority`; null = the playbook's. */
+  priority: z.number().nullable().default(null),
+  /** A manual quota priority set from the Quota limitation tab or `set_run_priority`: wins over `priority` and the playbook's; null = none. */
+  priorityOverride: z.number().nullable().default(null),
+  /** Set (sticky) by `set_run_priority` with applyToChildren: the children this run starts later start with its `priorityOverride`. */
+  inheritChildPriority: z.boolean().default(false),
+  /** Set at start (`start_playbook` `quota: { exempt: true }`, inherited by child runs): the run is not subject to quota limiting (ADR 2026-11-23-quota-exempt-runs). */
+  quotaExempt: z.boolean().default(false),
+  /** Set (sticky) by `set_run_quota_exempt` with applyToChildren: later changes of `quotaExempt` and the children this run starts later follow it (ADR 2026-11-23-run-quota-exempt-toggle). */
+  inheritChildExempt: z.boolean().default(false),
+  /** Review findings an agent dismissed with a written reason (`dismiss_finding`, ADR 2026-11-23-dismiss-finding), per PR and finding signature. */
+  dismissedFindings: z.array(DismissedFindingSchema).default([]),
+  /** The manager watchdog's memory (nudges sent per reported step, the manager's open question). */
+  managerWatch: ManagerWatchSchema.default({ steps: {}, question: null }),
+  /** The warden's findings for this run (empty unless `warden.enabled`). */
+  warden: WardenStateSchema.default({ findings: {} }),
   steps: z.record(z.string(), RunStepSchema),
   /** Times each goto edge fired, keyed "source->target", and extra loops granted at a loop-limit gate. */
   loops: z.record(z.string(), z.number().int()),
@@ -1017,6 +1326,24 @@ export const FanoutPassSummarySchema = z.object({ loop: z.number().int(), childr
 /** Earlier passes the summary carries per fan-out step. */
 export const SUMMARY_FANOUT_PASSES = 5;
 
+/** What the Runs view needs to show and change an active run's quota priority (see ADR 2026-11-23-run-priority-in-runs-view). */
+export const RunPriorityViewSchema = z.object({
+  /** The priority now, and the one the run would have without a manual override. */
+  priority: z.number(),
+  defaultPriority: z.number(),
+  /** The manual override (null = none). */
+  override: z.number().nullable(),
+  /** The run has child runs (fan-out or pool), at any depth. */
+  hasChildren: z.boolean(),
+  /** The run passes its priority to the children it starts (`inheritChildPriority`). */
+  inheritChildren: z.boolean(),
+  /** The run is exempt from quota limiting (`quotaExempt`): the menu shows that state, with the way back. */
+  exempt: z.boolean().default(false),
+  /** The run passes a change of its exemption to its children (`inheritChildExempt`). */
+  inheritChildExempt: z.boolean().default(false),
+});
+export type RunPriorityView = z.infer<typeof RunPriorityViewSchema>;
+
 /**
  * A run as the Playbooks screen and the sidebar badge see it: the fields they draw rows, badges
  * and gate buttons from. No history, reports, outputs, attempts, inbox, step prompts or job
@@ -1036,6 +1363,10 @@ export const RunSummarySchema = z.object({
   updatedAt: z.string(),
   seenAt: z.string().nullable(),
   pausedAt: z.string().nullable(),
+  /** Why rate limiting holds the run's new steps, when it does. */
+  rateHold: RateHoldSchema.nullable().default(null),
+  /** Pacing warning (a used provider reports no usage), when there is one. */
+  rateNote: z.string().nullable().default(null),
   /** Each step's status, and when its work started and ended (for the slow-step warning). */
   steps: z.record(z.string(), z.object({ status: StepStatusSchema, startedAt: z.string().nullable().default(null), endedAt: z.string().nullable().default(null) })),
   /** Open gates only (the decided ones are in the full run). */
@@ -1043,18 +1374,22 @@ export const RunSummarySchema = z.object({
   /** After-tasks' statuses. */
   after: z.record(z.string(), z.object({ status: AfterTaskStatusSchema })),
   /** Jobs without their inputs and outputs: what the stages and the job counts show. */
-  jobs: z.array(JobSchema.pick({ id: true, label: true, status: true, waiting: true, requeued: true, detached: true, outcome: true, followUps: true })),
+  jobs: z.array(JobSchema.pick({ id: true, label: true, status: true, waiting: true, requeued: true, detached: true, outcome: true, followUps: true, reopens: true })),
   batch: RunSchema.shape.batch,
   /** Set on a run a fan-out step started: its parent run, step and the item's key. */
   parent: RunSchema.shape.parent.default(null),
   /** Fan-out steps that started: the current pass's children, and the last passes before it (oldest first), by step id. */
   fanouts: z.record(z.string(), z.object({ loop: z.number().int(), children: z.array(FanoutChildSummarySchema), pool: PoolSummarySchema.nullable().default(null), past: z.array(FanoutPassSummarySchema) })).default({}),
+  /** The quota priority, only for an active run of a project that paces; null = no priority control (finished, pacing off, or an older server). */
+  quotaPriority: RunPriorityViewSchema.nullable().default(null),
+  /** The run is not subject to quota limiting (`quotaExempt`): the Runs view shows an "exempt" tag instead of the priority control. */
+  quotaExempt: z.boolean().default(false),
 });
 export type RunSummary = z.infer<typeof RunSummarySchema>;
 
 const TITLE_MAX = 200;
 
-export function summarizeRun(run: Run): RunSummary {
+export function summarizeRun(run: Run, quotaPriority: RunPriorityView | null = null): RunSummary {
   const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
   const { id, title, description, singleton, blocks, slowWarning, outcomes } = run.playbook;
   return {
@@ -1092,12 +1427,16 @@ export function summarizeRun(run: Run): RunSummary {
     updatedAt: run.updatedAt,
     seenAt: run.seenAt,
     pausedAt: run.pausedAt,
+    rateHold: run.rateHold,
+    rateNote: run.rateNote,
     steps: Object.fromEntries(Object.entries(run.steps).map(([stepId, step]) => [stepId, { status: step.status, ...stepTiming(step) }])),
     gates: run.gates.filter((gate) => gate.status === "pending"),
     after: Object.fromEntries(Object.entries(run.after).map(([taskId, task]) => [taskId, { status: task.status }])),
-    jobs: run.jobs.map(({ id, label, status, waiting, requeued, detached, outcome, followUps }) => ({ id, label, status, waiting, requeued, detached, outcome, followUps })),
+    jobs: run.jobs.map(({ id, label, status, waiting, requeued, detached, outcome, followUps, reopens }) => ({ id, label, status, waiting, requeued, detached, outcome, followUps, reopens })),
     batch: run.batch,
     parent: run.parent,
+    quotaPriority,
+    quotaExempt: run.quotaExempt,
     fanouts: Object.fromEntries(
       Object.entries(run.steps).flatMap(([stepId, step]) =>
         step.fanout && step.status !== "pending" && step.status !== "ready"
@@ -1208,6 +1547,27 @@ export function restartBlocker(run: Run, stepId: string): string | null {
   const missing = step.needs.filter((need) => !isStepDone(run.steps[need]?.status ?? "pending"));
   if (missing.length > 0) return `"${stepId}" needs ${missing.join(", ")}, which did not complete; restart from an earlier step`;
   return null;
+}
+
+/** When the run last ended (its end event; the last update for a run with none). */
+export function runEndedAt(run: Pick<Run, "history" | "updatedAt">): string {
+  return run.history.findLast((event) => event.type === "run_completed" || event.type === "run_failed" || event.type === "run_canceled")?.at ?? run.updatedAt;
+}
+
+/** Whether a finished run can be restarted from at least one step. */
+export function isRestartable(run: Run): boolean {
+  return run.playbook.steps.some((step) => restartBlocker(run, step.id) === null);
+}
+
+/**
+ * `auto_archive.keep_failed_workspace`: when a failed, restartable run's workspace is kept until (ISO time), or null when the
+ * rule does not hold it (auto_archive off, not failed, not restartable, no workspace of the run's own, `archive_with_run` off, or
+ * the workspace was already dealt with). Counted from the failure only, so later updates of the run do not move it.
+ */
+export function workspaceKeptUntil(run: Run): string | null {
+  if (!run.playbook.autoArchive.enabled || !run.playbook.workspace.archiveWithRun || run.status !== "failed" || isActive(run)) return null;
+  if (!run.workspaceCreated || run.workspaceArchive !== null || !isRestartable(run)) return null;
+  return new Date(Date.parse(runEndedAt(run)) + run.playbook.autoArchive.keepFailedWorkspaceMs).toISOString();
 }
 
 /** A step attempt's timeout: resolved at its start, else the step's (attempts from before templated timeouts). */

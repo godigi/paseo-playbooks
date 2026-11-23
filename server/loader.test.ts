@@ -1,7 +1,8 @@
 import { chmod, cp, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { resetDeprecationNotes } from "./config";
 import { hasPlaybooks, loadPlaybooks } from "./loader";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
@@ -65,6 +66,20 @@ describe("loadPlaybooks", () => {
     const { entries } = await loadPlaybooks(dir);
     expect(entries.find((entry) => entry.id === "retro")).toMatchObject({ hidden: true, errors: [] });
     expect(entries.find((entry) => entry.id === "pr")).toMatchObject({ hidden: false, errors: [] });
+  });
+
+  it("reads workspace.title, the playbook's over the default, and refuses an undeclared input", async () => {
+    const step = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const dir = await workspace({
+      "defaults/main.yaml": "workspace: { title: \"Run {ticket}\" }\n",
+      "own.yaml": `workspace: { title: "Ship {ticket}" }\ninputs: { ticket: { type: string, required: true } }\n${step}`,
+      "plain.yaml": `inputs: { ticket: { type: string } }\n${step}`,
+      "bad.yaml": `workspace: { title: "Ship {tickt}" }\ninputs: { ticket: { type: string } }\n${step}`,
+    });
+    const { entries } = await loadPlaybooks(dir);
+    expect(entries.find((entry) => entry.id === "own")?.playbook?.workspace.title).toBe("Ship {ticket}");
+    expect(entries.find((entry) => entry.id === "plain")?.playbook?.workspace.title).toBe("Run {ticket}");
+    expect(entries.find((entry) => entry.id === "bad")?.errors.join("\n")).toMatch(/workspace\.title uses "\{tickt\}" but the playbook declares no such input/);
   });
 
   it("reports when no folder exists", async () => {
@@ -305,6 +320,192 @@ steps:
     expect(entries.find((entry) => entry.id === "plain")!.playbook!.slowWarning).toEqual({ runs: 20, factor: 2 });
     const none = await workspace({ "plain.yaml": steps });
     expect((await loadPlaybooks(none)).entries[0]!.playbook!.slowWarning).toEqual({ runs: 10, factor: 2 });
+  });
+
+  it("reads manager_recovery in a playbook and in defaults, field by field (unset = null); refuses a flat or unknown key", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const dir = await workspace({ "defaults/main.yaml": "manager_recovery: { retry: false, fallback: { provider: codex, model: gpt-5-mini } }\n", "pr.yaml": `manager_recovery: { retry: true }\n${steps}`, "plain.yaml": steps });
+    const entries = (await loadPlaybooks(dir)).entries;
+    expect(entries.find((entry) => entry.id === "pr")!.playbook!.managerRecovery).toEqual({ retry: true, fallback: { provider: "codex", model: "gpt-5-mini" } });
+    expect(entries.find((entry) => entry.id === "plain")!.playbook!.managerRecovery).toEqual({ retry: false, fallback: { provider: "codex", model: "gpt-5-mini" } });
+    const none = await workspace({ "plain.yaml": steps });
+    expect((await loadPlaybooks(none)).entries[0]!.playbook!.managerRecovery).toEqual({ retry: null, fallback: null });
+    const bad = await workspace({ "pr.yaml": `manager_recovery: { retry: true, fallback: { provider: codex } }\n${steps}`, "other.yaml": `manager_recovery: { fallback: codex/gpt-5-mini }\n${steps}` });
+    expect((await loadPlaybooks(bad)).entries.every((entry) => entry.errors.length > 0)).toBe(true);
+  });
+
+  it("reads rate_limit.priority in a playbook and in defaults (default 0); refuses a bad or unknown rate_limit", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const dir = await workspace({ "defaults/main.yaml": "rate_limit: { priority: 2 }\n", "urgent.yaml": `rate_limit: { priority: 9 }\n${steps}`, "plain.yaml": steps });
+    const entries = (await loadPlaybooks(dir)).entries;
+    expect(entries.find((entry) => entry.id === "urgent")!.playbook!.rateLimit).toEqual({ priority: 9 });
+    expect(entries.find((entry) => entry.id === "plain")!.playbook!.rateLimit).toEqual({ priority: 2 });
+    const none = await workspace({ "plain.yaml": steps });
+    expect((await loadPlaybooks(none)).entries[0]!.playbook!.rateLimit).toEqual({ priority: 0 });
+    for (const block of ["{ priority: high }", "{ priority: 1.5 }", "{ weight: 3 }", "3"]) {
+      const bad = await workspace({ "pr.yaml": `rate_limit: ${block}\n${steps}` });
+      expect((await loadPlaybooks(bad)).entries[0]!.errors.length, block).toBeGreaterThan(0);
+    }
+  });
+
+  it("reads quota_limit.priority (and the old rate_limit alias, noted once; the new key wins) in a playbook and in defaults", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      resetDeprecationNotes();
+      const dir = await workspace({ "defaults/main.yaml": "quota_limit: { priority: 2 }\n", "new.yaml": `quota_limit: { priority: 9 }\n${steps}`, "old.yaml": `rate_limit: { priority: 7 }\n${steps}`, "both.yaml": `rate_limit: { priority: 7 }\nquota_limit: { priority: 4 }\n${steps}`, "plain.yaml": steps });
+      const entries = (await loadPlaybooks(dir)).entries;
+      const priority = (id: string) => entries.find((entry) => entry.id === id)!.playbook!.rateLimit.priority;
+      expect([priority("new"), priority("old"), priority("both"), priority("plain")]).toEqual([9, 7, 4, 2]);
+      const old = await workspace({ "defaults/main.yaml": "rate_limit: { priority: 3 }\n", "plain.yaml": steps });
+      expect((await loadPlaybooks(old)).entries[0]!.playbook!.rateLimit.priority).toBe(3);
+      expect(warn.mock.calls.filter(([text]) => String(text).includes("`rate_limit` is deprecated") && String(text).includes("`quota_limit`"))).toHaveLength(1);
+      for (const block of ["{ priority: high }", "{ weight: 3 }"]) {
+        const bad = await workspace({ "pr.yaml": `quota_limit: ${block}\n${steps}` });
+        expect((await loadPlaybooks(bad)).entries[0]!.errors.length, block).toBeGreaterThan(0);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reads quota_limits in defaults into every playbook; usable_percent alone turns pacing on; rate_limits stays an alias; the new key wins", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      resetDeprecationNotes();
+      const only = await workspace({ "defaults/main.yaml": "quota_limits: { quota: { usable_percent: 90 } }\n", "plain.yaml": steps });
+      expect((await loadPlaybooks(only)).entries[0]!.playbook!.quotaLimits).toEqual({ quota: { pacing: true, usablePercent: 90 } });
+      const full = await workspace({ "defaults/main.yaml": "quota_limits: { steps: 4, playbooks: 2, quota: { pacing: false, usable_percent: 80, refresh_interval: 2m, max_age: 10m } }\n", "plain.yaml": steps });
+      expect((await loadPlaybooks(full)).entries[0]!.playbook!.quotaLimits).toEqual({ steps: 4, playbooks: 2, quota: { pacing: false, usablePercent: 80, refreshMs: 120_000, maxAgeMs: 600_000 } });
+      const legacy = await workspace({ "defaults/main.yaml": "rate_limits: { quota: { usable_percent: 90 } }\n", "plain.yaml": steps });
+      expect((await loadPlaybooks(legacy)).entries[0]!.playbook!.quotaLimits).toEqual({ quota: { usablePercent: 90 } });
+      expect(warn.mock.calls.filter(([text]) => String(text).includes("`rate_limits` is deprecated") && String(text).includes("`quota_limits`"))).toHaveLength(1);
+      const both = await workspace({ "defaults/main.yaml": "rate_limits: { steps: 9 }\nquota_limits: { playbooks: 1 }\n", "plain.yaml": steps });
+      expect((await loadPlaybooks(both)).entries[0]!.playbook!.quotaLimits).toEqual({ playbooks: 1 });
+      const none = await workspace({ "plain.yaml": steps });
+      expect((await loadPlaybooks(none)).entries[0]!.playbook!.quotaLimits).toEqual({});
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reads quota.closed_hours and refuses a bad day, time, slot or timezone with a clear message", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const good = await workspace({ "defaults/main.yaml": "quota_limits: { quota: { usable_percent: 90 } }\nclosed_hours:\n  timezone: Europe/Paris\n  slots:\n    - { days: [saturday, sunday], from: \"00:00\", to: \"24:00\" }\n    - { days: monday, from: \"00:00\", to: \"08:00\" }\n", "pr.yaml": steps });
+    const loaded = await loadPlaybooks(good);
+    expect(JSON.stringify(loaded.entries[0]!.errors)).toBe("[]");
+    expect(loaded.entries[0]!.playbook!.quotaLimits.quota?.closedHours?.timezone).toBe("Europe/Paris");
+    expect(loaded.entries[0]!.playbook!.quotaLimits.quota?.usablePercent).toBe(90);
+    // The earlier location, quota_limits.quota.closed_hours, still works; the top-level block wins when both are there.
+    const old = await workspace({ "defaults/main.yaml": "quota_limits: { quota: { closed_hours: { timezone: UTC, slots: [{ days: monday, from: \"00:00\", to: \"08:00\" }] } } }\n", "pr.yaml": steps });
+    expect((await loadPlaybooks(old)).entries[0]!.playbook!.quotaLimits.quota?.closedHours?.timezone).toBe("UTC");
+    const both = await workspace({ "defaults/main.yaml": "quota_limits: { quota: { closed_hours: { timezone: UTC, slots: [{ days: monday, from: \"00:00\", to: \"08:00\" }] } } }\nclosed_hours: { timezone: Asia/Tokyo, slots: [{ days: monday, from: \"00:00\", to: \"08:00\" }] }\n", "pr.yaml": steps });
+    expect((await loadPlaybooks(both)).entries[0]!.playbook!.quotaLimits.quota?.closedHours?.timezone).toBe("Asia/Tokyo");
+    const inPlaybook = await workspace({ "pr.yaml": `closed_hours: { slots: [{ days: monday, from: "00:00", to: "08:00" }] }\n${steps}` });
+    expect(JSON.stringify(await loadPlaybooks(inPlaybook))).toContain("not set in a playbook");
+    const cases: Array<[string, string]> = [
+      ["{ days: funday, from: \"00:00\", to: \"08:00\" }", "unknown day"],
+      ["{ days: monday, from: \"8am\", to: \"09:00\" }", "not a time"],
+      ["{ days: monday, from: \"25:00\", to: \"26:00\" }", "not a time"],
+      ["{ days: monday, from: \"08:00\", to: \"08:00\" }", "must be after"],
+      ["{ days: monday, from: \"22:00\", to: \"06:00\" }", "does not wrap"],
+      ["{ days: monday, from: \"00:00\" }", "to"],
+    ];
+    for (const [slot, message] of cases) {
+      const bad = await workspace({ "defaults/main.yaml": `closed_hours: { timezone: UTC, slots: [${slot}] }\n`, "pr.yaml": steps });
+      expect(JSON.stringify(await loadPlaybooks(bad)), slot).toContain(message);
+    }
+    // Nested form: several ranges per day group, accepted; mixed, empty, incomplete or bad ranges refused with a clear message.
+    const nested = await workspace({ "defaults/main.yaml": "closed_hours:\n  timezone: Europe/Paris\n  slots:\n    - days: [saturday, sunday]\n      slots:\n        - { from: \"00:00\", to: \"24:00\" }\n    - days: weekdays\n      slots:\n        - { from: \"00:00\", to: \"08:00\" }\n        - { from: \"20:00\", to: \"24:00\" }\n    - { days: monday, from: \"09:00\", to: \"10:00\" }\n", "pr.yaml": steps });
+    expect((await loadPlaybooks(nested)).entries[0]!.errors).toEqual([]);
+    const nestedCases: Array<[string, string]> = [
+      ["{ days: monday, from: \"00:00\", to: \"08:00\", slots: [{ from: \"09:00\", to: \"10:00\" }] }", "not both"],
+      ["{ days: monday, to: \"08:00\", slots: [{ from: \"09:00\", to: \"10:00\" }] }", "not both"],
+      ["{ days: monday, slots: [] }", "nested `slots` list is empty"],
+      ["{ days: monday }", "needs `from` and `to`"],
+      ["{ days: monday, slots: [{ from: \"09:00\", to: \"08:00\" }] }", "must be after"],
+      ["{ days: monday, slots: [{ from: \"9am\", to: \"10:00\" }] }", "not a time"],
+      ["{ days: funday, slots: [{ from: \"09:00\", to: \"10:00\" }] }", "unknown day"],
+    ];
+    for (const [slot, message] of nestedCases) {
+      const bad = await workspace({ "defaults/main.yaml": `closed_hours: { timezone: UTC, slots: [${slot}] }\n`, "pr.yaml": steps });
+      expect(JSON.stringify(await loadPlaybooks(bad)), slot).toContain(message);
+    }
+    const tz = await workspace({ "defaults/main.yaml": "closed_hours: { timezone: Mars/Olympus, slots: [{ days: monday, from: \"00:00\", to: \"08:00\" }] }\n", "pr.yaml": steps });
+    expect(JSON.stringify(await loadPlaybooks(tz))).toContain("IANA timezone");
+    const empty = await workspace({ "defaults/main.yaml": "closed_hours: { slots: [] }\n", "pr.yaml": steps });
+    expect((await loadPlaybooks(empty)).entries[0]!.errors.length).toBeGreaterThan(0);
+  });
+
+  it("refuses a bad quota_limits in defaults (and in the old rate_limits), and a playbook's own quota_limits", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    for (const block of ["{ steps: 0 }", "{ playbooks: 1.5 }", "{ quota: { usable_percent: 400 } }", "{ quota: { usable_percent: 0 } }", "{ quota: { pacing: yes please } }", "{ quota: { max_age: soon } }", "{ quota: { refresh_interval: 0 } }", "{ speed: 3 }", "{ quota: { window: weekly } }", "5"]) {
+      for (const key of ["quota_limits", "rate_limits"]) {
+        const bad = await workspace({ "defaults/main.yaml": `${key}: ${block}\n`, "pr.yaml": steps });
+        const loaded = await loadPlaybooks(bad);
+        expect(JSON.stringify(loaded), `${key}: ${block}`).toContain("defaults/main.yaml");
+        expect(loaded.entries[0]!.errors.length, `${key}: ${block}`).toBeGreaterThan(0);
+      }
+    }
+    const own = await workspace({ "pr.yaml": `quota_limits: { steps: 2 }\n${steps}` });
+    expect((await loadPlaybooks(own)).entries[0]!.errors.length).toBeGreaterThan(0);
+  });
+
+  it("refuses the removed rate_limit.estimate with a message saying so, in a playbook and in defaults", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const inPlaybook = await workspace({ "pr.yaml": `rate_limit: { priority: 1, estimate: 3 }\n${steps}` });
+    expect((await loadPlaybooks(inPlaybook)).entries[0]!.errors.join("\n")).toMatch(/rate_limit\.estimate.*was removed/);
+    const inDefaults = await workspace({ "defaults/main.yaml": "rate_limit: { estimate: 3 }\n", "pr.yaml": steps });
+    const loaded = await loadPlaybooks(inDefaults);
+    expect(JSON.stringify(loaded)).toMatch(/rate_limit\.estimate.*was removed/);
+  });
+
+  it("reads agent_rules: defaults first, then the playbook's, each once; absent means none", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const dir = await workspace({
+      "defaults/main.yaml": 'agent_rules: ["  Prefer simple, separate shell commands.  ", "Check the listener first.", "Check the listener first."]\n',
+      "pr.yaml": `agent_rules: ["Check the listener first.", "Be brief."]\n${steps}`,
+      "plain.yaml": steps,
+    });
+    const entries = (await loadPlaybooks(dir)).entries;
+    expect(entries.every((entry) => entry.errors.length === 0)).toBe(true);
+    expect(entries.find((entry) => entry.id === "pr")!.playbook!.agentRules).toEqual(["Prefer simple, separate shell commands.", "Check the listener first.", "Be brief."]);
+    expect(entries.find((entry) => entry.id === "plain")!.playbook!.agentRules).toEqual(["Prefer simple, separate shell commands.", "Check the listener first."]);
+    const none = await workspace({ "plain.yaml": steps });
+    expect((await loadPlaybooks(none)).entries[0]!.playbook!.agentRules).toEqual([]);
+    const own = await workspace({ "pr.yaml": `agent_rules: [Be brief.]\n${steps}` });
+    expect((await loadPlaybooks(own)).entries[0]!.playbook!.agentRules).toEqual(["Be brief."]);
+  });
+
+  it("adds a sub-playbook's agent_rules to its parent's", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const dir = await workspace({
+      "defaults/main.yaml": "agent_rules: [Repo rule.]\n",
+      "child.yaml": `agent_rules: [Child rule.]\n${steps}`,
+      "parent.yaml": `agent_rules: [Parent rule.]\nsteps:\n  - { id: c, playbook: { name: child } }\n`,
+    });
+    const parent = (await loadPlaybooks(dir)).entries.find((entry) => entry.id === "parent")!;
+    expect(parent.errors).toEqual([]);
+    expect(parent.playbook!.agentRules).toEqual(["Repo rule.", "Parent rule.", "Child rule."]);
+  });
+
+  it("refuses a malformed agent_rules, in a playbook and in defaults", async () => {
+    const steps = "steps:\n  - id: a\n    role: { name: investigator, prompt: go }\n";
+    const cases: Array<[string, RegExp]> = [
+      ["agent_rules: be nice", /agent_rules: expected a list of strings/],
+      ["agent_rules: { a: b }", /agent_rules: expected a list of strings/],
+      ["agent_rules: [ok, 3]", /agent_rules\.1: expected a string/],
+      ['agent_rules: ["  "]', /agent_rules\.0: empty rule/],
+      [`agent_rules: ["${"x".repeat(501)}"]`, /agent_rules\.0: 501 characters, at most 500/],
+      [`agent_rules: [${Array.from({ length: 21 }, (_, i) => `r${i}`).join(", ")}]`, /agent_rules: 21 rules, at most 20/],
+    ];
+    for (const [line, message] of cases) {
+      const inPlaybook = (await loadPlaybooks(await workspace({ "pr.yaml": `${line}\n${steps}` }))).entries[0]!;
+      expect(inPlaybook.errors.join("\n"), line).toMatch(message);
+      const inDefaults = (await loadPlaybooks(await workspace({ "defaults/main.yaml": `${line}\n`, "pr.yaml": steps }))).entries[0]!;
+      expect(inDefaults.errors.join("\n"), line).toMatch(message);
+    }
   });
 
   it("refuses a bad or unknown slow_warning", async () => {

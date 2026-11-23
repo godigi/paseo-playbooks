@@ -2,6 +2,7 @@ import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { Playbook, Run } from "../shared/types";
 import {
+  currentAttempt,
   cancelRun,
   completeStep,
   decideGate,
@@ -14,7 +15,9 @@ import {
   resumeRun,
   startAttempt,
 } from "./engine";
+import { resolveRunInputs } from "./engine";
 import { isPaused } from "../shared/types";
+import { findGate, restartRun } from "./engine";
 import { loadPlaybooks } from "./loader";
 
 const EXAMPLES = path.resolve(__dirname, "..", "examples");
@@ -123,6 +126,14 @@ describe("engine", () => {
     expect(() => recordReport(r, "a1", { outcome: "nope", summary: "", outputs: {} }, now())).toThrow(/not allowed/);
   });
 
+  it("does not require declared outputs on a failure report or its completion", () => {
+    const r = run();
+    startAttempt(r, "investigate", { agentId: "a1", brief: "", now: now(), readonlySnapshot: null });
+    recordReport(r, "a1", { outcome: "failure", summary: "broke", outputs: { plan: "partial", bogus: 1 } }, now());
+    expect(currentAttempt(r, "investigate")!.report).toEqual({ outcome: "failure", summary: "broke", outputs: { plan: "partial" } });
+    expect(() => completeStep(r, "investigate", { outcome: "failure", now: now() })).not.toThrow();
+  });
+
   it("refuses to start a step that is not ready", () => {
     const r = run();
     expect(() => startAttempt(r, "implement", { agentId: "x", brief: "", now: now(), readonlySnapshot: null })).toThrow(/pending, not ready/);
@@ -163,6 +174,40 @@ describe("engine", () => {
     const second = r.gates.filter((g) => g.kind === "loop_limit").at(-1)!;
     decideGate(r, second.id, { decision: "rejected", comment: "enough", by: "host", via: "panel", now: now() });
     expect(r.status).toBe("failed");
+  });
+
+  it("a loop-limit gate after restart_run gets a new id: the old, decided gate is not mistaken for it", () => {
+    const r = run();
+    runStep(r, "investigate", "success");
+    const toLimit = () => {
+      for (let guard = 0; guard < 10 && !r.gates.some((g) => g.status === "pending"); guard++) {
+        for (const id of ["implement", "review", "local_qa"]) if (readySteps(r).includes(id)) runStep(r, id, "success");
+        if (readySteps(r).includes("babysit")) runStep(r, "babysit", "changes_requested");
+      }
+      return r.gates.filter((g) => g.kind === "loop_limit" && g.status === "pending").at(-1)!;
+    };
+    const first = toLimit();
+    decideGate(r, first.id, { decision: "rejected", comment: "no", by: "host", via: "panel", now: now() });
+    expect(r.status).toBe("failed");
+    restartRun(r, "implement", { comment: null, by: "host", now: now() });
+    const second = toLimit();
+    expect(second.id).not.toBe(first.id);
+    expect(new Set(r.gates.map((g) => g.id)).size).toBe(r.gates.length);
+    // The new gate is the one found, pending, and decidable: not "already decided" by the old one.
+    expect(findGate(r, second.id)).toBe(second);
+    expect(findGate(r, first.id)).toBe(first);
+    const decided = decideGate(r, second.id, { decision: "approved", comment: null, by: "host", via: "panel", now: now() });
+    expect(decided.alreadyDecided).toBe(false);
+    expect(second.status).toBe("approved");
+    expect(first.status).toBe("rejected");
+  });
+
+  it("findGate picks the pending gate among gates sharing an id (runs saved before ids were unique)", () => {
+    const r = run();
+    runStep(r, "investigate", "success");
+    const mk = (status: "rejected" | "pending") => ({ ...structuredClone(capabilityGate()), id: "loop-x-y-8", status });
+    r.gates.push(mk("rejected"), mk("pending"));
+    expect(findGate(r, "loop-x-y-8")!.status).toBe("pending");
   });
 
   it("retries a failure within retries, then fails; lost attempts don't count", () => {
@@ -231,4 +276,49 @@ describe("engine", () => {
     expect(r.pausedAt).toBeNull();
     expect(() => pauseRun(r, now())).toThrow(/only an active run can be paused/);
   });
+
+  describe("resolveRunInputs: an empty value falls back to the declared default", () => {
+    const pb = (inputs: Record<string, unknown>, steps: unknown[] = []) => ({ inputs, steps }) as unknown as Playbook;
+    const defs = {
+      exclude: { type: "string", required: false, default: "none" },
+      count: { type: "number", required: false, default: 3 },
+      mode: { type: "enum", required: false, values: ["a", "b"], default: "b" },
+      note: { type: "string", required: false },
+      must: { type: "string", required: true },
+    };
+    it("falls back for empty and whitespace-only values, of every type", () => {
+      for (const blank of ["", "   ", "\t\n"]) {
+        const r = resolveRunInputs(pb(defs), { exclude: blank, count: blank, mode: blank, must: "x" });
+        expect(r).toEqual({ ok: true, inputs: { exclude: "none", count: 3, mode: "b", must: "x" } });
+      }
+    });
+    it("a real value wins over the default", () => {
+      const r = resolveRunInputs(pb(defs), { exclude: "src", count: 5, mode: "a", must: "x" });
+      expect(r).toEqual({ ok: true, inputs: { exclude: "src", count: 5, mode: "a", must: "x" } });
+    });
+    it("an input without a default is unchanged: empty stays unset, a required one is refused", () => {
+      expect(resolveRunInputs(pb(defs), { note: "  ", must: "x" })).toMatchObject({ ok: true, inputs: { exclude: "none", count: 3, mode: "b", must: "x" } });
+      expect(resolveRunInputs(pb(defs), { must: "" })).toEqual({ ok: false, errors: ['input "must" is required'] });
+    });
+    it("a strict fan-out reference to a defaulted input no longer trips on an empty panel value", () => {
+      const steps = [
+        {
+          id: "spawn",
+          when: [],
+          inputs: { exclude: { source: "{{ playbook.inputs.exclude }}" } },
+          fanout: { items: "x", inputs: {}, pool: { inputs: { exclude: "{{ inputs.exclude }}" } } },
+        },
+      ];
+      const playbook = pb({ exclude: defs.exclude }, steps);
+      expect(resolveRunInputs(playbook, { exclude: "" })).toEqual({ ok: true, inputs: { exclude: "none" } });
+      const noDefault = pb({ exclude: { type: "string", required: false } }, steps);
+      expect(resolveRunInputs(noDefault, { exclude: "" })).toMatchObject({ ok: false });
+    });
+  });
 });
+
+function capabilityGate() {
+  const r = capabilityAtGate();
+  requestGate(r, "approve", "", now());
+  return r.gates[0]!;
+}

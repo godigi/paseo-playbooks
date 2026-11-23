@@ -183,13 +183,23 @@ describe("restart decisions through the real lookup", () => {
     const booted = await boot(daemon);
     let tick = 0;
     const now = () => new Date(Date.UTC(2026, 10, 4, 12, 0, tick++)).toISOString();
-    const run = newRun({ id: "run_r", playbook: await playbook(), workspaceId: "ws", workspaceDir: "/tmp", projectId: "p", branch: null, managerAgentId: "m", inputs: {}, now: now() });
+    const run = newRun({ id: "run_r", playbook: await playbook(), workspaceId: "ws", workspaceDir: "/tmp", projectId: "p", branch: null, managerAgentId: "m", inputs: {}, workspaceCreated: true, now: now() });
     startAttempt(run, "one", { agentId: "x", brief: "", now: now(), readonlySnapshot: null });
     cancelRun(run, "stop", now());
     await booted.store.create(run);
     daemon.agents.set("m", { archivedAt: null });
     return booted;
   }
+
+  it("archiving a workspace together with its run drops the cached list", async () => {
+    const daemon = fakeDaemon([{ id: "ws", projectId: "p" }]);
+    const { runtime, store } = await withRun(daemon);
+    expect(await runtime.lookupWorkspace("ws")).not.toBeNull();
+    const outcome = await (runtime as unknown as { archiveWorkspaceWithRun(run: unknown): Promise<{ archived: boolean }> }).archiveWorkspaceWithRun(store.get("run_r")!);
+    expect(outcome.archived).toBe(true);
+    expect(daemon.archived).toEqual(["ws"]);
+    expect(await runtime.lookupWorkspace("ws")).toBeNull();
+  });
 
   it("a transient daemon failure is reported as such, not as \"its workspace no longer exists\"", async () => {
     const daemon = fakeDaemon([{ id: "ws", projectId: "p" }]);

@@ -27,3 +27,20 @@ describe("queued message", () => {
     expect(mergeQueued(a, { text: "two", attachments: [] }).text).toBe("one\n\ntwo");
   });
 });
+
+describe("while the conversation is compacted", () => {
+  it("queues every message (even a plain Enter) and says it is compacting", async () => {
+    const { shouldQueue, workLabel } = await import("./queue");
+    const { PluginTranslationRuntime } = await import("@getpaseo/plugin/client/host");
+    const { messages } = await import("../i18n");
+    const runtime = new PluginTranslationRuntime({ getLocale: () => "en", subscribe: () => () => {} });
+    const label = (key: "sidekick.chat.compacting" | "sidekick.chat.working") => runtime.t(messages, key) as string;
+    expect(shouldQueue(false, { running: true, compacting: false })).toBe(false);
+    expect(shouldQueue(true, { running: true, compacting: false })).toBe(true);
+    expect(shouldQueue(false, { running: true, compacting: true })).toBe(true);
+    expect(shouldQueue(true, { running: false, compacting: false })).toBe(false);
+    expect(workLabel(label, { running: true, compacting: true })).toMatch(/^Compacting/);
+    expect(workLabel(label, { running: true, compacting: false })).toBe("Working…");
+    expect(workLabel(label, { running: false, compacting: false })).toBeNull();
+  });
+});

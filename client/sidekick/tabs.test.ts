@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { SidekickProject } from "../../shared/contracts";
-import { statusLine, visibleTabs } from "./tabs";
+import { PluginTranslationRuntime } from "@getpaseo/plugin/client/host";
+import { messages } from "../i18n";
+import { statusLine as statusWith, visibleTabs } from "./tabs";
 
-const project = (projectId: string, over: Partial<SidekickProject> = {}): SidekickProject => ({ projectId, workspaceId: `ws-${projectId}`, label: projectId, configured: false, errors: [], agentId: null, activeRuns: 0, needYou: 0, ...over });
+const runtime = new PluginTranslationRuntime({ getLocale: () => "en", subscribe: () => () => {} });
+const statusLine = (project: Parameters<typeof statusWith>[1]) => statusWith((key, params) => runtime.t(messages, key as never, params as never) as string, project);
+
+const project = (projectId: string, over: Partial<SidekickProject> = {}): SidekickProject => ({ projectId, workspaceId: `ws-${projectId}`, label: projectId, configured: false, errors: [], agentId: null, activeRuns: 0, needYou: 0, compacting: false, ...over });
 
 describe("visibleTabs", () => {
   it("shows projects with active runs or a Sidekick, and those added, most active first", () => {

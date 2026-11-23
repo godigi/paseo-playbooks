@@ -5,10 +5,10 @@
 import { descendantsOf } from "../shared/graph";
 import { record } from "./event-core";
 import { blockEntrySteps, blockStepIds, holdsBlock, innermostBlock } from "../shared/slots";
-import { ADMISSION_CHOICES, askChoices, askHumanText, askTransitionOf, choicesOfGate, GATE_SUMMARY_MAX, outcomeTransition } from "../shared/gates";
+import { ADMISSION_CHOICES, PERMISSION_CHOICES, askChoices, askHumanText, askTransitionOf, choicesOfGate, GATE_SUMMARY_MAX, outcomeTransition, isDeferred, waitsForHuman } from "../shared/gates";
 import { parse as parseYaml, stringify as toYaml } from "yaml";
-import type { PoolPass, AfterTask, AskChoice, Attempt, AttemptAgent, FanoutChild, FanoutState, Gate, GateDecider, Job, Playbook, Run, RunDefinition, RunStep, RunWorktree, Step, Transition, VarValue, When } from "../shared/types";
-import { isActive, isAgentlessAttempt, isManagerless, MAX_FANOUT_PAST, MAX_POOL_PASSES, isPaused, isPipeline, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
+import type { DismissedFinding, GateWaitCondition, PoolPass, AfterTask, AskChoice, Attempt, AttemptAgent, FanoutChild, FanoutState, Gate, GateDecider, Job, Playbook, RateHold, Run, RunDefinition, RunStep, RunWorktree, Step, Transition, VarValue, When } from "../shared/types";
+import { isActive, isUnavailableHold, isAgentlessAttempt, isFanoutAttempt, isManagerless, MAX_FANOUT_PAST, MAX_POOL_PASSES, isPaused, isPipeline, isStepDone, isStepLive, isTerminal, restartBlocker, runningAfterTasks } from "../shared/types";
 import { coerceValue, formatValue, type ListItem, lookup, parseDuration, parseList, renderTemplate, replaceRefs, resolveValue, singleRef, templateRefs } from "../shared/vars";
 
 export class EngineError extends Error {}
@@ -81,6 +81,14 @@ export interface NewRunInput {
   definition?: RunDefinition;
   /** Set when a fan-out step started the run. */
   parent?: Run["parent"];
+  /** `start_playbook`'s priority, overriding the playbook's `quota_limit.priority`. */
+  priority?: number | null;
+  /** A parent's manual priority a new child inherits. */
+  priorityOverride?: number | null;
+  inheritChildPriority?: boolean;
+  /** Not subject to quota limiting (`start_playbook` `quota.exempt`, or inherited from the parent run). */
+  quotaExempt?: boolean;
+  inheritChildExempt?: boolean;
   inputs: Record<string, unknown>;
   now: string;
 }
@@ -96,7 +104,10 @@ export function resolveRunInputs(
     if (!playbook.inputs[name]) errors.push(`unknown input "${name}"`);
   }
   for (const [name, def] of Object.entries(playbook.inputs)) {
-    const raw = given[name] ?? def.default;
+    // An empty or whitespace-only value (the panel's empty field) counts as not given, so the declared default applies.
+    const g = given[name];
+    const blank = g === undefined || g === null || (typeof g === "string" && g.trim() === "");
+    const raw = blank ? def.default ?? (typeof g === "string" ? g : undefined) : g;
     if (raw === undefined || raw === "") {
       if (def.required) errors.push(`input "${name}" is required`);
       continue;
@@ -105,7 +116,38 @@ export function resolveRunInputs(
     if (coerced.ok) inputs[name] = coerced.value;
     else errors.push(`input "${name}": ${coerced.error}`);
   }
+  if (errors.length === 0) errors.push(...unsetStrictInputs(playbook, inputs));
   return errors.length > 0 ? { ok: false, errors } : { ok: true, inputs };
+}
+
+/**
+ * Fan-out templates (items, key, workspace name, child inputs, pool refill inputs) are strict: an unset `{{ inputs.<name> }}`
+ * is an error, never empty. When such an input is wired straight from a playbook input the run did not get (optional, no
+ * default), the run could only fail later, mid-run. Names each one now. Steps with a `when` are left alone (they may be skipped).
+ */
+export function unsetStrictInputs(playbook: Playbook, given: Record<string, VarValue>): string[] {
+  const errors: string[] = [];
+  for (const step of playbook.steps) {
+    const fan = step.fanout;
+    if (!fan || step.when?.length) continue;
+    const templates: [string, string][] = [["fanout.items", fan.items], ...Object.entries(fan.inputs).map(([name, t]): [string, string] => [`fanout.inputs.${name}`, t])];
+    if (fan.key !== undefined) templates.push(["fanout.key", fan.key]);
+    if (fan.workspaceName !== undefined) templates.push(["fanout.workspace_name", fan.workspaceName]);
+    for (const [name, t] of Object.entries(fan.pool?.inputs ?? {})) templates.push([`fanout.pool.refill.inputs.${name}`, t]);
+    for (const [at, template] of templates) {
+      for (const ref of templateRefs(template)) {
+        if (!ref.startsWith("inputs.")) continue;
+        const name = ref.slice("inputs.".length);
+        for (const source of templateRefs(step.inputs[name]?.source ?? "")) {
+          if (!source.startsWith("playbook.inputs.")) continue;
+          const input = source.slice("playbook.inputs.".length);
+          if (input in given) continue;
+          errors.push(`input "${input}" is not set, but step "${step.id}" ${at} reads {{ ${ref} }} (from {{ ${source} }}) and an unset reference is an error: provide "${input}" when starting, or declare a non-empty \`default\` for it in the playbook's inputs`);
+        }
+      }
+    }
+  }
+  return [...new Set(errors)];
 }
 
 /** Validates one job's inputs against a singleton playbook (every input of a singleton is each job's). */
@@ -164,6 +206,9 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, kind: "
     projectId: input.projectId,
     branch: input.branch,
     managerAgentId: input.managerAgentId,
+    managerRecoveries: [],
+    managerQuotaBlockedId: null,
+    managerRecoveryPrompt: null,
     usageDeltas: true,
     name: input.name ?? null,
     inputs,
@@ -176,14 +221,25 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, kind: "
     workspaceArchive: null,
     exhausted: [],
     worktree: input.worktree ?? null,
+    scripts: null,
     definition: input.definition ?? null,
     archivedAt: null,
     seenAt: null,
     pausedAt: null,
+    rateHold: null,
+    rateNote: null,
+    priority: input.priority ?? null,
+    priorityOverride: input.priorityOverride ?? null,
+    inheritChildPriority: input.inheritChildPriority ?? false,
+    quotaExempt: input.quotaExempt ?? false,
+    inheritChildExempt: input.inheritChildExempt ?? false,
+    dismissedFindings: [],
+    managerWatch: { steps: {}, question: null },
+    warden: { findings: {} },
     steps: Object.fromEntries(
       input.playbook.steps.map((step) => [
         step.id,
-        { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, loop: 0, completedSeq: null, branch: null, fanout: null, fanoutPast: [], queuedAt: null, nextModel: null },
+        { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, loop: 0, completedSeq: null, branch: null, fanout: null, fanoutPast: [], queuedAt: null, nextModel: null, waitUntil: null },
       ]),
     ),
     loops: {},
@@ -214,7 +270,7 @@ function createRun(input: NewRunInput, inputs: Record<string, VarValue>, kind: "
     const resolved = resolveTimeout(step, stepInputs(run, step));
     if (!resolved.ok) throw new EngineError(resolved.error);
   }
-  log(run, input.now, "run_started", null, `playbook ${input.playbook.id}`);
+  log(run, input.now, "run_started", null, `playbook ${input.playbook.id}${run.quotaExempt ? "; quota: exempt (not subject to quota limiting)" : ""}`);
   refreshReady(run, input.now);
   return run;
 }
@@ -277,6 +333,11 @@ export function refreshReady(run: Run, now: string, fx?: Effects): { ready: stri
   for (const step of run.playbook.steps) {
     const state = run.steps[step.id]!;
     if (state.status !== "pending" || !isStepLive(run, step.id)) continue;
+    // A step a goto sent back with a `delay` stays pending until it is due.
+    if (state.waitUntil !== null) {
+      if (Date.parse(state.waitUntil) > Date.parse(now)) continue;
+      state.waitUntil = null;
+    }
     if (!step.needs.every((need) => { const status = run.steps[need]?.status; return status !== undefined && isStepDone(status); })) continue;
     const gating = limited.some(([prefix]) => blockEntrySteps(run.playbook, prefix).includes(step.id) && !holdsBlock(run, prefix));
     if (gating) {
@@ -290,6 +351,23 @@ export function refreshReady(run: Run, now: string, fx?: Effects): { ready: stri
     }
   }
   return { ready, queued };
+}
+
+/** The steps of the run that wait for a goto's `delay`, with when each is due (ISO). */
+export function delayedSteps(run: Run): Array<{ stepId: string; due: string }> {
+  return run.playbook.steps.flatMap((step) => {
+    const state = run.steps[step.id];
+    return state?.status === "pending" && state.waitUntil !== null ? [{ stepId: step.id, due: state.waitUntil }] : [];
+  });
+}
+
+/** Makes ready the steps whose delay is over (a no-op for the others). Returns the steps that became ready. */
+export function releaseDelayed(run: Run, now: string): string[] {
+  const due = delayedSteps(run).filter((entry) => Date.parse(entry.due) <= Date.parse(now)).map((entry) => entry.stepId);
+  if (due.length === 0) return [];
+  const { ready } = refreshReady(run, now);
+  for (const stepId of due) log(run, now, "delay_over", stepId, "the loop-back delay is over");
+  return ready.filter((id) => due.includes(id));
 }
 
 /** Why a step's `when` does not hold now (e.g. `when env is dev, not prd`), or null when it does. */
@@ -354,7 +432,7 @@ export function repairRun(run: Run): string[] {
   const added: string[] = [];
   for (const step of run.playbook.steps) {
     if (run.steps[step.id]) continue;
-    run.steps[step.id] = { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, loop: 0, completedSeq: null, branch: null, fanout: null, fanoutPast: [], queuedAt: null, nextModel: null };
+    run.steps[step.id] = { status: "pending", attempts: [], outputs: {}, summary: null, feedback: null, loop: 0, completedSeq: null, branch: null, fanout: null, fanoutPast: [], queuedAt: null, nextModel: null, waitUntil: null };
     added.push(step.id);
   }
   for (const task of run.playbook.after) {
@@ -702,6 +780,8 @@ export function validateOutputs(
  * outcome; a job ended early (no_deploy, stopped, ejected) brings what it has.
  */
 function outputsRequired(step: Step, outcome: string): boolean {
+  // The implicit `failure` is not a result: declared outputs are optional (those given are still typed).
+  if (outcome === "failure") return false;
   return !(step.kind === "handoff" && outcome !== step.outcomes[0]);
 }
 
@@ -736,9 +816,11 @@ export function recordReport(
   let outputs: Record<string, VarValue> = {};
   const kind = defaultTransition(step, report.outcome).kind;
   // A failure, or a question for a human (`ask`), is not a result: no outputs expected.
-  if (report.outcome !== "failure" && kind !== "ask" && !outputsRequired(step, report.outcome)) {
+  if (report.outcome === "failure") {
     outputs = partialOutputs(step, report.outputs);
-  } else if (report.outcome !== "failure" && kind !== "ask") {
+  } else if (kind !== "ask" && !outputsRequired(step, report.outcome)) {
+    outputs = partialOutputs(step, report.outputs);
+  } else if (kind !== "ask") {
     const checked = validateOutputs(step, report.outputs);
     if (!checked.ok) throw new EngineError(`report refused: ${checked.errors.join("; ")}. Fix these and call report_step_result again.`);
     outputs = checked.outputs;
@@ -1113,7 +1195,7 @@ function resetBlockLoops(run: Run, source: string, target: string): void {
   }
 }
 
-function performGoto(run: Run, source: string, target: string, feedback: string, now: string, fx: Effects): void {
+function performGoto(run: Run, source: string, target: string, feedback: string, now: string, fx: Effects, delayMs?: number): void {
   const key = `${source}->${target}`;
   resetBlockLoops(run, source, target);
   run.loops[key] = (run.loops[key] ?? 0) + 1;
@@ -1134,7 +1216,10 @@ function performGoto(run: Run, source: string, target: string, feedback: string,
     state.branch = null;
     state.completedSeq = null;
     state.loop += 1;
+    state.waitUntil = null;
   }
+  // The target is held back until the delay is over (refreshReady); the plugin releases it then.
+  if (delayMs !== undefined) run.steps[target]!.waitUntil = new Date(Date.parse(now) + delayMs).toISOString();
   for (const gate of run.gates) {
     if (gate.status === "pending" && reset.has(gate.stepId)) {
       gate.status = "rejected";
@@ -1145,20 +1230,24 @@ function performGoto(run: Run, source: string, target: string, feedback: string,
   run.steps[target]!.feedback = feedback || null;
   log(run, now, "goto", source, `${key} (loop ${run.loops[key]})`);
   const { ready, queued } = refreshReady(run, now, fx);
-  fx.notes.push(`Looping back to "${target}" (loop ${run.loops[key]}). Ready: ${readyList(run, ready) || "none"}.`);
+  fx.notes.push(`Looping back to "${target}" (loop ${run.loops[key]})${delayMs !== undefined ? `, which starts in ${Math.round(delayMs / 1000)}s (delay)` : ""}. Ready: ${readyList(run, ready) || "none"}.`);
   if (queued.length > 0) fx.notes.push(queueNote(run, queued));
 }
 
-function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | undefined, feedback: string, now: string, fx: Effects, decider?: GateDecider): void {
+function gotoOrLimit(run: Run, step: Step, target: string, maxLoops: number | undefined, feedback: string, now: string, fx: Effects, decider?: GateDecider, delayMs?: number): void {
   const key = `${step.id}->${target}`;
   const limit = maxLoops === undefined ? Infinity : maxLoops + (run.loopAllowance[key] ?? 0);
   if ((run.loops[key] ?? 0) < limit) {
-    performGoto(run, step.id, target, feedback, now, fx);
+    performGoto(run, step.id, target, feedback, now, fx, delayMs);
     return;
   }
   run.steps[step.id]!.status = "waiting";
+  // The count alone repeats: restart_run and a block's counter reset bring the same count back. A later gate of the same
+  // base gets a suffix, so an id names one gate for the life of the run (ADR 2026-11-20-unique-loop-gate-ids).
+  const base = `loop-${step.id}-${target}-${run.loops[key] ?? 0}`;
+  const earlier = run.gates.filter((candidate) => candidate.id === base || candidate.id.startsWith(`${base}~`)).length;
   const gate: Gate = {
-    id: `loop-${step.id}-${target}-${run.loops[key] ?? 0}`,
+    id: earlier === 0 ? base : `${base}~${earlier + 1}`,
     kind: "loop_limit",
     stepId: step.id,
     gotoTarget: target,
@@ -1312,7 +1401,7 @@ function followOutcome(run: Run, step: Step, outcome: string, summary: string, n
       break;
     }
     case "goto":
-      gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, now, fx, transition.decider);
+      gotoOrLimit(run, step, transition.target, transition.maxLoops, summary, now, fx, transition.decider, transition.delayMs);
       break;
     case "ask":
       openAskGate(run, step, outcome, transition, summary, now, fx);
@@ -1340,6 +1429,7 @@ function askChoiceOutputs(run: Run, step: Step, choice: AskChoice, comment: stri
   }
   const kind = defaultTransition(step, choice.outcome!).kind;
   if (kind !== "complete" && kind !== "end" && kind !== "goto") return null;
+  if (!outputsRequired(step, choice.outcome!)) return partialOutputs(step, merged);
   const checked = validateOutputs(step, merged);
   if (!checked.ok) throw new EngineError(`"${choice.label}" cannot complete "${step.id}": ${checked.errors.join("; ")}`);
   return checked.outputs;
@@ -1400,6 +1490,54 @@ export function escalateGate(run: Run, ref: string, reason: string, now: string)
   return true;
 }
 
+export interface DeferInput {
+  reason: string;
+  condition: GateWaitCondition;
+  remindAt?: string | null;
+  by: string;
+}
+
+function validIso(value: string, what: string): number {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) throw new EngineError(`${what} "${value}" is not a date (ISO 8601, e.g. 2026-12-01T09:00:00Z)`);
+  return ms;
+}
+
+/**
+ * Sets an open human gate aside in Waiting, with a reason and what it waits for (gate deferral, ADR 2026-11-20-deferred-gates).
+ * The gate stays pending: its choices, its decider and every decision rule are untouched, and it can still be decided.
+ * Only the "needs review" classification changes. Never infers anything: the caller states the condition.
+ */
+export function deferGate(run: Run, ref: string, input: DeferInput, now: string): Gate {
+  const gate = findGate(run, ref);
+  if (!gate) throw new EngineError(`no gate "${ref}" in run ${run.id}`);
+  if (gate.status !== "pending") throw new EngineError(`gate "${gate.id}" is not open (${gate.status}): nothing to defer`);
+  if (!waitsForHuman(gate)) throw new EngineError(`gate "${gate.id}" is held by a role decider, not waiting for a human: nothing to defer`);
+  const reason = input.reason.trim();
+  if (!reason) throw new EngineError("a reason is required: why is this not decided now?");
+  const nowMs = Date.parse(now);
+  const condition = input.condition;
+  if (condition.kind === "date" && validIso(condition.at, "the date") <= nowMs) throw new EngineError("the date is not in the future");
+  if (condition.kind === "run_ended" && condition.runId === run.id) throw new EngineError("a gate cannot wait for the end of its own run: it ends only once the gate is decided");
+  if (condition.kind === "gate_decided" && condition.runId === run.id && (findGate(run, condition.gateId)?.id === gate.id)) throw new EngineError("a gate cannot wait for its own decision");
+  const remindAt = input.remindAt ?? null;
+  if (remindAt !== null && validIso(remindAt, "the reminder date") <= nowMs) throw new EngineError("the reminder date is not in the future");
+  gate.deferral = { reason, condition, remindAt, deferredAt: now, deferredBy: input.by, returnedAt: null, returnedBy: null, returnNote: null };
+  log(run, now, "gate_deferred", gate.stepId, `${gate.id}: ${reason}`);
+  return gate;
+}
+
+/** Brings a deferred gate back to review (by hand, by an agent, or because what it waited for happened). False when it is not deferred. */
+export function returnGate(run: Run, ref: string, by: string, note: string | null, now: string): boolean {
+  const gate = findGate(run, ref);
+  if (!gate || !isDeferred(gate) || !gate.deferral) return false;
+  gate.deferral.returnedAt = now;
+  gate.deferral.returnedBy = by;
+  gate.deferral.returnNote = note;
+  log(run, now, "gate_returned", gate.stepId, `${gate.id}: back to review (${by})${note ? `: ${note}` : ""}`);
+  return true;
+}
+
 /** Records the agent a role decider runs as. */
 export function startGateDecider(run: Run, gateId: string, agentId: string, now: string): void {
   const gate = run.gates.find((candidate) => candidate.id === gateId);
@@ -1410,7 +1548,9 @@ export function startGateDecider(run: Run, gateId: string, agentId: string, now:
 
 /** Finds the pending gate for a step id or gate id. */
 export function findGate(run: Run, ref: string): Gate | null {
-  const byId = run.gates.find((gate) => gate.id === ref);
+  // Runs from before ids were unique may hold several gates with one id: the pending one, else the latest.
+  const sameId = run.gates.filter((gate) => gate.id === ref);
+  const byId = sameId.find((gate) => gate.status === "pending") ?? sameId.at(-1);
   if (byId) return byId;
   const forStep = run.gates.filter((gate) => gate.stepId === ref);
   return forStep.find((gate) => gate.status === "pending") ?? forStep.at(-1) ?? null;
@@ -1451,6 +1591,8 @@ export function decideGate(run: Run, ref: string, decision: GateDecision): { gat
   const fx = effects();
   if (gate.status !== "pending") return { gate, alreadyDecided: true, effects: fx };
   if (gate.kind === "admission") return { gate, alreadyDecided: false, effects: decideAdmission(run, gate, decision, fx) };
+  if (gate.kind === "permission") return { gate, alreadyDecided: false, effects: decidePermission(run, gate, decision, fx) };
+  if (gate.kind === "manager_question") return { gate, alreadyDecided: false, effects: decideManagerQuestion(run, gate, decision, fx) };
   assertLive(run, gate.stepId);
   const choices = choicesOfGate(gate, stepDef(run, gate.stepId));
   const choice = choices.find((candidate) => candidate.id === decision.decision);
@@ -1574,6 +1716,7 @@ export function restartRun(run: Run, stepId: string, input: { comment: string | 
     state.completedSeq = null;
     state.queuedAt = null;
     state.nextModel = null;
+    state.waitUntil = null;
   }
   run.steps[stepId]!.nextModel = input.model ?? null;
   run.steps[stepId]!.feedback = input.comment?.trim() ? `Restarted from this step by a human: ${input.comment.trim()}` : null;
@@ -1586,6 +1729,7 @@ export function restartRun(run: Run, stepId: string, input: { comment: string | 
   run.outputs = null;
   run.pausedAt = null;
   run.archivedAt = null;
+  run.workspaceArchive = null;
   run.seenAt = null;
   log(run, now, "run_restarted", stepId, `was ${previous}${input.by ? `, by ${input.by}` : ""}${input.comment?.trim() ? `: ${input.comment.trim()}` : ""}`);
   const { ready, queued } = refreshReady(run, now, fx);
@@ -1633,6 +1777,60 @@ export function pauseRun(run: Run, now: string): boolean {
   return true;
 }
 
+/** The accepted range of a quota priority: the playbook's `quota_limit.priority`. */
+export const PRIORITY_MIN = -1000;
+export const PRIORITY_MAX = 1000;
+
+/** Throws unless `priority` is null (clear) or a whole number in the playbook's range. */
+export function checkPriority(priority: number | null): void {
+  if (priority !== null && (!Number.isInteger(priority) || priority < PRIORITY_MIN || priority > PRIORITY_MAX)) throw new EngineError(`priority must be a whole number from ${PRIORITY_MIN} to ${PRIORITY_MAX}, or null to clear the override`);
+}
+
+/**
+ * Sets or clears the manual quota priority of a run (and the sticky `inheritChildPriority` flag when `inherit` is given). Returns
+ * what changed; the history records a change of the priority only when it moves (a flag change alone is recorded too).
+ */
+export function setRunPriority(run: Run, priority: number | null, inherit: boolean | undefined, now: string, note: string): { from: number | null; changed: boolean } {
+  checkPriority(priority);
+  const from = run.priorityOverride ?? null;
+  const flagBefore = run.inheritChildPriority ?? false;
+  run.priorityOverride = priority;
+  if (inherit !== undefined) run.inheritChildPriority = inherit;
+  const moved = from !== priority;
+  const flagMoved = inherit !== undefined && inherit !== flagBefore;
+  if (moved || flagMoved) log(run, now, "priority_changed", null, `${moved ? `quota priority override ${from === null ? "none" : from} → ${priority === null ? "none (the playbook's)" : priority}` : "children inherit the priority"}${flagMoved ? (inherit ? "; new children inherit it" : "; children no longer inherit it") : ""}${note ? ` (${note})` : ""}`);
+  return { from, changed: moved || flagMoved };
+}
+
+/**
+ * Sets or clears the run's exemption from quota limiting (and the sticky `inheritChildExempt` flag when `inherit` is given). Throws on a
+ * finished run. The history records a change of the exemption or of the flag; setting what is already set changes nothing.
+ */
+export function setRunExempt(run: Run, exempt: boolean, inherit: boolean | undefined, now: string, note: string): { from: boolean; changed: boolean } {
+  if (!isActive(run)) throw new EngineError(`run ${run.id} is finished: its quota exemption cannot change`);
+  const from = run.quotaExempt ?? false;
+  const flagBefore = run.inheritChildExempt ?? false;
+  run.quotaExempt = exempt;
+  if (inherit !== undefined) run.inheritChildExempt = inherit;
+  const moved = from !== exempt;
+  const flagMoved = inherit !== undefined && inherit !== flagBefore;
+  if (moved || flagMoved) log(run, now, "quota_exempt_changed", null, `${moved ? `quota: ${from ? "exempt" : "limited"} → ${exempt ? "exempt (not subject to quota limiting)" : "limited (back under the quota limits from its next step)"}` : "children follow the exemption"}${flagMoved ? (inherit ? "; new children follow it" : "; children no longer follow it") : ""}${note ? ` (${note})` : ""}`);
+  return { from, changed: moved || flagMoved };
+}
+
+/**
+ * Records a review finding an agent dismissed (ADR 2026-11-23-dismiss-finding). The guardrails are checked by the caller. Idempotent per
+ * (pr, signature): a second dismissal keeps the first record and changes nothing.
+ */
+export function dismissFinding(run: Run, entry: Omit<DismissedFinding, "at">, now: string): { changed: boolean; entry: DismissedFinding } {
+  const known = run.dismissedFindings.find((candidate) => candidate.pr === entry.pr && candidate.signature === entry.signature);
+  if (known) return { changed: false, entry: known };
+  const added = { ...entry, at: now };
+  run.dismissedFindings.push(added);
+  log(run, now, "finding_dismissed", null, `${entry.pr} ${entry.signature} ${entry.file} [${entry.severity}/${entry.category}] by ${entry.by}: ${entry.rationale.slice(0, 200)}`);
+  return { changed: true, entry: added };
+}
+
 /** Lifts a pause. Returns false if the run was not paused. */
 export function resumeRun(run: Run, now: string): boolean {
   if (!isPaused(run)) {
@@ -1642,6 +1840,50 @@ export function resumeRun(run: Run, now: string): boolean {
   run.pausedAt = null;
   log(run, now, "run_resumed", null, "resumed by a human");
   return true;
+}
+
+/**
+ * Records that rate limiting holds (or no longer holds) the run's new steps. A change of kind, provider or window is a new
+ * hold (`run_held`); a changed reason or retry time alone only updates the state. Returns "held", "released" or null.
+ */
+export function setRateHold(run: Run, hold: (Omit<RateHold, "since" | "estimatedCost" | "headroom" | "position" | "priority"> & Partial<Pick<RateHold, "estimatedCost" | "headroom" | "position" | "priority">>) | null, now: string): "held" | "released" | null {
+  const current = run.rateHold;
+  if (!hold) {
+    if (!current) return null;
+    run.rateHold = null;
+    log(run, now, "run_released", null, `rate limit hold lifted (was: ${current.reason})`);
+    return "released";
+  }
+  const detail = { estimatedCost: hold.estimatedCost ?? null, headroom: hold.headroom ?? null, position: hold.position ?? null, priority: hold.priority ?? null };
+  if (current && current.kind === hold.kind && current.provider === hold.provider && current.window === hold.window) {
+    run.rateHold = { ...current, reason: hold.reason, retryAt: hold.retryAt, ...detail };
+    return null;
+  }
+  // A switch between two quota holds where one only waits for the provider's reading (ADR 2026-11-23-provider-usage-unavailable)
+  // is the same hold: no new `run_held`, so no run.held event churn; the hold keeps its start.
+  const quotaKind = (kind: string) => kind === "quota" || kind === "headroom" || kind === "pace";
+  if (current && quotaKind(current.kind) && quotaKind(hold.kind) && isUnavailableHold(current) !== isUnavailableHold(hold)) {
+    run.rateHold = { ...hold, ...detail, since: current.since };
+    return null;
+  }
+  run.rateHold = { ...hold, ...detail, since: now };
+  log(run, now, "run_held", null, hold.reason);
+  return "held";
+}
+
+/**
+ * The hold episode of a run (ADR 2026-11-23-hold-notice-per-episode): it starts when the run is first held for quota and
+ * ends only when a step (or after-task) starts again. Read from the run's history, so it survives a restart:
+ * "armed" (no notice yet in this episode), "told" (the manager was told of the hold) or "released" (and of its end).
+ */
+export function holdEpisodeState(run: Run): "armed" | "told" | "released" {
+  for (let index = run.history.length - 1; index >= 0; index -= 1) {
+    const type = run.history[index]!.type;
+    if (type === "step_started" || type === "after_started") return "armed";
+    if (type === "hold_notice") return "told";
+    if (type === "hold_release_notice") return "released";
+  }
+  return "armed";
 }
 
 /** Marks a failed or timed-out readonly check on the current attempt. */
@@ -2155,6 +2397,136 @@ export function applyAdmission(pipeline: Run, stageId: string, sent: string[], r
   return { warnings, escalated };
 }
 
+/** What the plugin writes as `decidedBy` when its own policy closes a permission gate. */
+export const PERMISSION_POLICY_BY = "plugin policy (permissions.on_request)";
+
+/**
+ * Opens a `permission` gate for an agent's tool permission request (`permissions.on_request: escalate`): a human gate like
+ * the others, on the step the agent belongs to ("manager" for the manager). One gate per request: returns null when it is open already.
+ */
+export function openPermissionGate(run: Run, input: { stepId: string; agentId: string; requestId: string; tool: string; summary: string; details: string }, now: string): Gate | null {
+  if (run.gates.some((gate) => gate.kind === "permission" && gate.permission?.agentId === input.agentId && gate.permission.requestId === input.requestId)) return null;
+  const count = run.gates.filter((gate) => gate.kind === "permission").length;
+  const gate: Gate = {
+    id: `permission-${input.stepId}-${count + 1}`,
+    kind: "permission",
+    stepId: input.stepId,
+    gotoTarget: null,
+    jobId: null,
+    outcome: null,
+    status: "pending",
+    message: [input.summary, input.details].filter(Boolean).join("\n\n"),
+    summary: input.summary,
+    details: input.details,
+    requestedAt: now,
+    comment: null,
+    decidedBy: null,
+    decidedVia: null,
+    decidedAt: null,
+    decider: { by: "human" },
+    deciderAgentId: null,
+    escalated: null,
+    escalatedAt: null,
+    permission: { agentId: input.agentId, requestId: input.requestId, tool: input.tool },
+  };
+  run.gates.push(gate);
+  log(run, now, "gate_opened", input.stepId, gate.id);
+  updateStatus(run);
+  return gate;
+}
+
+/**
+ * Opens a `manager_question` gate for the Playbook Manager's open question (an AskUserQuestion-style request): a human gate on the
+ * step "manager", shown in the panel and `list_gates` like the others. One gate per request: returns null when it is open already.
+ */
+export function openManagerQuestionGate(
+  run: Run,
+  input: { agentId: string; requestId: string; tool: string; summary: string; details: string; question: NonNullable<Gate["question"]> },
+  now: string,
+): Gate | null {
+  if (run.gates.some((gate) => gate.kind === "manager_question" && gate.permission?.agentId === input.agentId && gate.permission.requestId === input.requestId)) return null;
+  const count = run.gates.filter((gate) => gate.kind === "manager_question").length;
+  const gate: Gate = {
+    id: `manager-question-${count + 1}`,
+    kind: "manager_question",
+    stepId: "manager",
+    gotoTarget: null,
+    jobId: null,
+    outcome: null,
+    status: "pending",
+    message: [input.summary, input.details].filter(Boolean).join("\n\n"),
+    summary: input.summary,
+    details: input.details,
+    requestedAt: now,
+    comment: null,
+    decidedBy: null,
+    decidedVia: null,
+    decidedAt: null,
+    decider: { by: "human" },
+    deciderAgentId: null,
+    escalated: null,
+    escalatedAt: null,
+    permission: { agentId: input.agentId, requestId: input.requestId, tool: input.tool },
+    question: input.question,
+  };
+  run.gates.push(gate);
+  log(run, now, "gate_opened", "manager", gate.id);
+  updateStatus(run);
+  return gate;
+}
+
+/** A human answers the manager's question (an option, or typed text); the runtime then delivers it to the manager's pending question. */
+function decideManagerQuestion(run: Run, gate: Gate, decision: GateDecision, fx: Effects): Effects {
+  if (decision.via === "manager" || decision.via === "role") throw new EngineError(`gate "${gate.id}" is the manager's own question to the human: a human answers it in the Playbooks panel`);
+  const choices = choicesOfGate(gate, undefined);
+  if (choices.length === 0) throw new EngineError(`gate "${gate.id}" has several questions or a multi-select: the human answers it in the manager's conversation`);
+  const choice = choices.find((candidate) => candidate.id === decision.decision);
+  if (!choice) throw new EngineError(`"${decision.decision}" is not a choice of gate "${gate.id}" (${choices.map((c) => c.id).join(", ")})`);
+  if (choice.comment === "required" && !decision.comment?.trim()) throw new EngineError(`"${choice.label}" needs the answer as a comment`);
+  gate.status = choice.id;
+  gate.comment = decision.comment;
+  gate.decidedBy = decision.by;
+  gate.decidedVia = decision.via;
+  gate.decidedAt = decision.now;
+  log(run, decision.now, "gate_decided", gate.stepId, `${gate.id}: ${choice.id} via ${decision.via}`);
+  updateStatus(run);
+  fx.notes.push(`Gate ${gate.id}: ${choice.id}.`);
+  return fx;
+}
+
+/** The request is gone (answered elsewhere, the agent was canceled or reloaded): its pending gate closes, decided by nobody. */
+export function dismissPermissionGates(run: Run, agentId: string, requestId: string | null, why: string, now: string): Gate[] {
+  const closed: Gate[] = [];
+  for (const gate of run.gates) {
+    if ((gate.kind !== "permission" && gate.kind !== "manager_question") || gate.status !== "pending" || gate.permission?.agentId !== agentId || (requestId !== null && gate.permission.requestId !== requestId)) continue;
+    gate.status = "dismissed";
+    gate.comment = why;
+    gate.decidedBy = PERMISSION_POLICY_BY;
+    gate.decidedVia = null;
+    gate.decidedAt = now;
+    log(run, now, "gate_decided", gate.stepId, `${gate.id}: dismissed (${why})`);
+    closed.push(gate);
+  }
+  updateStatus(run);
+  return closed;
+}
+
+/** A human allows or denies a permission request; the runtime then answers the agent. */
+function decidePermission(run: Run, gate: Gate, decision: GateDecision, fx: Effects): Effects {
+  if (decision.via === "manager" || decision.via === "role") throw new EngineError(`gate "${gate.id}" is an agent's tool permission request: a human decides it in the Playbooks panel`);
+  const choice = PERMISSION_CHOICES.find((candidate) => candidate.id === decision.decision);
+  if (!choice) throw new EngineError(`"${decision.decision}" is not a choice of gate "${gate.id}" (${PERMISSION_CHOICES.map((c) => c.id).join(", ")})`);
+  gate.status = choice.id;
+  gate.comment = decision.comment;
+  gate.decidedBy = decision.by;
+  gate.decidedVia = decision.via;
+  gate.decidedAt = decision.now;
+  log(run, decision.now, "gate_decided", gate.stepId, `${gate.id}: ${choice.id} via ${decision.via}`);
+  updateStatus(run);
+  fx.notes.push(`Gate ${gate.id}: ${choice.id}.`);
+  return fx;
+}
+
 /** A human answers an admission gate: retry (the runtime checks again at once), withdraw the job, or admit it anyway. */
 function decideAdmission(run: Run, gate: Gate, decision: GateDecision, fx: Effects): Effects {
   if (decision.via === "manager" || decision.via === "role") throw new EngineError(`gate "${gate.id}" asks whether to admit job ${gate.jobId}: a human decides it in the Playbooks panel`);
@@ -2183,24 +2555,33 @@ export function withdrawJob(pipeline: Run, jobId: string, reason: string, now: s
 }
 
 /**
- * `requeue_job`: a failed job goes back to waiting at the stages it may enter, keeping its id, its inputs, its outputs and the
- * stages it passed; its failed rides start again. Only a detached job (the pipeline owns it): a job whose hand-off step is
- * still waiting was already told "failure", and that step decides what happens next. Open already: nothing changes
- * (`changed: false`). Settled, withdrawn, shipped (every stage passed) or not detached: refused, saying why.
+ * `requeue_job`: a failed job, or one settled with an outcome that is not the singleton's first (the normal finish), goes back
+ * to waiting at the stages it may enter, keeping its id, inputs, outputs and the stages it passed (so it re-enters at the NEXT
+ * stage's queue); its failed rides start again and its pending follow-up is cleared (kept in `reopens`). Only a detached job (the
+ * pipeline owns it). `fromOutcome` guards the caller's expectation (`failed` for a failed job). A manual requeue is recorded in
+ * `reopens` and is not blocked by `queue.max_requeues`. Open already: nothing changes (`changed: false`). Running/queued with
+ * a guard, shipped (first outcome or every stage passed), withdrawn, or not detached: refused, saying why.
  */
-export function reopenJob(pipeline: Run, jobId: string, reason: string, now: string): { job: Job; changed: boolean } {
+export function reopenJob(pipeline: Run, jobId: string, reason: string, now: string, fromOutcome: string | null = null): { job: Job; changed: boolean } {
   if (!isPipeline(pipeline) || isTerminal(pipeline.status)) throw new EngineError(`run ${pipeline.id} is not an active pipeline`);
+  if (!reason.trim()) throw new EngineError("requeue_job needs a reason (a sentence: what was fixed)");
   const job = pipeline.jobs.find((candidate) => candidate.id === jobId);
-  if (!job) throw new EngineError(`pipeline ${pipeline.id} has no job "${jobId}" (its jobs: ${pipeline.jobs.filter((candidate) => candidate.status === "failed").map((candidate) => candidate.id).join(", ") || "none failed"})`);
+  if (!job) throw new EngineError(`pipeline ${pipeline.id} has no job "${jobId}" (its jobs: ${pipeline.jobs.filter((candidate) => candidate.status === "failed" || candidate.status === "settled").map((candidate) => candidate.id).join(", ") || "none ended"})`);
+  const now_ = job.status === "failed" ? "failed" : job.status === "settled" ? job.outcome : job.status;
+  if (fromOutcome !== null && fromOutcome !== now_) throw new EngineError(`job ${jobId} is ${job.status}${job.outcome ? ` (${job.outcome})` : ""}, not "${fromOutcome}": nothing was requeued`);
   if (job.status === "open") return { job, changed: false };
-  if (job.status !== "failed") throw new EngineError(`job ${jobId} is ${job.status}${job.outcome ? ` (${job.outcome})` : ""}: only a failed job can be requeued; hand its work off again for a new job`);
-  if (!job.detached) throw new EngineError(`job ${jobId} was handed off by a step that waits for its result (it was told "failure" and decides what happens next): restart that step, or hand the work off again`);
+  if (job.status === "withdrawn") throw new EngineError(`job ${jobId} is withdrawn (its hand-off was canceled): hand its work off again for a new job`);
+  if (job.status === "settled" && (job.outcome === null || job.outcome === pipeline.playbook.outcomes[0])) throw new EngineError(`job ${jobId} finished with "${job.outcome ?? "no outcome"}" (the normal finish): its work shipped, do not run it again`);
+  if (!job.detached) throw new EngineError(`job ${jobId} was handed off by a step that waits for its result (it was told "${job.status === "failed" ? "failure" : job.outcome}" and decides what happens next): restart that step, or hand the work off again`);
   const stages = stagesOf(pipeline);
   if (stages.length > 0 && stages.every((stage) => job.passed.includes(stage.id))) throw new EngineError(`job ${jobId} passed every stage: its work shipped, do not run it again`);
   const probe: Job = { ...structuredClone(job), batches: [], waiting: [] };
   queueNext(pipeline, probe, now);
   // No stage may take it (the playbook changed): nothing is touched.
   if (probe.waiting.length === 0) throw new EngineError(`job ${jobId} has no stage to wait at (stages: ${stages.map((stage) => stage.id).join(", ") || "none"}; passed: ${job.passed.join(", ") || "none"})`);
+  const previous = { status: job.status as "failed" | "settled", outcome: job.outcome, summary: job.summary, reason, followUps: structuredClone(job.followUps), at: now };
+  job.reopens.push(previous);
+  job.followUps = [];
   job.status = "open";
   job.outcome = null;
   job.summary = null;
@@ -2209,8 +2590,8 @@ export function reopenJob(pipeline: Run, jobId: string, reason: string, now: str
   job.waiting = probe.waiting;
   job.failedRides = {};
   job.requeued = null;
-  record(pipeline, "job.reopened", { jobId, reason, waiting: job.waiting, failedRides: job.failedRides, passed: job.passed }, now);
-  log(pipeline, now, "job_reopened", null, `${jobId} at ${job.waiting.map((entry) => entry.stage).join(", ")}${reason ? ` (${reason.slice(0, 200)})` : ""}`);
+  record(pipeline, "job.reopened", { jobId, reason, waiting: job.waiting, failedRides: job.failedRides, passed: job.passed, previous }, now);
+  log(pipeline, now, "job_reopened", null, `${jobId} (was ${previous.status}${previous.outcome ? `: ${previous.outcome}` : ""}) at ${job.waiting.map((entry) => entry.stage).join(", ")} (${reason.slice(0, 200)})`);
   return { job, changed: true };
 }
 
@@ -2397,7 +2778,7 @@ export function startFanout(run: Run, stepId: string, input: { agentId: string; 
     const child = built.child;
     children.push(child);
   }
-  state.fanout = { attempt: attempt.n, loop: state.loop, startedAt: input.now, children, pool: config.pool ? { refills: 0, lastRefillAt: null, added: 0, handled: [], status: "open", stopReason: null, passes: [] } : null };
+  state.fanout = { attempt: attempt.n, loop: state.loop, startedAt: input.now, children, pool: config.pool ? { refills: 0, lastRefillAt: null, added: 0, handled: [], wakeAt: null, status: "open", stopReason: null, passes: [] } : null };
   log(run, input.now, "fanout_started", stepId, `${children.length} item(s), at most ${config.maxActive} active`);
   return { error: null };
 }
@@ -2489,6 +2870,35 @@ export function replaceFanoutChild(
   log(run, input.now, "fanout_child_replaced", stepId, `${key}: ${child.previous.at(-1)!.runId} → ${input.newRunId}${input.reason ? ` (${input.reason.slice(0, 200)})` : ""}`);
 }
 
+/**
+ * Adds one item to a running fan-out step, as a `pending` child built exactly like a list or refill item (the same key, inputs and
+ * workspace name templates); the tick starts it under `max_active`. Refused (with the reason) when the step is not a running
+ * fan-out, the item is not a usable one, its key is already in the fan-out (any state) or its templates do not render.
+ */
+export function addFanoutItem(run: Run, stepId: string, item: unknown, now: string, by: string | null): { key: string; index: number } {
+  const step = stepDef(run, stepId);
+  if (!step.fanout) throw new EngineError(`step "${stepId}" is not a fan-out step`);
+  const state = run.steps[stepId]!;
+  const attempt = state.attempts.at(-1);
+  if (state.status !== "running" || !state.fanout || !attempt || !isFanoutAttempt(attempt.agentId)) throw new EngineError(`fan-out step "${stepId}" is not running (${state.status}): an item joins only a running fan-out`);
+  const list = parseList([item]);
+  if (!list.ok) throw new EngineError(`the item is not usable: ${list.error}`);
+  const values = Object.fromEntries(Object.entries(stepInputs(run, step)).map(([name, entry]) => [name, entry.value]));
+  const fanout = state.fanout;
+  const index = fanout.children.reduce((max, child) => Math.max(max, child.index + 1), 0);
+  const built = buildChild(step.fanout, values, list.items[0]!, index, now, new Map());
+  if ("error" in built) throw new EngineError(`the item cannot be added: ${built.error}`);
+  const child = built.child;
+  const clash = fanout.children.find((candidate) => candidate.key === child.key);
+  if (clash) throw new EngineError(`the key "${child.key}" is already in fan-out step "${stepId}" (${clash.status.replace("_", " ")}): an item is added once`);
+  if (child.status === "not_started") throw new EngineError(`the item cannot be added: ${child.error}`);
+  fanout.children.push(child);
+  // A pool that waits on blockers re-plans for the new item (all adds before the pass starts share one wake-up).
+  if (fanout.pool?.status === "open" && step.fanout.pool?.idle && !fanout.pool.wakeAt) fanout.pool.wakeAt = now;
+  log(run, now, "fanout_item_added", stepId, `${child.key}: added by ${by ?? "the panel"}, waiting for a slot (${fanoutSummaryText(fanout)})`);
+  return { key: child.key, index };
+}
+
 // ---------------------------------------------------------------- work pools (refill passes)
 
 type PoolConfig = NonNullable<NonNullable<Step["fanout"]>["pool"]>;
@@ -2509,17 +2919,43 @@ export function poolDoneKeys(state: FanoutState): string[] {
   return state.children.filter(isChildDone).map((child) => child.key);
 }
 
+/** The latest finished pass, when it completed. */
+function lastPass(state: FanoutState): PoolPass | undefined {
+  return state.pool?.passes.findLast((pass) => pass.status === "completed" || pass.status === "failed" || pass.status === "canceled");
+}
+
+/**
+ * A pool with `idle` is waiting on blockers: open, no pass runs, nothing unhandled, and the latest pass completed saying blocked items
+ * remain. Children may still run (their ending triggers a pass as usual); the fan-out does not end while it waits.
+ */
+export function poolWaiting(state: FanoutState, config: PoolConfig | undefined): boolean {
+  const pool = state.pool;
+  if (!pool || !config?.idle || pool.status !== "open" || poolPassInFlight(state)) return false;
+  const last = lastPass(state);
+  return !!last && last.status === "completed" && last.waiting && poolTriggers(state, config).length === 0;
+}
+
 /** Whether a pass should start now: none runs, the pool is open, a trigger is unhandled, the cap allows and the debounce has passed. */
 export function poolPassDue(state: FanoutState, config: PoolConfig, nowMs: number): boolean {
   const pool = state.pool;
   if (!pool || pool.status !== "open" || poolPassInFlight(state)) return false;
   const triggers = poolTriggers(state, config);
-  if (triggers.length === 0) return false;
+  if (triggers.length === 0) return poolWaitingDue(state, config, nowMs);
   if (pool.refills >= config.maxRefills) return false;
   const oldest = Math.min(...triggers.map((child) => (child.endedAt ? Date.parse(child.endedAt) : nowMs)));
   const lastEnd = pool.passes.findLast((pass) => pass.endedAt)?.endedAt;
   const since = Math.max(oldest, lastEnd ? Date.parse(lastEnd) : 0);
   return nowMs - since >= config.debounceMs;
+}
+
+/** A waiting pool re-plans when an item was added (after the debounce, one pass for all adds) or the poll interval has passed since the last pass. */
+function poolWaitingDue(state: FanoutState, config: PoolConfig, nowMs: number): boolean {
+  if (!poolWaiting(state, config)) return false;
+  const lastEnd = lastPass(state)?.endedAt;
+  const lastEndMs = lastEnd ? Date.parse(lastEnd) : 0;
+  const wake = state.pool!.wakeAt;
+  if (wake) return nowMs - Math.max(Date.parse(wake), lastEndMs) >= config.debounceMs;
+  return nowMs - lastEndMs >= config.idle!.pollMs;
 }
 
 /** Stops the pool when the cap is reached with endings still unhandled. Returns whether it changed. */
@@ -2538,9 +2974,11 @@ export function poolCheckLimit(run: Run, stepId: string, config: PoolConfig, now
 
 /** Records a new pass as `starting` with the keys of the items finished now (what it is told with `pool.done` and `pool.failed`). The run is created after, by the caller. */
 export function beginPass(run: Run, stepId: string, config: PoolConfig, input: { runId: string; now: string }): PoolPass {
-  void config;
   const state = run.steps[stepId]!.fanout!;
   const pool = state.pool!;
+  // A re-plan of a waiting pool (no child ending behind it) does not count against max_refills: polling for a long wait would exhaust it.
+  const counted = poolTriggers(state, config).length > 0;
+  const reason = counted ? null : pool.wakeAt ? "an item was added while the pool waited on blockers" : "the pool waited on blockers: periodic re-plan";
   const pass: PoolPass = {
     n: (pool.passes.at(-1)?.n ?? 0) + 1,
     runId: input.runId,
@@ -2553,12 +2991,15 @@ export function beginPass(run: Run, stepId: string, config: PoolConfig, input: {
     added: [],
     skipped: 0,
     output: null,
+    waiting: false,
+    counted,
   };
-  pool.refills += 1;
+  if (counted) pool.refills += 1;
+  pool.wakeAt = null;
   pool.lastRefillAt = input.now;
   pool.passes.push(pass);
   pool.passes = pool.passes.slice(-MAX_POOL_PASSES);
-  log(run, input.now, "fanout_refill_started", stepId, `refill #${pass.n}: ${pass.keys.length} item(s) done so far, ${state.children.length - pass.keys.length} not yet`);
+  log(run, input.now, "fanout_refill_started", stepId, `refill #${pass.n}: ${pass.keys.length} item(s) done so far, ${state.children.length - pass.keys.length} not yet${reason ? ` (re-plan, not counted in max_refills: ${reason})` : ""}`);
   return pass;
 }
 
@@ -2586,7 +3027,12 @@ export function poolPassInputs(run: Run, stepId: string, config: PoolConfig, n: 
       const value = lookup(context, ref);
       return value === undefined || value === null;
     });
-    if (missing !== undefined) return { ok: false, error: `pool.inputs.${name}: "{{ ${missing} }}" is not set` };
+    if (missing !== undefined) {
+      const from = /^inputs\.(.+)$/.exec(missing)?.[1];
+      const source = from !== undefined ? step.inputs[from]?.source.match(/playbook\.inputs\.([\w-]+)/)?.[1] : undefined;
+      const fix = source !== undefined ? `input "${source}" is not set: provide it, or declare a non-empty default in the playbook's inputs` : "declare a default for the input or provide it";
+      return { ok: false, error: `fanout.pool.refill.inputs.${name} reads "{{ ${missing} }}", which is not set; ${fix}` };
+    }
     inputs[name] = renderTemplate(template, context);
   }
   return { ok: true, inputs };
@@ -2598,8 +3044,8 @@ export function abandonPass(run: Run, stepId: string, n: number): void {
   if (!pool) return;
   const index = pool.passes.findIndex((pass) => pass.n === n && pass.status === "starting");
   if (index < 0) return;
-  pool.passes.splice(index, 1);
-  pool.refills = Math.max(0, pool.refills - 1);
+  const [removed] = pool.passes.splice(index, 1);
+  if (removed!.counted) pool.refills = Math.max(0, pool.refills - 1);
   pool.lastRefillAt = pool.passes.at(-1)?.startedAt ?? null;
 }
 
@@ -2612,7 +3058,7 @@ export function endPass(run: Run, stepId: string, status: "failed" | "canceled" 
   pass.status = status;
   pass.error = error;
   pass.endedAt = now;
-  if (status === "lost") pool.refills = Math.max(0, pool.refills - 1);
+  if (status === "lost") pool.refills = Math.max(0, pool.refills - (pass.counted ? 1 : 0));
   else {
     pool.status = "stopped";
     pool.stopReason = `refill #${pass.n} ${status}: ${error}`.slice(0, 300);
@@ -2662,6 +3108,8 @@ export function applyPass(run: Run, stepId: string, config: PoolConfig, outputs:
   const list = parseList(raw);
   if (!list.ok) return fail(`its output "${config.itemsOutput}" is not a usable list: ${list.error}`);
   pass.output = list.text.slice(0, 2000);
+  const waitRaw = config.idle ? outputs[config.idle.output] : undefined;
+  const waiting = waitRaw !== undefined && String(waitRaw).trim().toLowerCase() === "true";
   const values = Object.fromEntries(Object.entries(stepInputs(run, step)).map(([name, entry]) => [name, entry.value]));
   const known = new Set(state.children.map((child) => child.key));
   const seen = new Map<string, number>();
@@ -2682,12 +3130,14 @@ export function applyPass(run: Run, stepId: string, config: PoolConfig, outputs:
   state.children.push(...fresh);
   pass.status = "completed";
   pass.endedAt = now;
+  pass.waiting = waiting && fresh.length === 0;
   pass.added = fresh.map((child) => child.key);
   pass.skipped = skipped;
   pool.added += fresh.length;
   const stillDone = new Set(state.children.filter(isChildDone).map((child) => child.key));
   pool.handled = [...new Set([...pool.handled, ...pass.keys.filter((key) => stillDone.has(key))])];
   log(run, now, "fanout_refill_ended", stepId, `refill #${pass.n} completed: ${fresh.length} added${fresh.length ? ` (${pass.added.slice(0, 20).join(", ")})` : ""}${skipped ? `, ${skipped} already present` : ""}`);
+  if (pass.waiting) log(run, now, "fanout_pool_waiting", stepId, `refill #${pass.n}: nothing can start, blocked items remain; the pool stays open and re-plans when an item is added, a child ends or after ${Math.round(config.idle!.pollMs / 1000)}s`);
   return pass.added;
 }
 
@@ -2735,7 +3185,7 @@ export function fanoutSummaryText(state: FanoutState): string {
 export function fanoutJoined(state: FanoutState, config?: NonNullable<Step["fanout"]>["pool"]): boolean {
   if (!state.children.every(isChildDone)) return false;
   if (!state.pool || !config) return true;
-  if (poolPassInFlight(state)) return false;
+  if (poolPassInFlight(state) || poolWaiting(state, config)) return false;
   return state.pool.status === "stopped" || poolTriggers(state, config).length === 0;
 }
 

@@ -1,7 +1,8 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import { AnalyticsSchema } from "./analytics";
-import { AdmissionStatusSchema, PlaybookEntrySchema, ProfileInfoSchema, RoleSchema, RunSchema, StepSchema, RunSummarySchema, ScriptOutputSchema, VarValueSchema } from "./types";
+import { QuotaLimitationSchema } from "./quota-limitation";
+import { AdmissionStatusSchema, PlaybookEntrySchema, ProfileInfoSchema, RoleSchema, RunSchema, GateWaitConditionSchema, StepSchema, RunSummarySchema, ScriptOutputSchema, VarValueSchema } from "./types";
 
 export const listPlaybooks = defineRpc({
   name: "playbooks.list",
@@ -146,6 +147,27 @@ export const decideGateRpc = defineRpc({
   output: z.object({ alreadyDecided: z.boolean(), decision: z.string() }),
 });
 
+/** Sets an open gate aside in Waiting with a reason and what it waits for. The gate stays open and decidable. */
+export const deferGateRpc = defineRpc({
+  name: "gates.defer",
+  input: z.object({
+    runId: z.string(),
+    gateId: z.string(),
+    reason: z.string(),
+    condition: GateWaitConditionSchema,
+    remindAt: z.string().nullable().optional(),
+    hostLabel: z.string(),
+  }),
+  output: z.object({ deferred: z.boolean() }),
+});
+
+/** Brings a deferred gate back to Needs you. */
+export const returnGateRpc = defineRpc({
+  name: "gates.return",
+  input: z.object({ runId: z.string(), gateId: z.string(), note: z.string().optional(), hostLabel: z.string() }),
+  output: z.object({ returned: z.boolean() }),
+});
+
 export const cancelRunRpc = defineRpc({
   name: "runs.cancel",
   input: z.object({ runId: z.string(), reason: z.string().optional() }),
@@ -164,6 +186,13 @@ export const resumeRunRpc = defineRpc({
   name: "runs.resume",
   input: z.object({ runId: z.string() }),
   output: z.object({ pausedAt: z.string().nullable() }),
+});
+
+/** "Continue anyway": for a limited time, steps of runs that use the provider start despite the quota pacing (ADR 2026-11-20-rate-limiting). Does not lift the global step or playbook limits. */
+export const overrideQuotaRpc = defineRpc({
+  name: "rate_limits.override_quota",
+  input: z.object({ provider: z.string(), minutes: z.number().int().min(1).max(1440).optional() }),
+  output: z.object({ until: z.string() }),
 });
 
 /** Hides a finished run from the panel. Its saved state and its agents (manager and steps) are kept. */
@@ -192,11 +221,42 @@ export const nudgeStepRpc = defineRpc({
   output: z.object({ sent: z.boolean() }),
 });
 
+/** Adds one item to a running fan-out step, from the panel (a human). */
+export const addFanoutItemRpc = defineRpc({
+  name: "steps.add_fanout_item",
+  input: z.object({ runId: z.string(), stepId: z.string(), item: z.union([z.string(), z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]))]) }),
+  output: z.object({ key: z.string() }),
+});
+
 /** Reopens a finished run from a step: the step and what follows run again, with the same manager. */
 export const restartRunRpc = defineRpc({
   name: "runs.restart",
   input: z.object({ runId: z.string(), stepId: z.string(), comment: z.string().optional(), hostLabel: z.string() }),
   output: z.object({ status: z.string() }),
+});
+
+/** Sets or clears a run's manual quota priority from the Quota limitation tab (also the set_run_priority agent tool). */
+export const setRunPriorityRpc = defineRpc({
+  name: "runs.set_priority",
+  input: z.object({ runId: z.string(), priority: z.number().int().min(-1000).max(1000).nullable(), applyToChildren: z.boolean().optional() }),
+  output: z.object({ priorityOverride: z.number().nullable(), inheritChildPriority: z.boolean(), from: z.number().nullable(), changed: z.boolean(), cascaded: z.number().int() }),
+});
+
+/** Exempts a run from quota limiting, or puts it back under the limits, from the Runs view (also the set_run_quota_exempt agent tool). */
+export const setRunQuotaExemptRpc = defineRpc({
+  name: "runs.set_exempt",
+  input: z.object({ runId: z.string(), exempt: z.boolean(), applyToChildren: z.boolean().optional() }),
+  output: z.object({ quotaExempt: z.boolean(), inheritChildExempt: z.boolean(), from: z.boolean(), changed: z.boolean(), cascaded: z.number().int() }),
+});
+
+/** Manager-only quota recovery, also available as the recover_manager agent tool. */
+export const recoverManagerRpc = defineRpc({
+  name: "runs.recover_manager",
+  input: z.object({ runId: z.string(), expectedManagerId: z.string().min(1), reason: z.string().min(1), model: z.string().optional() }),
+  output: z.object({
+    changed: z.boolean(), blocked: z.boolean().optional(), from: z.string(), to: z.string(),
+    target: z.string(), thinking: z.string().nullable(), reason: z.string(), at: z.string(), takeoverPending: z.boolean(),
+  }),
 });
 
 /**
@@ -226,8 +286,16 @@ export const needsYouRpc = defineRpc({
 /** Where the tokens went, summed over the runs on disk (archived ones too): by playbook, step, role and model. */
 export const analyticsStateRpc = defineRpc({
   name: "analytics.state",
-  input: z.object({ days: z.number().int().positive().optional(), playbook: z.string().optional(), projectId: z.string().optional() }),
+  input: z.object({ days: z.number().int().positive().optional(), playbook: z.string().optional(), projectId: z.string().optional(), timeZone: z.string().optional() }),
   output: AnalyticsSchema,
+});
+
+/** The Quota limitation tab: the resolved limits per project, and per provider its usage windows, allowed-so-far values, reservations, headroom, held runs and exhausted marks. */
+export const quotaLimitationRpc = defineRpc({
+  name: "quota.limitation",
+  /** One workspace per project to resolve the limits of (the panel's projects); without any, no project is listed. */
+  input: z.object({ workspaces: z.array(z.object({ projectId: z.string(), workspaceId: z.string() })).default([]) }),
+  output: QuotaLimitationSchema,
 });
 
 /** One project of the Sidekick column: its Sidekick files, agent (if created) and active runs. */
@@ -243,6 +311,8 @@ export const SidekickProjectSchema = z.object({
   activeRuns: z.number(),
   /** Open gates of the project's runs that wait for a human (absent from an older plugin). */
   needYou: z.number().default(0),
+  /** The Sidekick's conversation is being compacted right now (absent from an older plugin). */
+  compacting: z.boolean().default(false),
 });
 export type SidekickProject = z.infer<typeof SidekickProjectSchema>;
 

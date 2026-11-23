@@ -16,8 +16,8 @@ It uses the same checks as the Playbooks panel. Its result is compact (`results[
 
 ## Layout
 
-Everything lives in the repository, under `.paseo/plugins/playbooks/` or the shorter
-`.paseo/playbooks/` (both are loaded; use one):
+Everything lives in the repository, under `.paseo/plugins/playbooks/`. The older `.paseo/playbooks/` is the
+legacy location: it is still read, as part of the default repository, but move its files to the new folder:
 
 ```text
 .paseo/plugins/playbooks/
@@ -59,15 +59,34 @@ It is defined by the `sidekick/` folder (a folder, so it never takes a playbook 
 `sidekick.yaml` and `sidekick/sidekick.yaml` coexist). Without that folder the project has no Sidekick, and
 its tab offers "Create the Sidekick files".
 
+A Sidekick may also live in `profiles/<id>/sidekick/`. Only active profiles participate; the first
+alphabetically wins, ahead of the top-level folder, with warnings for ignored folders. Use
+`sidekick: { tier: worker, subagents: { tier: worker } }` to resolve targets from the containing
+repository/profile's `defaults/main.yaml`. Multi-entry tiers cannot have inline agent overrides.
+Profile `agent_rules` apply to the Sidekick and its subagent briefs. The Sidekick skips targets at
+the configured provider usage threshold and, on quota failure, moves through its tier followed by
+`providers.fallback`, preserving its saved ledger and archiving the old agent first. Exhaustion is
+remembered for `providers.exhausted_for` until plugin reload. Restarts and compaction replacements
+use the same selection. When every target is exhausted, the failed agent remains visible without
+an automatic retry. Subagent fallback is instructed through the Sidekick's prompt; the plugin does
+not automatically replace those subagents.
+
 ```yaml
 # sidekick/sidekick.yaml (all fields optional)
 sidekick:
   model: claude-opus-5-5        # provider, model, mode, thinking: as an agent block
-  watch: [gate.escalated, run.failed, run.manager_lost]   # event types or globs, for this project's runs
-  subagents: { provider: claude, model: claude-sonnet-5-5, mode: acceptEdits }   # what it creates for jobs (default claude / claude-sonnet-5-5; mode defaults to its own)
-  session: { restart_above_tokens: 300000 }   # hand off and restart when its context grows past this (default 300000)
+  watch: [gate.escalated, run.failed, run.manager_lost, step.waiting_manager_stuck, manager.question_pending, run.held, run.released]   # event types or globs, for this project's runs
+  subagents: { provider: claude, model: claude-sonnet-5-5, mode: acceptEdits, archive_workspace: true, archive_after: 10m }   # what it creates for jobs (default claude / claude-sonnet-5-5; mode defaults to its own); archive_* : the hidden workspace of a finished subagent is archived after the grace period (default true / 10m)
+  session: { compact_above_tokens: 300000, hard_limit_tokens: 450000 }   # compact its conversation (same agent) past the first; replace it by a new agent only when compaction fails or it stays above the second (defaults 300000 and 1.5x; restart_above_tokens is the old name of the first)
   runs: { max_concurrent: 5, confirm_bulk: true }   # rules for the runs it starts; max_concurrent unset means unlimited, confirm_bulk defaults to false
 ```
+
+`sidekick.subagents.archive_workspace` / `archive_after`: a subagent the Sidekick created in its own new hidden worktree
+workspace is archived, with that workspace, `archive_after` (default 10m, at most 24h) after the Sidekick was told it finished,
+only if the workspace is not the project's root checkout, a run's or the Sidekick's own workspace, holds no other agent,
+nothing runs, and there are no uncommitted changes or unpushed commits (otherwise it is kept and the reason logged; the
+pending archives survive a restart). The Sidekick creates that workspace with `create_workspace` (isolation worktree,
+background true) and never calls `create_agent` without a `workspaceId`.
 
 `sidekick.runs` is enforced by its prompt only, not by the plugin. Its prompt also forbids it to edit files or run
 commands itself: it sends subagents for that work. `sidekick/instructions.md` holds the repository's rules for it;
@@ -88,6 +107,7 @@ agent:                 # defaults for every step
 manager:               # settings of the manager agent when Start creates a new one
   mode: default
   compact: { above_tokens: 150000 }  # when to /compact the manager: never | on_step | on_gate_decided | { above_tokens: N } (default shown)
+  nudge: { enabled: true, after: 3m, max_interval: 30m }  # prompt an idle manager that leaves a reported step waiting (defaults shown; a playbook's manager.nudge wins)
   # lifecycle: always_on   # repo-wide default of a playbook's `manager: { mode }`: always_on (default) | none (here `mode` is the manager agent's permission mode)
 providers:             # provider failover
   exhausted_for: 1h    # an exhausted provider/model is skipped this long, then tried again (default 1h)
@@ -96,13 +116,25 @@ providers:             # provider failover
   fallback: [codex/gpt-5.5, claude/claude-opus-5-5]  # provider/model targets every step falls back to, after its own tier (default none)
   usage: { check: true, threshold: 100 }  # skip a target whose provider's reported usage window is at/over threshold % (defaults shown; check: false disables)
 timeout: 1h            # default step timeout (optional)
+manager_recovery: { retry: true }  # a quota-blocked manager is recovered by itself once its provider has headroom (default retry: true); opt-in fallback: { provider: codex, model: gpt-5-mini } re-assigns it (also allowed in a playbook, and in config.yaml)
 slow_warning: { runs: 10, factor: 2 }  # warn when a step takes more than factor x the mean of its last `runs` completed runs (defaults shown; also allowed in a playbook)
+agent_rules: ["Prefer simple, separate shell commands."]  # house rules added to the prompt of every agent of the folder (a playbook can add its own `agent_rules:`; at most 20 rules of 500 characters; see "Agent rules")
+gates: { on_behalf: allow }  # allow (default) | deny: whether an agent outside the runs may answer a human gate with resume_gate, with the human's own answer
+permissions: { on_request: authorize }  # authorize (default) | escalate | deny: what the plugin does when an agent of a run raises a tool permission request (see "Permission requests"; also allowed in a playbook)
 role:                  # defaults for agent steps, in the shape of a step's `role:` block
   silence: 30m         # remind a step agent after this long without activity (default 30m; off to disable)
   archive_agents: true # archive step agents once the run no longer needs them (default true)
 workspace:             # what happens to the workspace a run created with newWorkspace
   archive: on_end      # never (default) | on_end: archive it when the run completes or is canceled
   keep_failed: true    # keep it when the run failed or lost its manager (default true)
+  archive_with_run: true   # archiving a run also archives the workspace it created, when safe: no uncommitted/unpushed work (default true)
+  title: "Ship {ticket}"   # title of that workspace, {input} filled from the run's inputs (default "<playbook title>: <first input>"; an unfilled placeholder keeps the default)
+  archive_after: 6h        # archive the workspace of a completed/canceled run this long after it ended; never = off (default 6h)
+auto_archive:          # archive a finished run and its manager, restartable with restart_run (off by default)
+  enabled: true        # default false
+  after: 30m           # grace period after the run ended (default 30m); an open gate, an open hand-off job or a busy manager keeps it
+  keep_failed_workspace: 24h  # a failed run that can be restarted keeps its workspace this long after the failure (default 24h); its agents still go after `after`
+reload_stale_sessions: true  # after a plugin update, reload idle agents still holding the old plugin's tools (default true; false disables)
 isolation: none        # none (default) | worktree | { mode: worktree, submodules: none | all | [paths], base: <branch> }: see "Isolated runs"
 ```
 
@@ -122,13 +154,12 @@ primary, the rest are fallbacks. When a step agent's turn fails because its prov
 (quota, rate or usage limit, no credits), the plugin restarts the same attempt on the next entry with
 the same brief, without using a `retry`, records the exhausted `provider/model` in `run.exhausted` (`{ target, at }`) for
 `providers.exhausted_for` (default `1h`; later agents skip it until then, after which it is tried again;
-very short values re-probe a failing provider), logs a `provider_exhausted` line and tells the manager. When every entry is exhausted the failure goes
+very short values re-probe a failing provider). The failover is recorded in the step's history. When every entry is exhausted the failure goes
 to the manager as usual, unless `providers.on_exhausted: wait`: the step then stays running with
 `attempt.waiting { since, until }`, no retry is used, and the plugin restarts the attempt at `until` (the
 earliest end of `exhausted_for`; it waits again if the provider is still out) until `providers.max_wait`
 (default: no limit) is spent. Do not nudge or complete a waiting step. A multi-entry tier cannot be combined with inline `provider`, `model`, `mode`
-or `thinking` on the same `agent` block: define another tier. On `manager` it only picks the first
-entry when a manager is created; the manager never switches mid-run.
+or `thinking` on the same `agent` block: define another tier. On `manager` the first available entry is used at creation; a quota exit can replace the manager during an active run without replaying steps.
 
 Provider usage: before a step agent, gate decider or manager starts, the plugin reads the usage the
 daemon reports (`paseo usage`; host-wide, not per run, cached about 45 s, never forced to refresh) and skips every
@@ -143,11 +174,38 @@ over, waits (`on_exhausted: wait`, until the earliest reset time the provider wi
 or fails as above. `providers: { usage: { check: false } }` turns it off. Because usage is per host, a new run
 also skips a full provider from the start, while `run.exhausted` (failures) stays per run.
 
-`providers.fallback` (a list of `provider/model`) is appended to every step agent's chain, after its
+`providers.fallback` (a list of `provider/model`) is appended to every step agent's and manager's chain, after its
 tier's own entries (duplicates skipped), so a role with a single model still moves on when it runs out.
 A fallback keeps the role's `mode` and `thinking` only on the same provider. Out of tokens is detected
 on a failed turn (its error text) and on a turn that ends on the provider's short notice as its last
 message (Claude Code's "You've hit your weekly limit · resets …"); the patterns are in `server/quota.ts`.
+
+A quota-stuck manager can be recovered with `recover_manager` (`runId`, `expectedManagerId`,
+`reason`, optional `model: provider/model`; system RPC: `runs.recover_manager`). This replaces only the manager of an active run:
+steps, attempts, reports, outputs, jobs, open gates and their deciders, pinned definition and
+scripts stay intact. It checks the expected manager, its idle state and latest quota notice;
+it refuses paused/ended/archived runs and pending agent questions/permissions. Ordinary
+human-held gates stay held: do not decide them to make recovery possible. The old manager
+is never archived because its children must survive. Concurrent/repeated calls with the same
+expected manager create one replacement; a mismatched owner is refused.
+
+Manager quota exits (`completed` with a short provider notice, or `failed` with a quota error)
+use the same path automatically. Selection uses the pinned manager tier then `providers.fallback`,
+skipping exhausted and usage-blocked targets. `model` can select only an available target in
+that chain; there is no thinking override or tier upgrade. The result reports `target` and
+`thinking` (null means provider default, not a known effort level). API prices do not predict
+subscription quota consumption. Configure a lower-cost target in the existing tier if wanted;
+recovery does not rewrite profile mappings. With no target available the manager stays durably
+blocked, preserving its inbox. While it has pending work (inbox, recovery prompt or a ready step) the plugin
+retries by itself (`manager_recovery.retry`, default true; every 15 s timer tick, per-run backoff 30 s doubling
+to 10 min, shared usage cache): a retry succeeds only once a target has headroom in the provider's usage
+reading (or its `providers.exhausted_for` ended), then writes a `manager_recovered` history entry and emits
+`run.manager_recovered` (`retargeted: true` when it used `manager_recovery.fallback`). The opt-in
+`manager_recovery: { fallback: { provider, model } }` (defaults, playbook or config.yaml) adds that provider/model after
+the manager's own chain, also for a manual `recover_manager { model }`. Nothing to do by hand in the common case; you
+may still call `recover_manager` yourself. The takeover brief and pending inbox are durable until sent,
+and event subscriptions and their queued notices transfer to the replacement. Startup repairs
+only committed handoffs; already-stuck managers need an explicit recovery after inspection.
 
 The manager can pick a model for one attempt: `start_step`, `nudge_step` and `restart_run` take
 `model: provider/model` (checked against the provider's models, as `list_models` shows them) and
@@ -200,8 +258,9 @@ agent: { model: claude-opus-5-5 }          # optional playbook-wide settings
 concurrency: 1                             # optional: max active runs (or held blocks) in the project
 manager: { prompt: Check the PR exists before accepting implement., compact: on_step, mode: always_on }  # optional: prompt is added to the manager's instructions; compact overrides the default; mode: none = no manager agent, the plugin drives the run (see "Runs with no manager")
 workspace: { archive: on_end }             # optional: overrides defaults/main.yaml's workspace block
+permissions: { on_request: escalate }      # optional: overrides defaults/main.yaml's permissions block (authorize | escalate | deny)
 isolation: { mode: worktree, submodules: none }  # optional: each run works in its own git worktree (see "Isolated runs"); the string form `isolation: worktree` also works
-hidden: false                              # optional: true moves it to the panel's collapsed "Hidden playbooks" section (for one meant as a sub-playbook or after-task; it can still be started from there or by start_playbook)
+hidden: false                              # optional: true moves it to the panel's collapsed "Hidden playbooks" section (for one meant as a sub-playbook or after-task; also left out of the Run Playbook form; it can still be started from the panel section or by start_playbook)
 
 inputs:                                    # the Start form; the manager fills them from chat
   request: { type: string, required: true, description: What to change }
@@ -264,9 +323,9 @@ steps:
 | `queue` | A singleton's stages only: `{ mode: fifo }` (default, one job per batch) or `{ mode: merge }` (every waiting job per batch), `max_requeues: N` (how often an outcome may requeue one job here, see Requeue by outcome; unset = no cap), and `admit`. |
 | `settle` | Role or script steps: `{ output: <name> }`, a string output holding YAML per job id (`{ outputs: {...}, outcome?, reason?, blocker? }`), with `effects: { <outcome>: continue | requeue }` saying what an outcome does to the job (unlisted: it ends the job); see Requeue by outcome. When the step completes on a batch of a singleton pipeline, the plugin settles those jobs itself, as `settle_job` would; `complete_step` refuses entries that do not apply. Has no effect outside a batch. |
 | `inputs` | List of names (auto-matched) or map of name → source (`"{{ playbook.inputs.x }}"`, `"{{ steps.<id>.outputs.y }}"`) or `~`. |
-| `outputs` | Typed values the step must return with any outcome except `failure` (a failure report skips output validation). All are required then. |
+| `outputs` | Typed values the step must return with any outcome except the implicit `failure`. All are required then. On `failure` every output is optional: those given are kept when well typed, missing or mistyped ones are dropped, so the real error is not hidden (a template reading a missing one still errors when evaluated). |
 | `outcomes` | Default `[success, failure]`. See "Outcomes" below. |
-| `on` | Per outcome: `complete`, `end`, `{ end: <playbook outcome> }`, `fail`, `{ goto: <earlier step>, max_loops: N }`, or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; a choice may `goto` a step or end the step with an `outcome` and `outputs`; see Loops). |
+| `on` | Per outcome: `complete`, `end`, `{ end: <playbook outcome> }`, `fail`, `{ goto: <earlier step>, max_loops: N, delay: 2m }` (`delay` optional: the target starts only that long after the outcome; see Loops), or `{ ask: "<text>", goto: <step>, max_loops: N, choices: {...} }` (agent steps; a choice may `goto` a step or end the step with an `outcome` and `outputs`; see Loops). |
 | `retries` | Extra attempts after `failure`. |
 | `timeout` | `30m`, `2h`…, or a template of the step's inputs (`"{{ inputs.release_timeout }}"`), rendered when each attempt starts; an empty value falls back to the default timeout, a value that is not a duration fails the start (or the run's start, when it only depends on the run's inputs). Expiry counts as a failure. The agent is reminded shortly before. If its work turns out done, `nudge_step` it: its next report replaces the timeout failure. |
 
@@ -371,7 +430,10 @@ The script contract:
 
 - **The file:** a plain name in `scripts/` (no path), executable (`chmod +x`). Its
   shebang picks the language: `#!/usr/bin/env bash`, `#!/usr/bin/env python3`… It runs in the
-  run's worktree, with the daemon's environment.
+  run's worktree, with the daemon's environment. If the file is not in the workspace when the step starts (a checkout
+  behind origin), the step fails at once with `script file not found: <path> (workspace <dir>, head <sha>)`, not a
+  bare ENOENT. A run started with `newWorkspace` begins in a workspace fast-forwarded to `origin/<branch>`, so
+  files that exist on origin are there.
 - **Inputs** come as environment variables, never in a command line:
   `PLAYBOOK_INPUT_<NAME>` (upper case; `services` → `PLAYBOOK_INPUT_SERVICES`), plus
   `PLAYBOOK_RUN_ID`, `PLAYBOOK_STEP_ID`, `PLAYBOOK_ATTEMPT`, `PLAYBOOK_CHECK` (1, 2, … within
@@ -382,7 +444,9 @@ The script contract:
   `{"outcome": "...", "summary": "...", "outputs": {...}}`, each key optional. `outcome`
   defaults to the first outcome, so a script can branch (`outcomes: [merged, closed]` with
   `on.closed`). Outputs are checked against `outputs` like an agent's report; a wrong one fails
-  the attempt. On failure, `summary` (or the last stderr line) says why.
+  the attempt. On failure, `summary` (or the last stderr line) says why. `failure` is always an
+  outcome of a script step, declared or not: a non-zero exit is retried per `retries`, then follows
+  `on.failure` or fails the run, and the manager is woken only after the retries are used up.
 - **Checks must be idempotent and short:** each check looks once and exits. The plugin does
   the waiting between checks, and it reruns the current check after a daemon restart.
   A script must not edit the checkout (the concurrency rule does not check scripts).
@@ -494,6 +558,11 @@ workspace** with its own Playbook Manager, keeps at most `max_active` going, and
   no `newWorkspace` (or `false`): an isolated run starts in the caller's workspace (or `workspaceId`), a playbook without
   isolation always in a new one (`newWorkspace: false` is refused for it). `newWorkspace: true` forces a new workspace.
   A Sidekick always gets a new workspace unless it passes `workspaceId` of an existing one.
+- `start_playbook` takes `priority` (quota queue order) and a `quota` block: `quota: { exempt: true }` starts a run that is not subject
+- `set_run_quota_exempt { runId, exempt, applyToChildren? }` exempts an already started run (running, queued or held) from quota limiting, or puts it back under the limits (from its next step). Use it only for work that really must run despite the limits; the change is recorded (`quota_exempt_changed`, event `run.quota_exempt_changed`) with who made it, including when you exempt your own run. `applyToChildren` is sticky like `set_run_priority`'s: true passes the state to the active child runs now and on later changes, false stops, omitted keeps it.
+  to quota limiting (never held or paused for quota, no caps; it still reserves its cost). For work that must not wait, such as a
+  request from a human; its child runs inherit it, and it cannot be changed after the start.
+- `dismiss_finding { runId, pr, file, text, severity, category, rationale }` ends a review loop in which a code-review bot raises the same finding on every head: it records the finding as dismissed, with your rationale, on the run (`get_run` `dismissedFindings`, history `finding_dismissed`, event `finding.dismissed`), keyed per PR by a signature of the file and the normalised text (not the comment id or the head). It refuses a P0/P1 (critical, blocker, high, major), an unknown or missing severity, a missing category and the categories security, auth, secrets, credentials, IAM and migration: those go to a human (ask, or open a gate). It posts nothing: reply on the PR thread yourself, with the rationale. Idempotent. A step does not get it: it tells its manager. `list_dismissed_findings { pr, file, text }` answers whether one finding is dismissed (and its signature); `{ pr }` alone lists the PR's dismissals from every run. A check script skips what is dismissed.
 - Per-item templates may use `{{ item }}`, `{{ item.<field> }}`, `{{ index }}` and `{{ inputs.<name> }}`. A reference that
   is not set makes that item `not_started` with the reason (never "(none)"). Keys must be unique (else the step fails).
 - A child run is never started twice for one key: the plugin records each child (key, run id) in the step before creating
@@ -509,6 +578,14 @@ workspace** with its own Playbook Manager, keeps at most `max_active` going, and
   `any_failed` (boolean). An empty list completes at once with `all_completed`.
 - Canceling or failing the parent run, resetting the step with a `goto`, or its `timeout` cancels the active children and
   drops the waiting ones (`cancel_children: false` leaves them running). Archiving the ended parent does not touch them.
+- **Adding an item live.** An item created after the step started (a new ticket) joins the running fan-out with
+  `add_fanout_item { runId, stepId, item }` (manager of the run only; a human uses the *Add item* field of the step's
+  Fan-out section in the panel). `item` has the shape of the step's items: a key, or an object when `fanout.key` is set
+  (an object as an object, not JSON text). It is built like any list or refill item (same `inputs`, `key`, `workspace_name`
+  templates), waits for a `max_active` slot as `pending`, and is in `pool.known` / `pending` / `active`, so a refill pass is
+  told about it and does not list it again. Refused: step not a fan-out or not running, key already in the fan-out (any
+  state), unusable item or templates that do not render. Also accepted while a pool with `idle` waits on blockers. Logged as run event `fanout_item_added`; the bus has
+  `fanout.item_added`. Do not start a separate run for it: it would sit outside `max_active` and the pool would not know it.
 - **Replaced children.** A child's manager sometimes cancels its run and starts a new one of the same playbook for the same
   item (`Restarting on the fixed playbook`). Link them so the item stays running: `replace_child { runId: "<old>",
   newRunId: "<new>", reason? }` (child's manager, parent's manager or any other non-step agent), or in one call
@@ -555,6 +632,7 @@ full). The step ends when no child runs or waits and the last pass added nothing
         after: completed                                      # completed (default): a success triggers a pass; ended: also failed/canceled
         max_refills: 20                                       # default 20, at most 500
         debounce: 10s                                         # optional: wait this long after the oldest unhandled ending
+    idle: { output: waiting, poll: 10m }                      # optional: stay open, waiting, while blocked items remain (see below)
   on: { some_failed: complete, refill_stopped: complete }
   timeout: 8h                                                 # a pool with no timeout gets 12h
 ```
@@ -577,6 +655,15 @@ children that completed), `pool.failed` (failed, canceled, not started), `pool.a
 `pool.pending` (queued), `pool.known` (every key), `pool.refill` (the pass's number). Lists are JSON text; a list input is
 at most 200 items: declare the input `type: string` for more.
 
+**Inputs the templates read must be set.** Fan-out templates (`items`, `key`, `workspace_name`, `inputs`) and the pool's
+`refill.inputs` are strict: an unset `{{ inputs.<name> }}` is an error, never empty. A step input wired from a playbook
+input (`scope: "{{ playbook.inputs.scope }}"`) is unset when that playbook input is optional (no `required`), has no
+`default` and the run was not given it. The plugin refuses to **start** such a run, naming the input and the template
+(`input "scope" is not set, but step "spawn" fanout.pool.refill.inputs.scope reads {{ inputs.scope }}`), instead of failing
+a refill pass mid-run. Declare a non-empty `default` for an input that may be left out (an empty default counts as unset; use
+a neutral value such as `none`), or mark it `required: true`. There is no `default` filter in templates. A step with a
+`when` is not checked (it may be skipped).
+
 **Mechanics.**
 
 - A pass is due when a child has ended (`after: completed`: completed; `ended`: also failed and canceled; a child being
@@ -588,6 +675,16 @@ at most 200 items: declare the input `type: string` for more.
   `max_active` as before; the pass's own run does not use a slot.
 - **End**: no child active or queued, no pass running, no ending left for a pass. `max_refills` reached with endings still
   unhandled stops refilling. An empty first list completes at once (no pass).
+- **Waiting on blockers (`pool.idle`).** Without it, a pool whose pass lists nothing ends, even when unstarted items remain
+  that are only blocked; a playbook that wants to keep going loops back (`goto`) and then no fan-out is running, so
+  `add_fanout_item` is refused. With `idle: { output: <name>, poll: 10m }` (`poll` default 10m) the pass playbook also
+  outputs `<name>`: `true` when it listed nothing to start but items remain that are blocked (by running or queued items). Then
+  the pool **stays open** (the step keeps running; run event `fanout_pool_waiting`) instead of ending, and it re-plans:
+  when a child ends (a normal pass), **when an item is added** with `add_fanout_item` or the panel (after `debounce`; several
+  adds in a short time share one pass), and every `poll` as a safety net. The pass that finds nothing blocked (`<name>` not
+  `true`, or it listed new items) lets the pool end as usual. Re-plans that no child ending triggered (an add, the poll) are
+  **not counted** in `max_refills` (a long wait would exhaust it); a pass that follows a child ending counts as before. The
+  step's `timeout` still bounds the wait. `get_run` shows `pool.waiting`.
 - **Failure.** A pass that fails, is canceled, outputs nothing usable or has clashing keys **stops refilling** (running
   children are never killed): the step waits for them, then ends with the outcome `refill_stopped` (a pool step's extra
   outcome; it fails the run unless `on` routes it, like `some_failed`). The pass's own steps follow the usual step rules
@@ -676,12 +773,15 @@ steps:
   `PLAYBOOK_JOBS`; without `admit` the next batch may take it at once (the plugin never polls anything). Events:
   `job.requeued` with `cause: outcome` (`outcome`, `reason`, `blocker`, `requeues`).
 - **Requeueing:** a batch that fails (a lost manager, a rejected gate) puts its jobs back at the stage by itself while the
-  stage's `retries` allow; past them the jobs are `failed`. `requeue_job { runId, jobId, reason? }` (any agent except
-  step and gate agents; `runId` is the pipeline or one of its batches) puts a **failed** job back: same id, inputs and
-  outputs, it waits at the stages it has not passed and its failed rides start again, so the next batch carries it. Only
-  a handed-off (detached) job: its run is not involved (a step of an older plugin version that was waiting was told "failure" and decides itself). Idempotent
-  (an open job is left alone, `changed: false`); refused for a settled or withdrawn job, a job that passed every stage and
-  an ended pipeline. Events: `job.reopened`, then `job.queued` (`via: reopened`).
+  stage's `retries` allow; past them the jobs are `failed`. `requeue_job { runId, jobId, reason, from_outcome? }` (any agent except
+  step and gate agents; `runId` is the pipeline or one of its batches) puts a **failed** job, or one **settled with an outcome
+  other than the first** (e.g. `ejected`, once its cause is fixed), back: same id, inputs and outputs, it waits at the stages it
+  has not passed (a job that passed an earlier stage goes back at the NEXT stage's queue), its failed rides start again and
+  its pending follow-up clears. `reason` is required. `from_outcome` guards what you expect (`failed`, or the outcome): another state
+  now = an error, nothing requeued. The earlier end stays in the history and in the job's `reopens`; `queue.max_requeues` does
+  not block a manual requeue (it is only counted in `reopens`). Only a handed-off (detached) job. Idempotent without the guard
+  (an open job is left alone, `changed: false`); refused for a job that finished with the first outcome or passed every stage, a withdrawn
+  job and an ended pipeline. Events: `job.reopened`, then `job.queued` (`via: reopened`).
 - **Hand-off pending (detached jobs that ended):** a handed-off job that a batch settles with an outcome
   other than the first (`ejected`, `no_deploy`...) is told to nobody: only the batch's manager can start what follows (the
   playbook's instructions say what, e.g. a rework run). Each such job needs a **follow-up recorded**: `start_playbook` with
@@ -914,8 +1014,10 @@ after:
   `escalationReason`; `subscribe_events` on `gate.escalated` tells agents when that happens; its `delivery` is `idle` by default, which holds the notice until the subscriber's turn ends, or `steer` to inject it into the running turn). A retro step that reviews the whole run gets it from
   the manager: tell the manager (in the playbook `description`) to put `get_run` with
   `view: "full"` in the step's brief. The default `get_run` view is compact (per step: status,
-  outcome, attempts, turn end and the first 300 characters of the summary), without reports
-  or outputs.
+  outcome, attempts, times, turn end and the first 300 characters of the summary), without reports
+  or outputs. Times: the run and each step that started have `startedAt`, `endedAt` (ISO; absent while running) and
+  `durationMs`; a running one also has `live: true` (the duration is the time so far). A retried step shows its current
+  attempt plus `totalMs` across attempts (`view: "full"` adds `attemptTimes`). Older runs without timestamps omit them.
   `read_agent_conversation` (every agent but step and gate agents) reads any agent's conversation as text, newest page first,
   with reasoning and tool input opt-in and a `before` cursor for older entries.
 
@@ -939,6 +1041,13 @@ target and every step after it. The step or gate that looped hands its summary o
 to the target as "Feedback to address". Reaching `max_loops` opens a "loop limit" gate; approving it
 sends the target the step's feedback and the decision's comment ("On the loop limit, the human said: …"). A comment
 from the manager or a role decider reads "the manager said"/"the role "x" said", whichever gate it is.
+
+`delay` on a `goto` (a duration such as `30s`, `2m`, `1h`, parsed like `timeout`) holds the target back after
+the outcome: it stays pending, the graph card shows "waits until <time>", and it becomes ready (and starts as any
+ready step does) when the time comes. The due time is saved in the run, so a plugin restart resumes it; pausing
+holds it until resume; canceling the run drops it. The delay is not running time. Use it on a polling loop so a
+check that keeps answering the same way does not spin:
+`on: { recheck: { goto: check_script, delay: 2m } }`. It does not apply to `ask` choices or a loop-limit approval.
 
 A `max_loops` inside a block holds per pass: when a `goto` from outside re-enters the block (an outer
 loop over items, say), the counters of the block's own loops start again from 0. The outer
@@ -1016,7 +1125,25 @@ on:
 ```
 
 - `by: human` (the default): the manager asks the human in chat and relays the answer, or the
-  human decides in the panel.
+  human decides in the panel. An agent that talks to the human and belongs to no run (the Sidekick, a coordinator) can
+  also relay the human's own answer with `resume_gate { runId, gateId, choice, comment }`: the
+  comment is required and carries the human's verbatim answer, and it is used only with the
+  human's answer given through the question tool (or a documented standing answer), never on
+  another agent's say-so. It is refused for a run's manager, step, gate or after-task agents and
+  anything they started (a run cannot approve its own gate), for a gate that is not open, a choice
+  the gate lacks, and an empty comment; a Sidekick is held to its project. Recorded as `decidedBy:
+  "agent <name> on behalf of the human"`, so `gate.decided` shows it; no new field. Turn it off
+  with `gates: { on_behalf: deny }` in `defaults/main.yaml`. No Sidekick is needed.
+  A human who reviewed a gate but will not decide now can **defer** it (panel "Defer…", or `defer_gate { runId,
+  gateId, reason, condition, remindAt? }` for the same kind of caller, at the human's request): it moves from Needs you to
+  Waiting with a required reason and a condition, stays open and decidable by the same rules, and never counts as an answer.
+  Conditions `date`, `run_ended` (another run of the project) and `gate_decided` (another gate of the project) are tracked
+  from run state (they return the gate to review and emit `gate.returned`); `manual` is not tracked (a PR merge, a reply):
+  say so, and bring it back with `return_gate` or let `remindAt` do it. Do not guess a condition from chat.
+  Without being asked, a Sidekick may defer a *routine* gate that plainly cannot be decided yet (`initiative: "agent"`:
+  best tracked condition from run data, else `manual` with a note and `remindAt`; recorded as "on its own judgment", never as the
+  human's request) and must tell the human afterwards. Secrets, credentials, IAM, auth or permissions, data loss, billing and
+  production go/no-go gates stay in Needs you unless the human explicitly defers them.
 - `by: manager`: the manager may decide alone (`resume` with `byManager: true` and its reason
   as comment, shown as "by the manager"), or call `escalate_gate` with its reason and ask a human as
   for a human gate (this tells agents subscribed to `gate.escalated`).
@@ -1086,9 +1213,10 @@ isolation: { mode: worktree, submodules: [ops/api, ops/web], base: main }   # bl
   (fast, shares objects; a submodule the workspace never initialised is initialised in place).
 - **Cleanup**: when the run completes or is canceled (and its after-tasks end), the plugin removes the worktree
   and its branch, and the history says so. A canceled run is an intentional end, so `keep_failed` does not apply
-  to it: it is removed like a completed one. It keeps the worktree, with a `worktree_kept` history entry, when the
-  run failed and `workspace.keep_failed` is true, when it has uncommitted changes (also after a cancel), or when the guard fired; it
-  keeps the branch (not the directory) when the branch has commits on no remote. Restarting a run brings the
+  to it: it is removed like a completed one. A failed run's worktree is kept, with a `worktree_kept` history entry, for
+  24 hours after the failure when `workspace.keep_failed` is true (default), and removed earlier when the volume is at
+  least 85% used. It also keeps the worktree when it has uncommitted changes (also after a cancel; `.cache` and `.tmp`
+  do not count, and are deleted) or when the guard fired; it keeps the branch (not the directory) when the branch has commits on no remote. Restarting a run brings the
   worktree back on its branch. At daemon start the plugin deletes worktree directories whose run no longer
   exists. It never deletes outside its worktrees directory.
 - **Fresh playbook**: an isolated run reads its playbook and roles from its worktree (a freshly fetched `origin/<base>`), not from the workspace checkout, so you do not need to fast-forward the workspace for new rules to apply (and must not while isolated runs are active). `start_playbook` says where the definition came from; if it warns that the workspace checkout's copy was used (fetch failed, or the playbook is missing/invalid on origin), the rules may be stale. The playbook must still exist, valid and isolated, in the workspace checkout to be started. `validate_playbooks` reports `source` per playbook (what a new run would load). `restart_run` keeps the run's frozen definition.
@@ -1109,6 +1237,38 @@ outputs:
   changes: { type: string, description: "What you changed, per file" }
 ```
 
+## Permission requests (`permissions.on_request`)
+
+Run agents (the manager, step agents, role deciders and their subagents) normally run in Bypass mode, yet Claude Code still
+asks about some compound or destructive-looking shell commands (`cd x && sed -i ... && rm -rf .tmp/*`). The request sits on
+the agent and the run hangs silently. The plugin answers it, by `permissions: { on_request: ... }` (repo-wide in
+`defaults/main.yaml`, overridable per playbook):
+
+- `authorize` (default): the plugin allows it on the human's behalf. A run agent in Bypass mode means the human would have authorized it.
+- `escalate`: a `permission` gate opens on the run (choices `allow` / `deny`, the agent and the command in its text). It shows
+  in the panel, in `list_gates`, in `gate.opened` / `gate.decided`, and blocks the run like any human gate. The panel or
+  `resume_gate` decides it; the plugin then answers the agent. If the request disappears first, the gate closes.
+- `deny`: the agent is told to pick another way (simple separate commands, the file tools).
+
+Only tool requests are handled by the policy: a plan or a mode change stays with the human. The Playbook Manager's own
+question (AskUserQuestion) is mirrored as a `manager_question` gate (below). Every outcome is
+a line of the run history (`permission_authorized`, `permission_denied`, `permission_escalated`). Choose `escalate` or `deny`
+for stricter runs. When you write role instructions, ask for simple separate commands: no `cd && sed -i && rm -rf` chains, no
+`rm -rf` globs, and the file tools for edits; the plugin adds this rule to the manager and step prompts too.
+
+### Manager questions (`manager_question` gates)
+
+When the manager asks the human a question in its conversation (AskUserQuestion), the plugin opens a gate of kind
+`manager_question` on step `manager`, so it shows under "Needs you" in the panel and in `list_gates` like any human gate
+(`gate.opened` / `gate.decided` fire, the run is `waiting_gate`). Choices: `option-1`, `option-2`, ... (the question's options, in
+order), `other` (needs the typed answer as `comment`); a question with no options has the single choice `answered` (comment
+required). Decide it in the panel or with `resume_gate` (a Sidekick relays the human's words); the plugin delivers the answer to
+the manager's pending question, and the manager's turn goes on. A manager cannot decide it (it asked the question). If the human
+answers in the manager's conversation, or the request disappears, the gate closes as `dismissed`. A request with several questions
+or a multi-select has no choices: tell the human to answer in the manager's conversation. A question the manager asks for a
+gate step, ask or loop-limit gate is that gate's own question and is not mirrored. Not duplicated with `permission` gates (tool
+requests under `escalate`). No setting: it is always on.
+
 ## Checklist
 
 1. Write roles first (`role.yaml` + a clear `instructions.md` that names its outputs).
@@ -1121,10 +1281,16 @@ outputs:
 ## Improve a playbook from its token spend
 
 `get_analytics` (read-only; `days`, `playbook`, `projectId`, `limit`) sums what agents spent, by playbook, step
-(with its role and model), role and model: tokens, peak context, and wasted attempts (retried, or whose
-agent did not finish) with their tokens. Look for steps that use the most tokens, retry the most or fill their context,
-and for a big model on a simple step; then propose a change to the playbook, role or model. `overhead` is the
-managers' and gate deciders' share. Usage exists only for runs that ended turns after v0.58.0.
+(with its role and model), role and model: tokens, peak context, and repeat passes (`repeatAttempts` /
+`repeatTokens`: earlier attempts of a step, often by design) split by why the earlier attempt ended: `feedbackAttempts`
+(a `goto` loop-back such as `changes_requested`), `pollAttempts` (a `goto` with a `delay`: a re-check), `retryAttempts`
+(failure or timeout, then run again) and `interruptedAttempts` (the agent errored, was canceled or lost, or reported
+nothing). Lost work is the real loss: `lostAttempts` / `lostTokens` (retries + interrupted) and `lostShare` (lost over the
+row's tokens, 0..1); `stalledAttempts` flags loops that returned the same outcome and summary 3 times in a row, or hit
+their `max_loops` gate. `wastedAttempts` / `wastedTokens` are deprecated aliases of the repeat passes. The Analytics tab
+shows the same, and can sort by lost share. Look for steps with a high lost share or stalled loops, that fill their
+context, and for a big model on a simple step; then propose a change to the playbook, role or model. `overhead` is the
+managers' and gate deciders' share. Usage is recorded as per-turn deltas from v0.66.1; runs recorded before that hold an inflated manager usage that analytics leaves out (their step and decider usage still counts).
 
 ## Recover a run
 
@@ -1148,7 +1314,11 @@ steps that completed:
      Manager is created there; the history records the move. `create_workspace` makes a
      workspace; check out the run's branch in it first if the work lives there.
 
-`archive_run` (`runId`, optional `force`) archives a run that has ended, like the panel's archive button: after `cancel_run` or a finished run, once its job is settled. It hides the run from the panel and from `list_runs` (without `archived: true`); `restart_run` still reopens it. It refuses an active run, and a run whose hand-off job is still open at a pipeline stage or batch unless `force: true`; archiving twice is fine.
+`refresh_scripts` (`runId`, `reason`) makes a run's script steps (`codex_check`, `ci_check`...) run the scripts as committed on the current `origin/<base>`, instead of the copy pinned at its start: use it after a script fix landed on main. On an active run only the `scripts/` folder is refreshed; the step definitions (inputs, declared outputs) stay pinned. It also works on a **failed** (or any ended) run that `restart_run` can reopen, and then re-reads the definition (playbook, roles, defaults) too, from the same source, as long as the steps are the same (ids, kinds, needs; else the definition stays pinned and the result says why): so after a script fix, `refresh_scripts` then `restart_run` (or `restart_run` with `refresh: true`, one call; if the refresh fails nothing is restarted) runs the current scripts and definition. The run's history, outputs and completed steps are kept, and the scripts of a failed run never run again by themselves. A plain `restart_run` keeps the pinned scripts and definition (a failed run's worktree is kept for a while, with the old scripts). **Source**: `origin/<base>` (fetched) when the playbook there is valid; when it is invalid or missing there, the workspace checkout is used instead, and the result says so (`source: workspace`, `note`: the short validation error, shown as a WARNING). Refused when the fetch fails, for a run `restart_run` cannot reopen (singleton pipeline, batch, no restartable step), for a run without a worktree, or a worktree not created from `origin/<base>`; refreshing twice to the same commit changes nothing. The history records the commit before and after (`scripts_refreshed`).
+
+A run whose definition was read from the workspace checkout instead of origin (origin's playbook invalid, missing or unfetchable at start, or at a refresh) carries a warning, "definition read from the workspace checkout because origin/<base> is invalid: <reason>": `warnings` in `get_run`/`list_runs`, `definition.warning`, a `definition_fallback` history entry, the `run.definition_fallback` event (subscribe_events) and a line in the run's details in the panel. It means the run may use an out-of-date definition: fix the playbook on origin, then `refresh_scripts` (ended run) to re-read it.
+
+`archive_run` (`runId`, optional `force`) archives a run that has ended, like the panel's archive button: after `cancel_run` or a finished run, once its job is settled. It hides the run from the panel and from `list_runs` (without `archived: true`); `restart_run` still reopens it. It refuses an active run, and a run whose hand-off job is still open at a pipeline stage or batch unless `force: true`; archiving twice is fine. The run's workspace (and every agent in it) is archived with it by default: `workspace: { archive_with_run }` defaults to `true`, and `workspace: { archive_with_run: false }` (in a playbook or `defaults/main.yaml`) opts out. It is archived only when no other unarchived run uses it, nothing in it runs or waits on a permission, every visible agent in it is a run's, and it has no uncommitted changes and no unpushed commits; the result carries `workspaceArchived` and `workspaceReason`. If the workspace is gone, `restart_run` needs its `workspaceId` (an existing workspace of the same project, no active run) to restart there.
 
 `restart_run` refuses an active run (cancel it first), a step whose needs did not complete,
 and a workspace that is gone or already has another active run (the message names that run and
@@ -1177,6 +1347,19 @@ With no manager, a human gate is shown in the panel and also put to the human in
 that agent is still alive (`role: { archive_agents: false }`, idle): the plugin asks it to use `AskUserQuestion`, then `answer_gate`
 (a tool only those step agents have). Answering in the panel or in the conversation closes the gate; the other surface is dismissed.
 
+## Rate limits
+
+Off by default; set in a repository's or profile's `defaults/main.yaml` and/or the user config (`quota_limits: { steps, playbooks, quota: { pacing, usable_percent, refresh_interval, max_age } }`; `usable_percent` alone turns pacing on; the folder's defaults override the user config, field by field, resolved per run from the run's own playbook folder, each run gated by the caps of its own config; the old `rate_limits` and `rate_limit` still work as deprecated aliases).
+
+`closed_hours: { timezone, slots: [{ days, from, to } | { days, slots: [{ from, to }, …] }] }` (top level of the defaults or the user config, shared by the quota and the warden; `quota_limits.quota.closed_hours` still works) declares weekly slots. Quota: they are left out of what is allowed so far (allowed so far = `usable_percent` × open hours elapsed ÷ open hours in the window; flat while a slot is closed; nothing is paused or held for it). Warden: the clocks of its time thresholds (`stale_definition`, `slow`, `gate_open`, `stalled`, `held`, the PR checks) pause while a slot is closed and resume when it ends. `days`: a name (`monday`/`mon`), a list, or `weekdays` / `weekend` / `everyday`; `from`/`to`: `HH:MM`, `to` after `from` (`24:00` = end of day, no wrapping: write two slots); `timezone`: IANA, default the host's. A slot is flat (`days` + `from` + `to`) or nested (`days` + a non-empty `slots` list of `{ from, to }` ranges: several ranges per day group, e.g. a weekday morning and evening), never both; ranges are validated alike and overlapping or adjacent ones are merged. Example: `closed_hours: { timezone: Europe/Paris, slots: [{ days: [saturday, sunday], from: "00:00", to: "24:00" }] }`.
+With `quota.pacing` the quota left decides how much runs: work starts while a provider's headroom (allowed so far minus usage minus what started work
+still uses) covers its estimated cost (the measured history of its steps; with none it is not paced by cost until its first measure; the old manual `quota_limit.estimate` was removed and is refused at load); `steps` and `playbooks` are only optional hard caps.
+A run is admitted whole when the headroom covers its estimated cost; the pace may later pause admitted runs between steps (kind `pace`). A playbook may set
+`quota_limit: { priority: 0 }` (priority: a whole number, higher first, ties oldest first; also in `defaults/main.yaml`), and `start_playbook` takes `priority` to override it per run.
+The plugin may hold a run's new steps (not enough headroom, a provider at its usable share, a cap). `get_run` shows `rateHold`
+(kind headroom | pace | quota | steps | playbooks, reason, provider, window, retryAt, estimatedCost, headroom, position, priority) and `rateNote` (a used provider reports no usage, so it is not paced); `run.held` / `run.released` are events. A held run needs nothing from an agent: running steps finish, the
+plugin starts the ready steps itself when capacity or quota returns. Never start, retry, restart or cancel because of a hold.
+
 ## Slow steps
 
 The panel marks a step with a yellow "attention" triangle when it takes more than `factor` (default 2) times the
@@ -1188,6 +1371,19 @@ mean duration of its last `runs` (default 10, at least 3) completed runs of the 
 - One run: `get_run { runId }` (compact or full): `slowSteps` on the run and `slow` on each slow step. A slow step
   that already ended is listed there too (`running: false`).
 - Normal `list_runs` rows carry `slowSteps` as well. A step with fewer than 3 completed runs has no baseline and is never slow. Completed steps shorter than 1s are not samples, and a step that has taken less than 10s is never slow.
+- A reported step the manager does not act on: the plugin prompts the idle manager (`manager.nudge`: after `after`, then
+  2x, 4x ..., at most every `max_interval`; never while the manager runs a turn or has a question or permission request
+  open, or while a gate of the run is held by a human or a role). If you are that manager: complete_step it, or route it
+  (nudge_step). After the second prompt without progress `subscribe_events` type `step.waiting_manager_stuck` fires; a
+  manager question open for `after` fires `manager.question_pending` (once per episode each; both are in the Sidekick's default `watch`).
+- The warden (`warden: { enabled: false, interval: 15m, cooldown: 1h, checks: { stale_definition: { after: 12h, action: report }, manager_blocked: { action: report }, loops: { above: 5, action: report }, slow: { action: report }, gate_open: { after: 30m, action: report } } }`
+  in `defaults/main.yaml` or a playbook; a playbook's own fields win): **off by default**, nothing runs without `enabled: true`. One periodic,
+  deterministic pass (no LLM, no prompt to a run's agent). `action`: `report` or `none` (off for that check); `stale_definition` also
+  `refresh_scripts` (isolated runs only, once per finding) and only fires once the run's pinned definition is `after` old (default `12h`; a workspace-checkout definition is reported at once). Findings are in `get_run`'s `warden` list (check, subject, detail, since, reportedAt)
+  and in the panel; `warden.finding` (`subscribe_events`, scoped) is emitted for `stale_definition`, `manager_blocked` and `loops`; `slow` and
+  `gate_open` reuse `step.slow` and `gate.stale`. A finding is reported once, again after `cooldown` if still true. The Sidekick gets one
+  "[playbooks] The warden found ..." message per pass with the new findings only. See `docs/adrs/2026-11-18-warden.md`.
+- PR checks (`warden.pr_checks`, `defaults/main.yaml` only, each check off unless its block is set; needs `warden.enabled` and a project with a Sidekick): every `interval` one `gh pr list` read of the open PRs finds a PR with none of `no_reviewer.required` requested (`pr_no_reviewer`), `conflicting` (`pr_conflicting`), no `review_bot` receipt for its head after `review_stale.after` (`pr_review_stale`), a `required_checks.names` entry not run on its head (`pr_required_checks`), changes requested by the bot with no `fix_step` running (`pr_review_findings`), no owning run (`pr_unowned`: the run's branch is the PR's head, or the PR URL is in its state) or a draft idle for `draft_idle.after` (`pr_draft_idle`). Each finding carries the run id (if any), the PR, the cause and a proposed action (text: the warden takes none) and reaches the Sidekick in the same summary, deduplicated the same way. See `docs/adrs/2026-11-20-warden-pr-checks.md`. Extensions (`docs/adrs/2026-11-20-warden-pr-checks-extended.md`): `repos: { names: [owner/repo], from_runs: true }` scans several repositories with `gh pr list --repo` (default: the project root's), ownership matched per repo; `required_checks: { from_ruleset: true, workflows: { check: workflow } }` adds the checks the base branch's ruleset requires (`gh api repos/<repo>/rules/branches/<base>`; an API error is logged and skipped) and names the workflow (`{workflow}`, `{repo}` in `dispatch`); `review_findings: { marker: { pattern, truthy } }` reads the bot's own marker (`pattern` has one capture, `truthy` matches the captured value when findings are open) instead of CHANGES_REQUESTED; `failed_run: { playbooks: [ids], within: 24h }` proposes a failed run (or failed step) of those playbooks with the run id, step and error (`run_failed`).
 - `subscribe_events` with type `step.slow` (scoped, like the other step events): one message when a running step
   first goes past the threshold (measured every 30 s; not repeated, and not announced for steps already slow when the
   daemon restarts). A slow step is often stuck: read its agent with `read_agent_conversation` before nudging it.

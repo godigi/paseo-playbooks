@@ -173,4 +173,75 @@ describe("header buttons", () => {
     expect(updates).toEqual([expect.objectContaining({ id: "a", visible: true })]);
     stop();
   });
+  it("retries failed requests on the next poll without overlapping calls", async () => {
+    const { client, requests, handlers, updates } = fakeClient();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const rpc = vi.fn().mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue({ withPlaybooks: ["a"], waiting: [] });
+    (client as unknown as { rpc: unknown }).rpc = (_: unknown, input: { workspaceIds: string[] }) => {
+      requests.push(input.workspaceIds);
+      return rpc();
+    };
+    const stop = contributeHeaderButtons(client);
+    await vi.advanceTimersByTimeAsync(0);
+    handlers().snapshot({ entries: [{ id: "a" }] });
+    await vi.advanceTimersByTimeAsync(400);
+    expect(requests).toEqual([["a"]]);
+    expect(updates).toEqual([]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(requests).toEqual([["a"], ["a"]]);
+    expect(updates).toEqual([expect.objectContaining({ id: "a", visible: true })]);
+    stop();
+    error.mockRestore();
+  });
+
+  it("releases observation and visibility listeners and cancels pending work on disposal", async () => {
+    const { client, requests, handlers, updates } = fakeClient();
+    const stopObservation = vi.fn();
+    const releaseSubscription = vi.fn();
+    const originalList = client.paseo.workspaces.list.bind(client.paseo.workspaces);
+    (client.paseo.workspaces as unknown as { list: unknown }).list = async () => {
+      const result = await originalList({ subscribe: {} });
+      const subscribe = result.subscription.subscribe.bind(result.subscription);
+      return { subscription: { release: releaseSubscription, subscribe: (h: unknown) => {
+        subscribe(h as never);
+        return stopObservation;
+      } } };
+    };
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("document", { visibilityState: "visible",
+      addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) => listeners.delete(listener) });
+    let resolve!: (value: unknown) => void;
+    (client as unknown as { rpc: unknown }).rpc = () => new Promise(r => { resolve = r; });
+    const stop = contributeHeaderButtons(client);
+    await vi.advanceTimersByTimeAsync(0);
+    handlers().snapshot({ entries: [{ id: "a" }] });
+    await vi.advanceTimersByTimeAsync(400);
+    handlers().update(upsert("b"));
+    stop();
+    resolve({ withPlaybooks: ["a"], waiting: ["a"] });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(updates).toEqual([]);
+    expect(requests).toEqual([]);
+    expect(stopObservation).toHaveBeenCalledOnce();
+    expect(releaseSubscription).toHaveBeenCalledOnce();
+    expect(listeners.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases a subscription that arrives after disposal", async () => {
+    const { client } = fakeClient();
+    let resolve!: (value: unknown) => void;
+    const release = vi.fn();
+    const subscribe = vi.fn();
+    (client.paseo.workspaces as unknown as { list: unknown }).list = () => new Promise(r => { resolve = r; });
+    const stop = contributeHeaderButtons(client);
+    stop();
+    resolve({ subscription: { release, subscribe } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(release).toHaveBeenCalledOnce();
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
 });

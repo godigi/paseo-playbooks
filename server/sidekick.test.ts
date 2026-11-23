@@ -85,6 +85,59 @@ describe("loading the Sidekick files", () => {
   });
 });
 
+describe("profile Sidekick tiers", () => {
+  const defaults = `tiers:
+  worker:
+    - { provider: claude, model: primary, mode: bypassPermissions }
+    - { provider: codex, model: backup, mode: full-access }
+providers: { usage: { check: false }, exhausted_for: 2h }
+agent_rules: ["Keep changes focused."]
+`;
+
+  it("uses only active profiles, alphabetically, ahead of the legacy folder and loads profile rules", async () => {
+    const dir = await tempDir("sk-profiles-");
+    await write(dir, `${PLAYBOOKS}/sidekick/instructions.md`, "Legacy.");
+    for (const id of ["alice", "bob"]) {
+      await write(dir, `${PLAYBOOKS}/profiles/${id}/defaults/main.yaml`, defaults);
+      await write(dir, `${PLAYBOOKS}/profiles/${id}/sidekick/sidekick.yaml`, "sidekick: { tier: worker, subagents: { tier: worker } }");
+    }
+    expect((await loadSidekick(dir)).profile).toBeNull();
+    const load = await loadSidekick(dir, { activeProfiles: ["bob", "alice"] });
+    expect(load).toMatchObject({ profile: "alice", errors: [], config: {
+      tier: "worker", provider: "claude", model: "primary", mode: "bypassPermissions",
+      fallback: [{ provider: "codex", model: "backup", mode: "full-access" }],
+      subagents: { tier: "worker", provider: "claude", model: "primary", fallback: [{ provider: "codex", model: "backup", mode: "full-access" }] },
+      providers: { usageCheck: false, exhaustedForMs: 7200000 }, agentRules: ["Keep changes focused."],
+    } });
+    expect(load.warnings.join("\n")).toContain("bob");
+    expect(load.warnings.join("\n")).toContain("ignored");
+    expect((await loadPlaybooks(dir, { activeProfiles: ["bob"] })).sidekick.profile).toBe("bob");
+  });
+
+  it("resolves top-level tiers and rejects unknown tiers, conflicts and misplaced tier fields", async () => {
+    const dir = await tempDir("sk-tier-errors-");
+    await write(dir, `${PLAYBOOKS}/defaults/main.yaml`, defaults);
+    for (const yaml of ["sidekick: { tier: absent }", "sidekick: { tier: worker, model: override }", "sidekick: { subagents: { tier: worker, mode: plan } }", "tier: worker", "sidekick: { session: { tier: worker } }"]) {
+      await write(dir, `${PLAYBOOKS}/sidekick/sidekick.yaml`, yaml);
+      expect((await loadSidekick(dir)).errors.length, yaml).toBeGreaterThan(0);
+    }
+    await write(dir, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { tier: worker }");
+    expect(await loadSidekick(dir)).toMatchObject({ errors: [], profile: null, config: { model: "primary" } });
+    await write(dir, `${PLAYBOOKS}/defaults/main.yaml`, "tiers: { worker: { provider: codex, model: small } }");
+    await write(dir, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { tier: worker, model: large }");
+    expect(await loadSidekick(dir)).toMatchObject({ errors: [], config: { provider: "codex", model: "large" } });
+  });
+
+  it("applies defaults even with no sidekick.yaml and reports invalid profile defaults", async () => {
+    const dir = await tempDir("sk-profile-defaults-");
+    await write(dir, `${PLAYBOOKS}/profiles/alice/sidekick/instructions.md`, "Rules.");
+    await write(dir, `${PLAYBOOKS}/profiles/alice/defaults/main.yaml`, defaults);
+    expect(await loadSidekick(dir, { activeProfiles: ["alice"] })).toMatchObject({ errors: [], config: { agentRules: ["Keep changes focused."] } });
+    await write(dir, `${PLAYBOOKS}/profiles/alice/defaults/main.yaml`, "providers: { exhausted_for: invalid }");
+    expect((await loadSidekick(dir, { activeProfiles: ["alice"] })).config).toBeNull();
+  });
+});
+
 describe("the Sidekick prompt", () => {
   it("is scoped to the project, lists what it watches and ends with the repository's instructions", () => {
     const text = sidekickPrompt({ projectId: "p1", label: "Shop", root: "/work/shop", watch: ["gate.escalated"] }, "Never merge on Friday.");
@@ -132,13 +185,24 @@ describe("the Sidekick prompt", () => {
 
 function fakePaseo(roots: Record<string, string>) {
   const archivedAt: Record<string, string | null> = {};
+  const targets: Record<string, { provider: string; model: string }> = {};
+  const timeline: Record<string, any[]> = {};
+  const usageData: { providers: any[] } = { providers: [] };
   const created = { workspaces: [] as Array<Record<string, unknown>>, agents: [] as Array<{ workspaceId: string; options: Record<string, any> }> };
   const sent: Array<{ agentId: string; text: string }> = [];
   const state: Record<string, { status: string; used: number }> = {};
+  const latency = { ms: 0 };
+  const labels: Record<string, Record<string, string>> = {};
+  const failSend = { on: false };
+  const live = { count: 0, max: 0 };
   const ref = (agentId: string) => ({
     refresh: async () =>
-      agentId in archivedAt ? { agent: { id: agentId, status: state[agentId]?.status ?? "idle", archivedAt: archivedAt[agentId], lastUsage: { contextWindowUsedTokens: state[agentId]?.used ?? 0 } } } : null,
-    send: async (text: string) => void sent.push({ agentId, text }),
+      (latency.ms ? await new Promise((done) => setTimeout(done, latency.ms)) : undefined, agentId in archivedAt ? { agent: { id: agentId, ...targets[agentId], status: state[agentId]?.status ?? "idle", archivedAt: archivedAt[agentId], lastUsage: { contextWindowUsedTokens: state[agentId]?.used ?? 0 } } } : null),
+    timeline: { refetch: async () => ({ entries: timeline[agentId] ?? [] }) },
+    send: async (text: string) => {
+      if (failSend.on) throw new Error("no compaction here");
+      sent.push({ agentId, text });
+    },
     archive: async () => void (archivedAt[agentId] = new Date().toISOString()),
   });
   const workspace = (id: string) => ({
@@ -154,12 +218,19 @@ function fakePaseo(roots: Record<string, string>) {
         created.agents.push({ workspaceId: id, options });
         const agentId = `agent-${created.agents.length}`;
         archivedAt[agentId] = null;
+        const [provider, ...model] = options.config.provider.split("/");
+        targets[agentId] = { provider, model: model.join("/") };
+        labels[agentId] = options.labels;
+        // A Sidekick never starts while another one of the project is alive.
+        live.count = Object.keys(labels).filter((id) => archivedAt[id] === null).length;
+        live.max = Math.max(live.max, live.count);
         return { id: agentId, ...ref(agentId) };
       },
     },
   });
   const paseo = {
-    agents: { ref, list: async () => ({ entries: [] }) },
+    providers: { listUsage: async () => usageData },
+    agents: { ref, list: async () => ({ entries: Object.keys(labels).map((id) => ({ agent: { id, labels: labels[id], archivedAt: archivedAt[id], createdAt: `2026-01-01T00:00:${String(id.replace(/\D/g, "") || 0).padStart(2, "0")}Z` } })) }) },
     workspaces: {
       ref: (id: string) => workspace(id),
       create: async (options: Record<string, any>) => {
@@ -168,7 +239,7 @@ function fakePaseo(roots: Record<string, string>) {
       },
     },
   };
-  return { paseo, created, sent, state, archive: (id: string) => (archivedAt[id] = new Date().toISOString()) };
+  return { paseo, created, sent, state, timeline, usageData, latency, labels, failSend, live, archivedAt, archive: (id: string) => (archivedAt[id] = new Date().toISOString()) };
 }
 
 async function setup(projects: Record<string, boolean>, options: { debounceMs?: number } = {}) {
@@ -258,6 +329,32 @@ describe("a project's Sidekick", () => {
   });
 });
 
+describe("the Sidekick column's list", () => {
+  it("asks the projects at once, not one after the other, and keeps the input's order", async () => {
+    const names = Array.from({ length: 30 }, (_, index) => `p${index}`);
+    const { runtime, latency } = await setup(Object.fromEntries(names.map((name) => [name, true])));
+    for (const name of names) await runtime.openSidekick(`ws-${name}`);
+    latency.ms = 20;
+    const started = performance.now();
+    const projects = await runtime.sidekickProjects(names.map((name) => ({ projectId: name, workspaceId: `ws-${name}` })));
+    const took = performance.now() - started;
+    console.log(`[bench] sidekickProjects, 30 projects, 20 ms per agent lookup: ${took.toFixed(0)} ms`);
+    expect(projects.map((project) => project.projectId)).toEqual(names);
+    expect(projects.every((project) => project.agentId !== null)).toBe(true);
+    // One after the other would take 30 x 20 ms.
+    expect(took).toBeLessThan(300);
+  });
+
+  it("leaves out a project whose workspace is gone", async () => {
+    const { runtime } = await setup({ shop: true });
+    const projects = await runtime.sidekickProjects([
+      { projectId: "gone", workspaceId: "ws-gone" },
+      { projectId: "shop", workspaceId: "ws-shop" },
+    ]);
+    expect(projects.map((project) => project.projectId)).toEqual(["shop"]);
+  });
+});
+
 describe("a Sidekick's session", () => {
   it("carries the project label, the configured subagent model and the relay and analytics tools", async () => {
     const { runtime, created, roots } = await setup({ shop: true });
@@ -330,22 +427,251 @@ describe("a Sidekick's session", () => {
     expect(await run("sidekick: { model: claude-sonnet-5-5 }\n")).not.toContain("modeId");
   });
 
-  it("is asked to hand off past the context threshold, then restarted with its summary", async () => {
-    const { runtime, created, sent, state, roots } = await setup({ shop: true });
-    await write(roots.shop!, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { session: { restart_above_tokens: 1000 } }\n");
-    await runtime.openSidekick("ws-shop");
-    state["agent-1"] = { status: "idle", used: 500 };
-    await runtime.onTurnEnded("agent-1", "completed");
-    expect(sent).toEqual([]);
-    state["agent-1"] = { status: "idle", used: 2000 };
-    await runtime.onTurnEnded("agent-1", "completed");
-    expect(sent[0]?.text).toContain("sidekick_handoff");
-    await runtime.sidekickHandoff("agent-1", "Ledger: human chose A.", true);
-    await runtime.onTurnEnded("agent-1", "completed");
-    expect(created.agents).toHaveLength(2);
-    expect(created.agents[1]!.options.prompt).toContain("Ledger: human chose A.");
-    expect(created.workspaces).toHaveLength(1);
-    expect(await runtime.openSidekick("ws-shop")).toMatchObject({ agentId: "agent-2", created: false });
+  describe("tier failover", () => {
+    const configure = async () => {
+      const made = await setup({ shop: true });
+      await write(made.roots.shop!, `${PLAYBOOKS}/defaults/main.yaml`, `tiers:
+  worker:
+    - { provider: claude, model: first, mode: bypassPermissions }
+    - { provider: codex, model: second, mode: full-access }
+    - { provider: backup, model: third, mode: default }
+providers: { usage: { check: false }, exhausted_for: 2h }
+`);
+      await write(made.roots.shop!, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { tier: worker, subagents: { tier: worker } }");
+      await made.runtime.openSidekick("ws-shop");
+      await made.runtime.sidekickHandoff("agent-1", "Continue task 42.", false);
+      return made;
+    };
+
+    it("moves through the ordered chain on quota failures, preserves the ledger, and keeps the target on restart", async () => {
+      const { runtime, created, timeline, live } = await configure();
+      timeline["agent-1"] = [{ item: { type: "error", message: "out of tokens" } }];
+      await runtime.onTurnEnded("agent-1", "failed");
+      expect(created.agents[1]!.options.config).toMatchObject({ provider: "codex/second", modeId: "full-access" });
+      expect(created.agents[1]!.options.prompt).toContain("Continue task 42.");
+      expect(created.agents[1]!.options.prompt).toContain("provider codex, model second");
+      expect(created.agents[1]!.options.prompt).toContain("backup/third");
+      await runtime.restartSidekick("ws-shop");
+      expect(created.agents[2]!.options.config.provider).toBe("codex/second");
+      timeline["agent-3"] = [{ item: { type: "assistant_message", text: "You've hit your weekly limit" } }];
+      await runtime.onTurnEnded("agent-3", "completed");
+      expect(created.agents[3]!.options.config.provider).toBe("backup/third");
+      timeline["agent-4"] = [{ item: { type: "error", message: "out of credits" } }];
+      await runtime.onTurnEnded("agent-4", "failed");
+      expect(created.agents).toHaveLength(4);
+      expect(live.max).toBe(1);
+    });
+
+    it("skips usage-blocked targets at launch and compaction replacement, then uses providers.fallback", async () => {
+      const { runtime, roots, created, usageData, failSend, state } = await setup({ shop: true });
+      await write(roots.shop!, `${PLAYBOOKS}/defaults/main.yaml`, `tiers:
+  worker:
+    - { provider: claude, model: first, mode: bypassPermissions }
+    - { provider: codex, model: second, mode: full-access }
+providers: { fallback: [backup/third], usage: { threshold: 90 } }
+`);
+      await write(roots.shop!, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { tier: worker, session: { compact_above_tokens: 1000 } }");
+      usageData.providers = [
+        { providerId: "claude", status: "available", windows: [{ id: "weekly", usedPct: 95 }] },
+        { providerId: "codex", status: "available", windows: [{ id: "weekly", usedPct: 100 }] },
+      ];
+      await runtime.openSidekick("ws-shop");
+      expect(created.agents[0]!.options.config).toEqual({ provider: "backup/third" });
+      await runtime.sidekickHandoff("agent-1", "Keep this through compaction failure.", false);
+      state["agent-1"] = { status: "idle", used: 2000 };
+      failSend.on = true;
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(created.agents[1]!.options.config).toEqual({ provider: "backup/third" });
+      expect(created.agents[1]!.options.prompt).toContain("Keep this through compaction failure.");
+    });
+
+    it("fails over when compaction ends on quota instead of retrying the exhausted provider", async () => {
+      const { runtime, created, timeline } = await configure();
+      await runtime.sidekickHandoff("agent-1", "Ledger during compaction.", true);
+      await runtime.onTurnEnded("agent-1", "completed");
+      timeline["agent-1"] = [{ item: { type: "error", message: "out of tokens" } }];
+      await runtime.onTurnEnded("agent-1", "failed");
+      expect(created.agents[1]!.options.config.provider).toBe("codex/second");
+      expect(created.agents[1]!.options.prompt).toContain("Ledger during compaction.");
+    });
+
+    it("does not fail over on other errors or cancelled turns", async () => {
+      const { runtime, created, timeline } = await configure();
+      timeline["agent-1"] = [{ item: { type: "error", message: "connection closed" } }];
+      await runtime.onTurnEnded("agent-1", "failed");
+      timeline["agent-1"] = [{ item: { type: "error", message: "out of tokens" } }];
+      await runtime.onTurnEnded("agent-1", "canceled");
+      expect(created.agents).toHaveLength(1);
+    });
+  });
+
+  describe("context compaction", () => {
+    const COMPACT = "sidekick: { session: { compact_above_tokens: 1000, hard_limit_tokens: 3000 } }\n";
+    const compactSetup = async (yaml = COMPACT) => {
+      const made = await setup({ shop: true });
+      await write(made.roots.shop!, `${PLAYBOOKS}/sidekick/sidekick.yaml`, yaml);
+      await made.runtime.openSidekick("ws-shop");
+      return made;
+    };
+
+    it("compacts the same agent, idle and above the threshold, with the saved ledger in the instructions", async () => {
+      const { runtime, created, sent, state } = await compactSetup();
+      await runtime.sidekickHandoff("agent-1", "Ledger: human chose A.", false);
+      state["agent-1"] = { status: "idle", used: 500 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent).toEqual([]);
+      state["agent-1"] = { status: "idle", used: 2000 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.text.startsWith("/compact ")).toBe(true);
+      expect(sent[0]!.text).toContain("Ledger: human chose A.");
+      expect(created.agents).toHaveLength(1);
+      expect(await runtime.openSidekick("ws-shop")).toMatchObject({ agentId: "agent-1", created: false });
+    });
+
+    it("never compacts mid-turn: a failed or canceled turn does not trigger it", async () => {
+      const { runtime, sent, state } = await compactSetup();
+      state["agent-1"] = { status: "idle", used: 2000 };
+      await runtime.onTurnEnded("agent-1", "canceled");
+      await runtime.onTurnEnded("agent-1", "failed");
+      expect(sent).toEqual([]);
+    });
+
+    it("re-injects the ledger once the compaction ended, with the notices held meanwhile, and says it is compacting", async () => {
+      const { runtime, sent, state } = await compactSetup();
+      await runtime.sidekickHandoff("agent-1", "LEDGER-7", false);
+      state["agent-1"] = { status: "idle", used: 2000 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(await runtime.sidekickProjects([{ projectId: "shop", workspaceId: "ws-shop" }])).toMatchObject([{ agentId: "agent-1", compacting: true }]);
+      state["agent-1"] = { status: "running", used: 0 };
+      await runtime.onTurnEnded("sub-1abcdef", "completed", "agent-1");
+      expect(sent).toHaveLength(1);
+      state["agent-1"] = { status: "idle", used: 0 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent).toHaveLength(2);
+      expect(sent[1]!.text).toContain("Context compacted");
+      expect(sent[1]!.text).toContain("LEDGER-7");
+      expect(sent[1]!.text).toContain("sub-1abc");
+      expect(await runtime.sidekickProjects([{ projectId: "shop", workspaceId: "ws-shop" }])).toMatchObject([{ compacting: false }]);
+    });
+
+    it("compacts when the Sidekick asks with sidekick_handoff restart, and does not compact again until it grew well past what was left", async () => {
+      const { runtime, sent, state } = await compactSetup();
+      await runtime.sidekickHandoff("agent-1", "L", true);
+      state["agent-1"] = { status: "idle", used: 10 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent[0]!.text).toMatch(/^\/compact /);
+      state["agent-1"] = { status: "idle", used: 1500 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent).toHaveLength(2);
+      for (const used of [1600, 1800]) {
+        state["agent-1"] = { status: "idle", used };
+        await runtime.onTurnEnded("agent-1", "completed");
+      }
+      expect(sent.filter((message) => message.text.startsWith("/compact"))).toHaveLength(1);
+      state["agent-1"] = { status: "idle", used: 2500 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent.filter((message) => message.text.startsWith("/compact"))).toHaveLength(2);
+    });
+
+    it("falls back to a safe replacement when the compaction cannot be sent: the old agent is archived before the new one is created", async () => {
+      const { runtime, created, state, failSend, archivedAt, live } = await compactSetup();
+      await runtime.sidekickHandoff("agent-1", "LEDGER-9", false);
+      failSend.on = true;
+      state["agent-1"] = { status: "idle", used: 2000 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(created.agents).toHaveLength(2);
+      expect(created.agents[1]!.options.prompt).toContain("LEDGER-9");
+      expect(archivedAt["agent-1"]).toBeTruthy();
+      expect(live.max).toBe(1);
+      expect(created.workspaces).toHaveLength(1);
+    });
+
+    it("falls back to a safe replacement when the compaction fails, or leaves the context above the hard limit", async () => {
+      for (const after of [{ outcome: "failed" as const, used: 0 }, { outcome: "completed" as const, used: 3500 }]) {
+        const { runtime, created, state, live, archivedAt } = await compactSetup();
+        state["agent-1"] = { status: "idle", used: 2000 };
+        await runtime.onTurnEnded("agent-1", "completed");
+        expect(created.agents).toHaveLength(1);
+        state["agent-1"] = { status: "idle", used: after.used };
+        await runtime.onTurnEnded("agent-1", after.outcome);
+        expect(created.agents).toHaveLength(2);
+        expect(archivedAt["agent-1"]).toBeTruthy();
+        expect(live.max).toBe(1);
+      }
+    });
+
+    it("reads the thresholds: compact_above_tokens, its older name restart_above_tokens, the default, and a hard limit of 1.5x", async () => {
+      const { sidekickLimits } = await import("./sidekick");
+      expect(sidekickLimits(null)).toEqual({ compact: 300_000, hard: 450_000 });
+      expect(sidekickLimits({ restartAboveTokens: 1000 })).toEqual({ compact: 1000, hard: 1500 });
+      expect(sidekickLimits({ restartAboveTokens: 1000, compactAboveTokens: 2000 })).toEqual({ compact: 2000, hard: 3000 });
+      expect(sidekickLimits({ compactAboveTokens: 2000, hardLimitTokens: 500 })).toEqual({ compact: 2000, hard: 2000 });
+      const dir = await tempDir("sk-limits-");
+      await write(dir, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { session: { restart_above_tokens: 5000 } }\n");
+      const old = await loadSidekick(dir);
+      expect(old).toMatchObject({ errors: [], warnings: [], config: { restartAboveTokens: 5000 } });
+      await write(dir, `${PLAYBOOKS}/sidekick/sidekick.yaml`, "sidekick: { session: { compact_above_tokens: 5000, hard_limit_tokens: 9000 } }\n");
+      expect((await loadSidekick(dir)).config).toMatchObject({ compactAboveTokens: 5000, hardLimitTokens: 9000 });
+    });
+
+    it("compacts at the old restart_above_tokens threshold of an existing config", async () => {
+      const { runtime, created, sent, state } = await compactSetup("sidekick: { session: { restart_above_tokens: 1000 } }\n");
+      state["agent-1"] = { status: "idle", used: 1200 };
+      await runtime.onTurnEnded("agent-1", "completed");
+      expect(sent[0]!.text).toMatch(/^\/compact /);
+      expect(created.agents).toHaveLength(1);
+    });
+  });
+
+  describe("at most one live Sidekick per project", () => {
+    it("holds when a restart, a replacement and opens run at the same time", async () => {
+      const { runtime, created, live, state, failSend, archivedAt } = await setup({ shop: true });
+      await runtime.openSidekick("ws-shop");
+      failSend.on = true;
+      state["agent-1"] = { status: "idle", used: 400_000 };
+      await Promise.all([runtime.onTurnEnded("agent-1", "completed"), runtime.restartSidekick("ws-shop"), runtime.openSidekick("ws-shop"), runtime.openSidekick("ws-shop")]);
+      expect(live.max).toBe(1);
+      expect(Object.values(archivedAt).filter((value) => value === null)).toHaveLength(1);
+      expect(created.workspaces).toHaveLength(1);
+    });
+
+    it("does not replace an agent twice for two concurrent triggers", async () => {
+      const { runtime, created, state, failSend, live } = await setup({ shop: true });
+      await runtime.openSidekick("ws-shop");
+      failSend.on = true;
+      state["agent-1"] = { status: "idle", used: 400_000 };
+      await Promise.all([runtime.onTurnEnded("agent-1", "completed"), runtime.onTurnEnded("agent-1", "completed")]);
+      expect(created.agents).toHaveLength(2);
+      expect(live.max).toBe(1);
+    });
+
+    it("keeps a replacement that was cut short from leaving two: a duplicate found at the next launch is archived", async () => {
+      const { runtime, created, labels, archivedAt } = await setup({ shop: true });
+      await runtime.openSidekick("ws-shop");
+      labels["ghost"] = { [SIDEKICK_LABEL]: "true", "playbooks/project": "shop" };
+      archivedAt["ghost"] = null;
+      await runtime.restartSidekick("ws-shop");
+      expect(archivedAt["ghost"]).toBeTruthy();
+      expect(created.agents).toHaveLength(2);
+      expect(Object.values(archivedAt).filter((value) => value === null)).toHaveLength(1);
+    });
+
+    it("cleans up duplicates at startup: keeps the one the record names, archives the others", async () => {
+      const dir = await tempDir("sidekick-dup-");
+      const root = path.join(dir, "shop");
+      await write(root, `${PLAYBOOKS}/sidekick/instructions.md`, "Rules.\n");
+      const store = new RunStore(path.join(dir, "data", "runs"));
+      await store.init();
+      await write(dir, "data/sidekick.json", JSON.stringify({ shop: { workspaceId: "side-shop", agentId: "agent-2" } }));
+      const archived: string[] = [];
+      const agents = ["agent-1", "agent-2", "agent-3"].map((id) => ({ agent: { id, labels: { [SIDEKICK_LABEL]: "true", "playbooks/project": "shop" }, archivedAt: null, createdAt: `2026-01-01T00:00:0${id.slice(-1)}Z` } }));
+      const paseo = { agents: { ref: (id: string) => ({ archive: async () => void archived.push(id), refresh: async () => null }), list: async () => ({ entries: agents }) }, workspaces: { ref: () => ({}) } };
+      const runtime = new Runtime(store, {});
+      runtimes.push(runtime);
+      await runtime.attach(paseo as never);
+      await vi.waitFor(() => expect(archived.sort()).toEqual(["agent-1", "agent-3"]));
+    });
   });
 
   it("is told at the end of a turn about open gates waiting for a human, once per gate", async () => {
@@ -365,17 +691,6 @@ describe("a Sidekick's session", () => {
     expect(sent).toHaveLength(2);
     expect(sent[1]?.text).toContain("run_b");
     expect(sent[1]?.text).not.toContain("run_a");
-  });
-
-  it("restarts from the last saved ledger when it does not hand off, and refuses a hand-off from other agents", async () => {
-    const { runtime, created, state } = await setup({ shop: true });
-    await runtime.openSidekick("ws-shop");
-    await expect(runtime.sidekickHandoff("someone", "x", false)).rejects.toThrow(/only a Sidekick/);
-    await runtime.sidekickHandoff("agent-1", "Saved ledger.", false);
-    state["agent-1"] = { status: "idle", used: 400_000 };
-    await runtime.onTurnEnded("agent-1", "completed");
-    await runtime.onTurnEnded("agent-1", "completed");
-    expect(created.agents[1]!.options.prompt).toContain("Saved ledger.");
   });
 
   it("holds a subagent's finish notice while the Sidekick is busy and sends it when it is idle", async () => {
