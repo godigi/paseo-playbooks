@@ -12,6 +12,7 @@ import { conditionText } from "../shared/labels";
 import { attemptTimeoutMs, isPaused, isStepLive, restartBlocker, type Gate, type GateChoice, type Playbook, type Run, type RunSummary } from "../shared/types";
 import { SCRIPT_OUTPUT_POLL_MS, checkHeading, lastLines, scriptActivity } from "./script-output";
 import { STEP_KINDS, stepTitle, stepTitleOf, type Theme } from "./theme";
+import { semanticColor } from "./semantic-colors";
 
 /** A poll interval as people say it: 30 s, 1 min, 2 h. */
 function formatInterval(ms: number): string {
@@ -68,7 +69,7 @@ function Line(props: { theme: Theme; children: ReactNode; muted?: boolean }) {
   );
 }
 
-/** Button colours of a gate choice, from the Paseo theme. */
+/** Button colours of a gate choice, from the Paseo theme: buttons follow the theme. */
 function choiceColors(theme: Theme, color: NonNullable<GateChoice["color"]>): { background: string; foreground: string } {
   switch (color) {
     case "primary":
@@ -296,7 +297,7 @@ function ScriptLive(props: { theme: Theme; run: Run; stepId: string; latest: Run
   const tail = output?.running ? output.tail : "";
   // Nothing in memory (the daemon restarted, or the attempt ended): the last check's tail the run recorded.
   const fallback = checks.length === 0 && !tail ? latest.lastMessage : null;
-  const color = activity.kind === "running" ? theme.colors.statusSuccess : theme.colors.foregroundMuted;
+  const color = activity.kind === "running" ? semanticColor(theme, "done") : theme.colors.foregroundMuted;
   return (
     <View style={{ gap: 6 }}>
       {activity.kind !== "idle" ? (
