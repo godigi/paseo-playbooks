@@ -1,0 +1,9 @@
+{
+ "schema_version": 1,
+ "allow_no_ci": true,
+ "required_checks": [],
+ "deploy_instructions": "PROPOSAL, needs owner approval before use (reverses the 2026-11-18 'merge only, no plugin swap' rule; a live plugin swap is HIGH-risk, so run with --owner-gate). After merge: update /home/brian/code/paseo-playbooks to merged main (`git checkout main && git pull --ff-only`, never discard local edits), then run `scripts/fork-install.sh <merged sha>` (backs up, swaps the plugin source to godigi/paseo-playbooks at that commit, checks status/commit/version/remote). Then, from a NEW agent session, call list_runs and confirm it answers; report version and sha. Roll back with the command the script prints.",
+ "verify_argv": ["bash", "-euo", "pipefail", "-c", "cd /home/brian/code/paseo-playbooks && npm run typecheck && npx vitest run"],
+ "revision_relation": "contains",
+ "version_repository": "/home/brian/code/paseo-playbooks"
+}
