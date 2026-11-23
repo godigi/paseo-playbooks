@@ -242,7 +242,7 @@ quota_limits:
     pacing: true           # (turned on by usable_percent alone) work starts only while the quota headroom covers its estimated cost
     usable_percent: 97     # a 100 h window then allows 0.97 points an hour (what is allowed so far); 97 is also the hard cap
     refresh_interval: 5m   # a reading younger than this is used as is
-    max_age: 30m           # an older reading holds new work ("quota data unavailable") until a refresh succeeds
+    max_age: 30m           # an older reading holds new work ("waiting for quota data") until a refresh succeeds
   steps: 4                 # optional hard cap: agent and script steps running at once, across all projects
   playbooks: 2             # optional hard cap: runs admitted at once
 ```
@@ -251,7 +251,7 @@ quota_limits:
 minus current usage minus what work already started still has to use. Work starts while the headroom covers its **estimated cost**: the
 average quota points the playbook's steps used, measured from the usage readings and kept in `rate-history.json` (there is no manual estimate;
 `quota_limit.estimate` was removed and is refused at load). A playbook with no history is **not paced by cost** (it starts
-without a headroom check and reserves nothing) until its first measure exists; the hard cap (`usable_percent`) and "quota data unavailable" still hold it.
+without a headroom check and reserves nothing) until its first measure exists; the hard cap (`usable_percent`) and "waiting for quota data" still hold it.
 A playbook whose estimate is **zero** (at most 0.05 points) is treated the same: it can't move the pace, so it is never held for headroom, never paused to fit the pace, reserves nothing and isn't blocked behind a held higher-priority run; an exhausted window or unavailable data still hold it.
 The rest is held; the plugin lifts the hold itself.
 
@@ -272,6 +272,20 @@ The rest is held; the plugin lifts the hold itself.
 A running step is never interrupted. `get_run` shows why in `rateHold` (kind `headroom`, `pace` (an admitted run paused to fit the pace, with its position in the resume queue), `quota`, `steps` or `playbooks`, reason, estimated cost,
 headroom, position in the queue, priority, retry time), the manager and the Sidekick are told (`run.held`, `run.released`), and the run's tab
 says "on hold" with a "Continue anyway" button for a quota or headroom hold (one hour, per provider).
+
+**Provider usage unavailable.** Whether a provider's usage can be read is a condition of the provider, not of a run
+(`docs/adrs/2026-11-23-provider-usage-unavailable.md`). It is derived from the pacing's readings (nothing new is stored on runs): a provider
+is *unavailable* when the usage endpoint keeps failing and its last good reading is older than `quota_limit.max_age`. The Quota limitation
+tab shows it once per provider, in violet and not as an error (`claude: Usage unavailable since 15:42 (HTTP 429) · last read 15:31`); under
+each project the provider's last known windows are greyed and marked stale, and the allowed-so-far, headroom and throttle parts read
+"unknown". The `quota.limitation` RPC carries it per provider in `usage` (`available`, `since` = first failure of the streak, `lastReadAt`,
+`reason`, `failures`; an older panel ignores it). Two plugin events, on transitions only: `provider.usage_unavailable` (provider, since,
+reason, failures, lastReadAt) and `provider.usage_restored` (provider, since, reason, unavailableMs); they carry no run, so they may be
+subscribed unscoped. A run whose steps use an unavailable provider is still held (no fail-open), with the reason `waiting for quota data on
+<provider>` and no per-run detail; its manager is **never** told of this hold (nor of its end), and a later real quota hold of the same run
+still gets its one notice (`docs/adrs/2026-11-23-hold-notice-per-episode.md`). A switch of a run's hold between headroom and waiting for quota
+data keeps one hold: no new `run.held`, no `run.released`, the hold keeps its start. The warden has no provider-level finding (its checks are
+per run); the two events cover it.
 
 ### Profiles
 
