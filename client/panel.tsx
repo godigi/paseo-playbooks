@@ -1,11 +1,12 @@
-import { openExternalUrl, useRpc, useTabState, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
+import { messages } from "./i18n";
+import { openExternalUrl, useRpc, useTabState, useTranslation, type PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { z } from "zod";
 import { Icon, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Pressable, Text, View } from "react-native";
-import { archiveRunRpc, cancelRunRpc, createExampleRpc, listPlaybooks, listRuns, pauseRunRpc, resumeRunRpc } from "../shared/contracts";
-import { isActive, isPaused, isPipeline, isTerminal, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
+import { archiveRunRpc, cancelRunRpc, createExampleRpc, listPlaybooks, listRuns, overrideQuotaRpc, pauseRunRpc, resumeRunRpc } from "../shared/contracts";
+import { isActive, isPaused, isPipeline, isTerminal, workspaceKeptUntil, type Playbook, type PlaybookEntry, type Run } from "../shared/types";
 import { slowView } from "../shared/slow";
 import { useSlowSteps } from "./slow";
 import { NowProvider } from "./now";
@@ -16,9 +17,11 @@ import { ProfilePicker, useSetProjectProfile } from "./profiles";
 import { Button, StepSheet } from "./sheet";
 import { StartForm, type StartTarget } from "./start-form";
 import { dotGroups, isRead, runTone, splitTabs, type DotGroup, type RunTone } from "./run-tabs";
+import type { Tr } from "./tr";
 import { openJobsLabel, Stages, batchName } from "./stages";
 import { splitError } from "../shared/errors";
-import { runStatusColor, runStatusLabel, withAlpha, type Theme } from "./theme";
+import { withAlpha, type Theme } from "./theme";
+import { semanticColor, semanticOn } from "./semantic-colors";
 
 interface Card {
   id: string;
@@ -28,6 +31,7 @@ interface Card {
 
 export function PlaybooksPanel(props: PluginWorkspacePanelProps) {
   const { theme, layout, workspaceId, navigation } = props;
+  const { t } = useTranslation(messages);
   const list = useRpc(listPlaybooks);
   const runsRpc = useRpc(listRuns);
   const playbooks = useQuery({
@@ -96,7 +100,7 @@ export function PlaybooksPanel(props: PluginWorkspacePanelProps) {
         </View>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Refresh playbooks"
+          accessibilityLabel={t("panel.refresh")}
           hitSlop={8}
           onPress={() => void queryClient.invalidateQueries({ queryKey: ["playbooks"] })}
         >
@@ -108,28 +112,28 @@ export function PlaybooksPanel(props: PluginWorkspacePanelProps) {
         <EmptyState theme={theme} compact={layout.compact} workspaceId={workspaceId} />
       ) : (
         <ScrollView contentContainerStyle={{ paddingHorizontal: pad, paddingBottom: pad, gap: 12 }}>
-          {playbooks.isLoading ? <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text> : null}
-          {playbooks.error ? <Text style={{ color: theme.colors.statusDanger }}>{(playbooks.error as Error).message}</Text> : null}
+          {playbooks.isLoading ? <Text style={{ color: theme.colors.foregroundMuted }}>{t("common.loading")}</Text> : null}
+          {playbooks.error ? <Text style={{ color: semanticColor(theme, "failed") }}>{(playbooks.error as Error).message}</Text> : null}
           {/* Earlier cards stack above later ones, so a card's dropdown menus are not covered by the cards below it. */}
           {cards.map((card, index) => renderCard(card, total - index))}
           {hiddenCards.length > 0 ? (
             <Pressable
               accessibilityRole="button"
               accessibilityState={{ expanded: showHidden }}
-              accessibilityLabel={`${showHidden ? "Collapse" : "Expand"} hidden playbooks, ${hiddenCards.length}`}
-              accessibilityHint="Playbooks marked hidden: meant as sub-playbooks or after-tasks"
+              accessibilityLabel={t(showHidden ? "detail.hidden.collapse" : "detail.hidden.expand", { count: hiddenCards.length })}
+              accessibilityHint={t("detail.hidden.hint")}
               onPress={() => setShowHidden(!showHidden)}
               style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 }}
             >
               <View style={{ flex: 1, height: 1, backgroundColor: theme.colors.border }} />
               <Icon name={showHidden ? "ChevronDown" : "ChevronRight"} size={14} color={theme.colors.foregroundMuted} />
-              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, fontWeight: "600" }}>Hidden playbooks ({hiddenCards.length})</Text>
+              <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, fontWeight: "600" }}>{t("detail.hidden.heading", { count: hiddenCards.length })}</Text>
               <View style={{ flex: 1, height: 1, backgroundColor: theme.colors.border }} />
             </Pressable>
           ) : null}
           {showHidden && hiddenCards.length > 0 ? (
             <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, marginTop: -6 }}>
-              Meant as sub-playbooks or after-tasks; they can still be started on their own.
+              {t("detail.hidden.note")}
             </Text>
           ) : null}
           {showHidden ? hiddenCards.map((card, index) => renderCard(card, hiddenCards.length - index)) : null}
@@ -149,13 +153,14 @@ function ProfileBar(props: {
   onToggle: (projectId: string, profile: string, active: boolean) => void;
 }) {
   const { theme, profiles } = props;
+  const { t } = useTranslation(messages);
   // Nothing to choose while the project has no profile besides `default` (turning it off is done in the Profiles tab).
   if (!props.projectId || profiles.every((profile) => profile.id === "default")) return null;
   return (
     <View style={{ paddingHorizontal: props.pad, paddingBottom: 8, gap: 6, zIndex: 40 }}>
       <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Profiles (whole project):</Text>
-        <ProfilePicker theme={theme} label="this project" profiles={profiles} onToggle={(profile, active) => props.onToggle(props.projectId, profile, active)} zIndex={40} />
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{t("detail.profiles.wholeProject")}</Text>
+        <ProfilePicker theme={theme} label={t("detail.profiles.thisProject")} profiles={profiles} onToggle={(profile, active) => props.onToggle(props.projectId, profile, active)} zIndex={40} />
       </View>
       {props.diagnostics.map((note) => (
         <Text key={note} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
@@ -174,6 +179,7 @@ const EXAMPLE_DIR = ".paseo/plugins/playbooks/";
 
 function EmptyState(props: { theme: Theme; compact: boolean; workspaceId: string }) {
   const { theme } = props;
+  const { t } = useTranslation(messages);
   const toast = useToast();
   const queryClient = useQueryClient();
   const createExample = useRpc(createExampleRpc);
@@ -186,7 +192,7 @@ function EmptyState(props: { theme: Theme; compact: boolean; workspaceId: string
     try {
       await createExample({ workspaceId: props.workspaceId });
       await queryClient.invalidateQueries({ queryKey: ["playbooks"] });
-      toast.show("Example playbook created. Press Start on its card.", { variant: "success" });
+      toast.show(t("empty.created"), { variant: "success" });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
       setConfirming(false);
@@ -197,24 +203,24 @@ function EmptyState(props: { theme: Theme; compact: boolean; workspaceId: string
   return (
     <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: props.compact ? 16 : 24, gap: 12 }}>
       <Icon name="Workflow" size={32} color={theme.colors.foregroundMuted} />
-      <Text style={{ color: theme.colors.foreground, fontSize: 15, fontWeight: "600", textAlign: "center" }}>No playbooks in this workspace</Text>
+      <Text style={{ color: theme.colors.foreground, fontSize: 15, fontWeight: "600", textAlign: "center" }}>{t("empty.heading")}</Text>
       {confirming ? (
         <>
           <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13, textAlign: "center", maxWidth: 320 }}>
-            This adds hello.yaml and a writer role under {EXAMPLE_DIR} in this workspace. Nothing existing is overwritten.
+            {t("empty.confirm", { dir: EXAMPLE_DIR })}
           </Text>
           <View style={{ flexDirection: "row", gap: 8 }}>
-            <Button theme={theme} kind="primary" label={busy ? "Creating…" : "Create files"} disabled={busy} onPress={() => void create()} />
-            <Button theme={theme} label="Cancel" disabled={busy} onPress={() => setConfirming(false)} />
+            <Button theme={theme} kind="primary" label={busy ? t("empty.creating") : t("empty.createFiles")} disabled={busy} onPress={() => void create()} />
+            <Button theme={theme} label={t("common.cancel")} disabled={busy} onPress={() => setConfirming(false)} />
           </View>
         </>
       ) : (
         <>
           <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13, textAlign: "center", maxWidth: 320 }}>
-            Start from a small example that writes a note and waits for your approval, or add your own to {EXAMPLE_DIR} or .paseo/playbooks/ and refresh.
+            {t("empty.intro", { dir: EXAMPLE_DIR })}
           </Text>
-          <Button theme={theme} kind="primary" label="Create an example playbook" onPress={() => setConfirming(true)} />
-          <Button theme={theme} label="Read the guide ↗" onPress={open} accessibilityLabel="Open the getting started guide in your browser" />
+          <Button theme={theme} kind="primary" label={t("empty.createExample")} onPress={() => setConfirming(true)} />
+          <Button theme={theme} label={t("empty.readGuide")} onPress={open} accessibilityLabel={t("empty.readGuideLabel")} />
         </>
       )}
     </View>
@@ -236,6 +242,7 @@ function PlaybookCard(props: {
   onRead(runId: string): void;
 }) {
   const { card, theme } = props;
+  const { t } = useTranslation(messages);
   const queryClient = useQueryClient();
   const active = card.runs.find((run) => isActive(run));
   // Untouched (null), a card is open while it has an active run: opening a conversation in the
@@ -273,7 +280,7 @@ function PlaybookCard(props: {
       <View style={{ flexDirection: "row", alignItems: "center", gap: 6, zIndex: 20 }}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`${expanded ? "Collapse" : "Expand"} ${title}`}
+          accessibilityLabel={t(expanded ? "detail.card.collapse" : "detail.card.expand", { title })}
           onPress={() => setExpanded(!expanded)}
           style={{ flex: 1, flexDirection: "row", alignItems: "center", gap: 6 }}
         >
@@ -284,8 +291,8 @@ function PlaybookCard(props: {
             </Text>
             <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
               {card.entry && card.entry.repo !== "default" ? `${card.entry.repo} · ` : ""}
-              {card.entry?.file ?? "(file removed)"}
-              {playbook?.concurrency ? ` · concurrency ${playbook.concurrency}` : ""}
+              {card.entry?.file ?? t("detail.card.fileRemoved")}
+              {playbook?.concurrency ? ` · ${t("detail.card.concurrency", { value: playbook.concurrency })}` : ""}
             </Text>
           </View>
         </Pressable>
@@ -311,11 +318,11 @@ function PlaybookCard(props: {
       {expanded && pipeline ? (
         <View style={{ gap: 6, zIndex: 16 }}>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 6, zIndex: 16 }}>
-            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>Stages</Text>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>{t("detail.card.stages")}</Text>
             <RunChip
               theme={theme}
               run={pipeline}
-              label={`Pipeline · ${openJobsLabel(pipeline)}`}
+              label={t("detail.card.pipeline", { jobs: openJobsLabel(pipeline, t) })}
               selected={false}
               read
               onSelect={() => undefined}
@@ -342,7 +349,7 @@ function PlaybookCard(props: {
                 paddingVertical: 2,
               }}
             >
-              <Text style={{ color: runId === "definition" ? theme.colors.surface1 : theme.colors.foregroundMuted, fontSize: 11 }}>Definition</Text>
+              <Text style={{ color: runId === "definition" ? theme.colors.surface1 : theme.colors.foregroundMuted, fontSize: 11 }}>{t("detail.card.definition")}</Text>
             </Pressable>
           ) : null}
           {shown.map((candidate) => (
@@ -350,7 +357,7 @@ function PlaybookCard(props: {
               key={candidate.id}
               theme={theme}
               run={candidate}
-              label={runLabel(candidate)}
+              label={runLabel(candidate, t)}
               selected={candidate.id === runId}
               read={isRead(candidate, props.readRuns)}
               onSelect={() => {
@@ -423,9 +430,23 @@ function PlaybookCard(props: {
 
 function RunBar(props: { theme: Theme; run: Run; hostLabel: string }) {
   const { theme, run } = props;
+  const { t } = useTranslation(messages);
   return (
     <View style={{ gap: 6 }}>
-      {run.failure ? <Text style={{ color: theme.colors.statusDanger, fontSize: 12 }}>{run.failure}</Text> : null}
+      {run.failure ? <Text style={{ color: semanticColor(theme, "failed"), fontSize: 12 }}>{run.failure}</Text> : null}
+      {workspaceKeptUntil(run) ? <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>{t("panel.workspaceKept", { when: new Date(workspaceKeptUntil(run)!).toLocaleString() })}</Text> : null}
+      {run.definition?.warning ? (
+        <View accessibilityRole="alert" style={{ flexDirection: "row", alignItems: "flex-start", gap: 6 }}>
+          <Icon name="TriangleAlert" size={13} color={semanticColor(theme, "waiting")} />
+          <Text selectable style={{ flex: 1, color: semanticColor(theme, "waiting"), fontSize: 12 }}>{run.definition.warning}</Text>
+        </View>
+      ) : null}
+      {Object.values(run.warden.findings).map((finding) => (
+        <View key={`${finding.check}:${finding.subject ?? ""}`} accessibilityRole="alert" style={{ flexDirection: "row", alignItems: "flex-start", gap: 6 }}>
+          <Icon name="TriangleAlert" size={13} color={semanticColor(theme, "waiting")} />
+          <Text selectable style={{ flex: 1, flexShrink: 1, color: semanticColor(theme, "waiting"), fontSize: 12 }}>{t("detail.warden", { check: finding.check.replace("_", " "), detail: finding.detail })}</Text>
+        </View>
+      ))}
     </View>
   );
 }
@@ -433,12 +454,13 @@ function RunBar(props: { theme: Theme; run: Run; hostLabel: string }) {
 /** Split button: Start runs with the workspace's agent; the chevron menu offers a new agent here, or a new workspace. */
 /** The Start button's menu: other ways to start than the workspace's current agent. */
 const START_OPTIONS = [
-  { target: "agent", label: "Start on a new agent", icon: "Bot" },
-  { target: "workspace", label: "Start in a new workspace", icon: "GitBranchPlus" },
+  { target: "agent", label: "panel.startOnNewAgent", icon: "Bot" },
+  { target: "workspace", label: "panel.startInNewWorkspace", icon: "GitBranchPlus" },
 ] as const;
 
 function StartButton(props: { theme: Theme; title: string; onStart(target: StartTarget): void }) {
   const { theme } = props;
+  const { t } = useTranslation(messages);
   const [menu, setMenu] = useState(false);
   const [hover, setHover] = useState<StartTarget | null>(null);
   const segment = { flexDirection: "row", alignItems: "center", gap: 6, paddingVertical: 7, backgroundColor: theme.colors.accent } as const;
@@ -447,17 +469,17 @@ function StartButton(props: { theme: Theme; title: string; onStart(target: Start
       <View style={{ flexDirection: "row", borderRadius: 8, overflow: "hidden" }}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Start ${props.title} with this workspace's agent`}
+          accessibilityLabel={t("panel.startWithAgent", { title: props.title })}
           onPress={() => props.onStart("current")}
           style={{ ...segment, paddingLeft: 12, paddingRight: 10 }}
         >
           <Icon name="Play" size={13} color={theme.colors.accentForeground} />
-          <Text style={{ color: theme.colors.accentForeground, fontSize: 13, fontWeight: "600" }}>Start</Text>
+          <Text style={{ color: theme.colors.accentForeground, fontSize: 13, fontWeight: "600" }}>{t("common.start")}</Text>
         </Pressable>
         <View style={{ width: 1, backgroundColor: theme.colors.accentForeground, opacity: 0.25 }} />
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`More ways to start ${props.title}`}
+          accessibilityLabel={t("panel.moreStartWays", { title: props.title })}
           accessibilityState={{ expanded: menu }}
           onPress={() => setMenu((value) => !value)}
           style={{ ...segment, paddingHorizontal: 8 }}
@@ -502,7 +524,7 @@ function StartButton(props: { theme: Theme; title: string; onStart(target: Start
               }}
             >
               <Icon name={option.icon} size={15} color={theme.colors.foreground} />
-              <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{option.label}</Text>
+              <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{t(option.label)}</Text>
             </Pressable>
           ))}
         </View>
@@ -514,36 +536,40 @@ function StartButton(props: { theme: Theme; title: string; onStart(target: Start
 /** A run tab with a chevron menu: the run's details (branch, start, inputs, manager), then Pause/Resume and Cancel for active runs. */
 function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; selected: boolean; read: boolean; onSelect(): void; onCanceled(): void; onOpenManager(): void }) {
   const { theme, run, selected } = props;
+  const { t, locale } = useTranslation(messages);
   const cancel = useRpc(cancelRunRpc);
   const archive = useRpc(archiveRunRpc);
   const pause = useRpc(pauseRunRpc);
   const resume = useRpc(resumeRunRpc);
+  const overrideQuota = useRpc(overrideQuotaRpc);
   const toast = useToast();
   const [menu, setMenu] = useState<"closed" | "open" | "confirm">("closed");
   const paused = isPaused(run);
-  // Blue running, yellow waiting for a decision, green done, grey done and opened, red failed.
-  const color = run.status === "completed" && props.read ? theme.colors.foregroundMuted : runStatusColor(theme, run.status);
+  // Blue running, orange waiting for a decision, violet paused or on hold, green done, grey done and opened, red failed.
+  const tone = runTone(run, props.read);
+  const color = toneColor(theme, tone);
   const active = isActive(run);
   /** The run has ended and after-tasks are running. */
   const wrapping = active && isTerminal(run.status);
   // Selected: filled with the colour. Not selected: outlined in it.
   const border = color;
-  const text = selected ? (color === theme.colors.foregroundMuted ? theme.colors.surface1 : theme.colors.accentForeground) : color;
+  const text = selected ? (color === theme.colors.foregroundMuted ? theme.colors.surface1 : semanticOn(theme, tone === "seen" ? "done" : tone)) : color;
   return (
     <View style={{ zIndex: menu === "closed" ? 0 : 30 }}>
       <View style={{ flexDirection: "row", borderRadius: 10, borderWidth: 1, borderColor: border, backgroundColor: selected ? color : "transparent", overflow: "hidden" }}>
         <Pressable
           accessibilityRole="tab"
-          accessibilityLabel={`${props.label ?? runLabel(run)}, ${runStatusLabel(run.status)}${wrapping ? ", wrapping up" : ""}${paused ? ", paused" : ""}`}
+          accessibilityLabel={`${props.label ?? runLabel(run, t)}, ${t(`detail.status.${run.status}`)}${wrapping ? `, ${t("detail.chip.wrappingUp")}` : ""}${paused ? `, ${t("detail.chip.paused")}` : ""}${run.rateHold ? `, ${t("detail.chip.onHold")}` : ""}`}
           accessibilityState={{ selected }}
           onPress={props.onSelect}
           style={{ paddingLeft: 8, paddingRight: 6, paddingVertical: 2 }}
         >
           {/* The colour says the status; only what it cannot say is written. */}
           <Text style={{ color: text, fontSize: 11 }}>
-            {props.label ?? runLabel(run)}
-            {wrapping ? " · wrapping up" : ""}
-            {paused ? " · paused" : ""}
+            {props.label ?? runLabel(run, t)}
+            {wrapping ? ` · ${t("detail.chip.wrappingUp")}` : ""}
+            {paused ? ` · ${t("detail.chip.paused")}` : ""}
+            {run.rateHold ? ` · ${t("detail.chip.onHold")}` : ""}
           </Text>
         </Pressable>
         {(
@@ -551,7 +577,7 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             <View style={{ width: 1, backgroundColor: selected ? text : border, opacity: selected ? 0.35 : 1 }} />
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel={`Details and actions for run ${run.id}`}
+              accessibilityLabel={t("detail.chip.details", { id: run.id })}
               accessibilityState={{ expanded: menu !== "closed" }}
               onPress={() => setMenu((value) => (value === "closed" ? "open" : "closed"))}
               style={{ paddingHorizontal: 5, justifyContent: "center" }}
@@ -583,18 +609,39 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             <>
             <View style={{ paddingHorizontal: 10, paddingTop: 6, gap: 4 }}>
               {[
-                ["Run", run.id],
-                ["Branch", run.branch ?? "(unknown)"],
-                ["Started", new Date(run.createdAt).toLocaleString()],
+                [t("detail.chip.run"), run.id],
+                [t("detail.chip.branch"), run.branch ?? t("detail.chip.unknown")],
+                [t("detail.chip.started"), new Date(run.createdAt).toLocaleString(locale)],
               ].map(([label, value]) => (
                 <View key={label} style={{ flexDirection: "row", gap: 10 }}>
                   <Text style={{ width: 56, color: theme.colors.foregroundMuted, fontSize: 12 }}>{label}</Text>
                   <Text selectable style={{ flex: 1, color: theme.colors.foreground, fontSize: 12 }}>{value}</Text>
                 </View>
               ))}
+              {run.rateHold ? (
+                <View style={{ gap: 4 }}>
+                  <Text selectable style={{ color: semanticColor(theme, "paused"), fontSize: 12 }}>
+                    {t("detail.hold.text", { kind: t(`detail.hold.kind.${run.rateHold.kind}`), reason: run.rateHold.reason })}
+                    {run.rateHold.retryAt ? t("detail.hold.retry", { when: new Date(run.rateHold.retryAt).toLocaleTimeString(locale) }) : t("detail.hold.resumes")}
+                  </Text>
+                  {(run.rateHold.kind === "quota" || run.rateHold.kind === "headroom" || run.rateHold.kind === "pace") && run.rateHold.provider ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={t("detail.hold.continueLabel", { provider: run.rateHold.provider })}
+                      onPress={() => void overrideQuota({ provider: run.rateHold!.provider!, minutes: 60 })}
+                      style={{ paddingVertical: 4 }}
+                    >
+                      <Text style={{ color: theme.colors.accent, fontSize: 12 }}>{t("detail.hold.continueText", { provider: run.rateHold.provider })}</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              ) : null}
+              {run.rateNote ? (
+                <Text selectable style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>{t("detail.chip.note", { note: run.rateNote })}</Text>
+              ) : null}
               {Object.keys(run.inputs).length > 0 ? (
                 <>
-                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>Inputs</Text>
+                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12 }}>{t("detail.chip.inputs")}</Text>
                   <View style={{ borderRadius: 6, borderWidth: 1, borderColor: theme.colors.border }}>
                     {Object.entries(run.inputs).map(([name, value], index) => (
                       <View
@@ -619,7 +666,7 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
               style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}
             >
               <Icon name="ExternalLink" size={15} color={theme.colors.accent} />
-              <Text style={{ color: theme.colors.accent, fontSize: 13 }}>Open the Playbook Manager</Text>
+              <Text style={{ color: theme.colors.accent, fontSize: 13 }}>{t("detail.chip.openManager")}</Text>
             </Pressable>
             ) : null}
             {active ? (
@@ -629,8 +676,8 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
               accessibilityRole="menuitem"
               accessibilityHint={
                 paused
-                  ? "Lets the Playbook Manager start steps again and wakes it with what happened meanwhile."
-                  : "No new step starts; running steps finish their current turn."
+                  ? t("detail.actions.resumeHint")
+                  : t("detail.actions.pauseHint")
               }
               onPress={() =>
                 void (paused ? resume : pause)({ runId: run.id })
@@ -644,9 +691,9 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             >
               <Icon name={paused ? "Play" : "Pause"} size={15} color={theme.colors.foreground} />
               <View style={{ flex: 1 }}>
-                <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{paused ? "Resume run" : "Pause run"}</Text>
+                <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{paused ? t("detail.actions.resume") : t("detail.actions.pause")}</Text>
                 <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
-                  {paused ? "The manager picks up where it stopped" : "Running steps finish; no new step starts"}
+                  {paused ? t("detail.actions.resumeSub") : t("detail.actions.pauseSub")}
                 </Text>
               </View>
             </Pressable>
@@ -656,7 +703,7 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
               style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}
             >
               <Icon name="CircleStop" size={15} color={theme.colors.statusDanger} />
-              <Text style={{ color: theme.colors.statusDanger, fontSize: 13 }}>{wrapping ? "Cancel after-tasks…" : "Cancel run…"}</Text>
+              <Text style={{ color: theme.colors.statusDanger, fontSize: 13 }}>{wrapping ? t("detail.actions.cancelAfterTasks") : t("detail.actions.cancelRun")}</Text>
             </Pressable>
             </>
             ) : (
@@ -664,7 +711,7 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             <View style={{ height: 1, backgroundColor: theme.colors.border }} />
             <Pressable
               accessibilityRole="menuitem"
-              accessibilityHint="Hides the run from this panel. Its agents and saved state are kept."
+              accessibilityHint={t("detail.actions.archiveHint")}
               onPress={() =>
                 void archive({ runId: run.id })
                   .then(() => {
@@ -677,8 +724,8 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             >
               <Icon name="Archive" size={15} color={theme.colors.foreground} />
               <View style={{ flex: 1 }}>
-                <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>Archive run</Text>
-                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Hides it here; agents are kept</Text>
+                <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{t("detail.actions.archive")}</Text>
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{t("detail.actions.archiveSub")}</Text>
               </View>
             </Pressable>
             </>
@@ -688,14 +735,14 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
             <View style={{ padding: 6, gap: 8 }}>
               <Text style={{ color: theme.colors.foreground, fontSize: 12 }}>
                 {wrapping
-                  ? `Cancel the after-tasks of run ${run.id}? Their steps are stopped; the run stays ${run.status}.`
-                  : `Cancel run ${run.id}? Running steps are stopped.`}
+                  ? t("detail.actions.confirmAfterTasks", { id: run.id, status: t(`detail.status.${run.status}`) })
+                  : t("detail.actions.confirmRun", { id: run.id })}
               </Text>
               <View style={{ flexDirection: "row", gap: 6 }}>
                 <Button
                   theme={theme}
                   kind="danger"
-                  label={wrapping ? "Cancel after-tasks" : "Cancel run"}
+                  label={wrapping ? t("detail.actions.confirmAfterTasksButton") : t("detail.actions.confirmRunButton")}
                   onPress={() =>
                     void cancel({ runId: run.id })
                       .then(() => {
@@ -705,7 +752,7 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
                       .catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)))
                   }
                 />
-                <Button theme={theme} label="Keep" onPress={() => setMenu("closed")} />
+                <Button theme={theme} label={t("detail.actions.keep")} onPress={() => setMenu("closed")} />
               </View>
             </View>
           )}
@@ -718,7 +765,8 @@ function RunChip(props: { theme: Theme; run: Run; label?: string | undefined; se
 /** A playbook's validation errors as one callout: a heading, then each problem with its location in bold. */
 function ErrorCallout(props: { theme: Theme; file: string; errors: string[] }) {
   const { theme } = props;
-  const danger = theme.colors.statusDanger;
+  const { t } = useTranslation(messages);
+  const danger = semanticColor(theme, "failed");
   return (
     <View
       accessibilityRole="alert"
@@ -735,7 +783,7 @@ function ErrorCallout(props: { theme: Theme; file: string; errors: string[] }) {
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
         <Icon name="TriangleAlert" size={15} color={danger} />
         <Text style={{ flex: 1, color: danger, fontSize: 13, fontWeight: "600" }}>
-          This playbook can't run · {props.errors.length} {props.errors.length === 1 ? "problem" : "problems"}
+          {t("detail.errors.title", { count: props.errors.length })}
         </Text>
       </View>
       {props.errors.map((error) => {
@@ -760,9 +808,9 @@ const INPUT_LABEL_MAX = 24;
  * A run's tab label: the name its manager gave it, else its first text input's first line,
  * else its short id. A batch: its stage's name and short id.
  */
-function runLabel(run: Run): string {
+function runLabel(run: Run, t: Tr): string {
   const id = run.id.replace(/^run_/, "");
-  if (run.batch) return `${batchName(run)} · ${id}`;
+  if (run.batch) return `${batchName(run, t)} · ${id}`;
   if (run.name) return run.name;
   const text = Object.values(run.inputs).find((value): value is string => typeof value === "string" && value.trim() !== "");
   if (!text) return id;
@@ -773,41 +821,36 @@ function runLabel(run: Run): string {
 function toneColor(theme: Theme, tone: RunTone): string {
   switch (tone) {
     case "waiting":
-      return theme.colors.statusWarning;
+      return semanticColor(theme, "waiting");
     case "running":
-      return theme.colors.accent;
+      return semanticColor(theme, "running");
+    case "paused":
+      return semanticColor(theme, "paused");
     case "failed":
-      return theme.colors.statusDanger;
+      return semanticColor(theme, "failed");
     case "done":
-      return theme.colors.statusSuccess;
+      return semanticColor(theme, "done");
     case "seen":
       return theme.colors.foregroundMuted;
   }
 }
 
-const TONE_LABELS: Record<RunTone, string> = {
-  waiting: "waiting for a decision",
-  running: "running",
-  failed: "failed or canceled",
-  done: "done, not opened yet",
-  seen: "done and opened",
-};
-
 /** The run tabs' last item: runs without a tab (finished and opened, over a day old, or past MAX_TABS), newest first. */
 function HistoryMenu(props: { theme: Theme; runs: Run[]; readRuns: string[]; onSelect(run: Run): void }) {
   const { theme } = props;
+  const { t, locale } = useTranslation(messages);
   const [open, setOpen] = useState(false);
   const [hover, setHover] = useState<string | null>(null);
   return (
     <View style={{ zIndex: open ? 30 : 0 }}>
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={`History, ${props.runs.length} more ${props.runs.length === 1 ? "run" : "runs"}`}
+        accessibilityLabel={t("detail.history.label", { count: props.runs.length })}
         accessibilityState={{ expanded: open }}
         onPress={() => setOpen((value) => !value)}
         style={{ flexDirection: "row", alignItems: "center", gap: 4, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, paddingLeft: 8, paddingRight: 5, paddingVertical: 2 }}
       >
-        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>History ({props.runs.length})</Text>
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{t("detail.history.title", { count: props.runs.length })}</Text>
         <Icon name="ChevronDown" size={12} color={theme.colors.foregroundMuted} />
       </Pressable>
       {open ? (
@@ -835,7 +878,7 @@ function HistoryMenu(props: { theme: Theme; runs: Run[]; readRuns: string[]; onS
                 <Pressable
                   key={run.id}
                   accessibilityRole="menuitem"
-                  accessibilityLabel={`${runLabel(run)}, ${runStatusLabel(run.status)}. Opens it.`}
+                  accessibilityLabel={t("detail.history.item", { label: runLabel(run, t), status: t(`detail.status.${run.status}`) })}
                   onPress={() => {
                     setOpen(false);
                     props.onSelect(run);
@@ -854,9 +897,9 @@ function HistoryMenu(props: { theme: Theme; runs: Run[]; readRuns: string[]; onS
                 >
                   <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: toneColor(theme, tone) }} />
                   <Text numberOfLines={1} style={{ flex: 1, color: theme.colors.foreground, fontSize: 12 }}>
-                    {runLabel(run)}
+                    {runLabel(run, t)}
                   </Text>
-                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{new Date(run.createdAt).toLocaleDateString()}</Text>
+                  <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{new Date(run.createdAt).toLocaleDateString(locale)}</Text>
                 </Pressable>
               );
             })}
@@ -886,6 +929,7 @@ function RunDots(props: { theme: Theme; runs: Run[]; readRuns: string[]; onOpen(
 
 function RunDot(props: { theme: Theme; group: DotGroup; onPress(): void }) {
   const { theme, group } = props;
+  const { t } = useTranslation(messages);
   const reduceMotion = useReduceMotion();
   const pulsing = group.pulsing && !reduceMotion;
   const color = toneColor(theme, group.tone);
@@ -905,7 +949,7 @@ function RunDot(props: { theme: Theme; group: DotGroup; onPress(): void }) {
     return () => loop.stop();
   }, [pulsing, pulse]);
   const count = group.runs.length;
-  const label = `${count} ${count === 1 ? "run" : "runs"} ${TONE_LABELS[group.tone]}. Opens ${count === 1 ? "it" : "the first"}.`;
+  const label = t("detail.dot.label", { count, tone: t(`detail.tone.${group.tone}`) });
   return (
     <Pressable accessibilityRole="button" accessibilityLabel={label} hitSlop={6} onPress={props.onPress} style={{ flexDirection: "row", alignItems: "center", gap: 3, padding: 3 }}>
       <View style={{ width: 10, height: 10, alignItems: "center", justifyContent: "center" }}>

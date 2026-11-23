@@ -1,4 +1,4 @@
-import { openExternalUrl, useAgent, useRpc } from "@getpaseo/plugin/client";
+import { openExternalUrl, useAgent, useRpc, useTranslation } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -6,14 +6,19 @@ import { AccessibilityInfo, Animated, Pressable, Text, View } from "react-native
 import { Button, GateActions } from "./sheet";
 import { startAfterTaskRpc } from "../shared/contracts";
 import { askChoices, waitsForHuman } from "../shared/gates";
+import { blockStats, blockStatus, collapseNodes, EMPTY_COLLAPSE, isCollapsed, markSeen, toggled, type BlockStats, type BlockStatus, type CollapseState } from "../shared/collapse";
+import { clearOfHeaders, frameRects, HEADER_H, layerHeadroom, type Box, type FrameRect } from "../shared/frames";
 import { END, layerOf, layoutGraph, START, withTerminals } from "../shared/graph";
 import { isTerminal, type AfterTask, type Playbook, type Run, type Step } from "../shared/types";
 import { activeStep, assignLanes, badgeText, groupLoops, loopText, relatedLoops, visibleAttempts, type LoopEdge, type LoopGroup } from "./loops";
 import { conditionText } from "../shared/labels";
 import { runningFor } from "../shared/elapsed";
-import { slowDetail, type SlowInfo } from "../shared/slow";
+import { formatSlowDuration, type SlowInfo } from "../shared/slow";
+import { messages } from "./i18n";
+import type { Tr } from "./tr";
 import { useNow } from "./now";
-import { agentBackground, gateBackground, stepTitle, nodeColor, nodeIcon, nodeStateLabel, STEP_KINDS, type NodeState, type Theme } from "./theme";
+import { agentBackground, gateBackground, stepTitle, nodeColor, nodeIcon, STEP_KINDS, type NodeState, type Theme } from "./theme";
+import { semanticColor } from "./semantic-colors";
 
 /** Nodes grow with the panel between these widths; below the minimum the graph scrolls sideways. */
 const NODE_MIN = 132;
@@ -115,13 +120,55 @@ export function Graph(props: GraphProps) {
 /** Layered top-down DAG built from plain views: nodes in rows, org-chart connectors between rows. */
 function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available: number }) {
   const { playbook, run, theme, steps, available } = props;
+  const { t } = useTranslation(messages);
+  // An after-task's own frame already holds its sub-playbook: no second frame for it.
+  const blocks = useMemo(
+    () => Object.fromEntries(Object.entries(playbook.blocks).filter(([prefix]) => !playbook.after.some((task) => task.id === prefix))),
+    [playbook],
+  );
+  // Sub-playbooks fold into one node each (ADR 2026-11-13-collapsible-sub-playbooks).
+  const stats = useMemo(() => {
+    const ids = steps.map((step) => step.id);
+    return Object.fromEntries(
+      Object.keys(blocks).map((prefix) => [
+        prefix,
+        blockStats(prefix, ids, (id) => {
+          const state = run?.steps[id];
+          return state ? { status: state.status, startedAt: state.attempts.map((attempt) => attempt.startedAt) } : undefined;
+        }),
+      ]),
+    );
+  }, [blocks, steps, run]);
+  const [collapseStates, setCollapseStates] = useState<Record<string, CollapseState>>({});
+  const runKey = run?.id ?? "definition";
+  const collapse = collapseStates[runKey] ?? EMPTY_COLLAPSE;
+  useEffect(() => {
+    setCollapseStates((current) => {
+      const before = current[runKey] ?? EMPTY_COLLAPSE;
+      const after = markSeen(before, stats);
+      return after === before ? current : { ...current, [runKey]: after };
+    });
+  }, [stats, runKey]);
+  const collapsedKey = Object.keys(blocks)
+    .filter((prefix) => stats[prefix]!.total > 0 && isCollapsed(prefix, stats[prefix]!, collapse, run !== null))
+    .join("|");
+  const collapsedSet = useMemo(() => new Set(collapsedKey ? collapsedKey.split("|") : []), [collapsedKey]);
+  const folded = useMemo(() => collapseNodes(steps, collapsedSet), [steps, collapsedSet]);
+  const setCollapsed = (prefix: string, collapsed: boolean) => setCollapseStates((current) => ({ ...current, [runKey]: toggled(current[runKey] ?? EMPTY_COLLAPSE, prefix, collapsed) }));
   // Start and End are laid out like steps: Start above the roots, End below every step nothing needs.
-  const nodes = useMemo(() => (props.terminals ? withTerminals(steps) : steps), [steps, props.terminals]);
+  const nodes = useMemo(() => (props.terminals ? withTerminals(folded.nodes) : folded.nodes), [folded, props.terminals]);
+  const needsOf = useMemo(() => new Map(folded.nodes.map((node) => [node.id, node.needs])), [folded]);
   const layout = useMemo(() => layoutGraph(nodes), [nodes]);
   const layers = useMemo(() => layerOf(nodes), [nodes]);
-  const loops = useMemo(() => loopEdges(steps, run), [steps, run]);
+  const loops = useMemo(
+    () =>
+      loopEdges(steps, run)
+        .map((loop) => ({ ...loop, from: folded.nodeOf(loop.from), to: folded.nodeOf(loop.to) }))
+        .filter((loop) => loop.from !== loop.to),
+    [steps, run, folded],
+  );
   const forward = useMemo(() => forwardLabels(steps), [steps]);
-  const groups = useMemo(() => groupLoops(loops), [loops]);
+  const groups = useMemo(() => groupLoops(loops, t), [loops, t]);
   /** The loop badge tapped (its group key): its target is outlined and its outcomes listed. */
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const selectedGroup = groups.find((group) => group.key === selectedKey) ?? null;
@@ -131,11 +178,6 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
   const active = activeStep(hovered, pinned);
   const onKeys = useMemo(() => relatedLoops(groups, active), [groups, active]);
   const { lanes, count: laneCount } = useMemo(() => assignLanes(groups, (id) => layers.get(id) ?? 0), [groups, layers]);
-  // An after-task's own frame already holds its sub-playbook: no second frame for it.
-  const blocks = useMemo(
-    () => Object.fromEntries(Object.entries(playbook.blocks).filter(([prefix]) => !playbook.after.some((task) => task.id === prefix))),
-    [playbook],
-  );
   /** Room on each side for the one back-edge lane (both sides, so the graph stays centred). */
   const gutter = groups.length > 0 ? 6 + laneCount * LANE_GAP : 0;
   const columns = Math.max(1, ...layout.layers.map((row) => row.length));
@@ -161,22 +203,42 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
     const row = layout.layers.find((candidate) => candidate.includes(id));
     return deciding.has(id) && row?.length === 1 ? Math.max(nodeWidth, width - GAP) : nodeWidth;
   };
-  const running = new Set(run ? steps.filter((step) => run.steps[step.id]?.status === "running").map((step) => step.id) : []);
+  /** Expanded sub-playbooks that have nodes on screen, and the room their headers need above their first layer. */
+  const shown = useMemo(
+    () =>
+      Object.keys(blocks)
+        .filter((prefix) => !collapsedSet.has(prefix))
+        .map((prefix) => ({ prefix, ids: folded.nodes.map((node) => node.id).filter((id) => id.startsWith(`${prefix}.`)) }))
+        .filter((block) => block.ids.length > 0),
+    [blocks, collapsedSet, folded],
+  );
+  const heads = useMemo(() => layerHeadroom(shown.map((block) => ({ prefix: block.prefix, layer: Math.min(...block.ids.map((id) => layers.get(id) ?? 0)) }))), [shown, layers]);
+  /** Top of a layer's nodes: below its header room and, past the first layer, its edge band. */
+  const nodeTopOf = (layer: number, layerTop: number) => layerTop + (layer > 0 ? BAND_H : 0) + (heads.get(layer) ?? 0);
+  const frames = useMemo(() => {
+    const inputs: Array<{ prefix: string; members: Box[] }> = [];
+    for (const block of shown) {
+      const members: Box[] = [];
+      for (const id of block.ids) {
+        const layer = layers.get(id) ?? 0;
+        const layerTop = layerTops[layer];
+        const height = heights[id];
+        if (layerTop === undefined || !height) return [];
+        const top = nodeTopOf(layer, layerTop);
+        const center = gutter + (centers.get(id) ?? 0);
+        members.push({ left: center - widthOf(id) / 2, right: center + widthOf(id) / 2, top, bottom: top + height });
+      }
+      inputs.push({ prefix: block.prefix, members });
+    }
+    return frameRects(inputs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shown, layers, layerTops, heights, centers, heads, gutter, nodeWidth, width]);
+  const running = new Set(run ? steps.filter((step) => run.steps[step.id]?.status === "running").map((step) => folded.nodeOf(step.id)) : []);
 
   return (
     <ScrollView horizontal style={{ flexGrow: 0 }} contentContainerStyle={{ minWidth: "100%", justifyContent: "center" }}>
       <View style={{ width: width + 2 * gutter, paddingHorizontal: gutter, paddingTop: 4, paddingBottom: 16 }}>
-        <BlockFrames
-          theme={theme}
-          blocks={blocks}
-          stepIds={steps.map((step) => step.id)}
-          layers={layers}
-          layerTops={layerTops}
-          heights={heights}
-          centers={centers}
-          offset={gutter}
-          widthOf={widthOf}
-        />
+        <BlockFrames theme={theme} frames={frames} />
         <LoopLines
           theme={theme}
           groups={groups.filter((group) => !onKeys.has(group.key))}
@@ -188,6 +250,7 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
           centers={centers}
           offset={gutter}
           widthOf={widthOf}
+          nodeTopOf={nodeTopOf}
           laneStart={gutter + width + 6}
         />
         {layout.layers.map((row, index) => (
@@ -198,10 +261,13 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
               setLayerTops((current) => (current[index] === y ? current : { ...current, [index]: y }));
             }}
           >
+            {index === 0 && (heads.get(0) ?? 0) > 0 ? <View style={{ height: heads.get(0) }} /> : null}
             {index > 0 ? (
               <Band
                 theme={theme}
                 width={width}
+                extra={heads.get(index) ?? 0}
+                headers={frames.map((frame) => ({ left: frame.header.left - gutter, right: frame.header.right - gutter, top: frame.header.top - (layerTops[index] ?? 0), bottom: frame.header.bottom - (layerTops[index] ?? 0) }))}
                 edges={layout.edges.filter((edge) => layers.get(edge.from) === index - 1 && layers.get(edge.to) === index)}
                 centers={centers}
                 running={running}
@@ -221,14 +287,25 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
                       areaWidth={Math.max(nodeWidth, width - GAP)}
                       longNeeds={id === END ? nodes.find((node) => node.id === END)!.needs.filter((need) => (layers.get(need) ?? 0) < index - 1) : []}
                     />
+                  ) : folded.prefixes.has(id) ? (
+                    <GroupNode
+                      theme={theme}
+                      title={blocks[folded.prefixes.get(id)!]?.title ?? id}
+                      stats={stats[folded.prefixes.get(id)!]!}
+                      depth={folded.prefixes.get(id)!.split(".").length - 1}
+                      nodeWidth={nodeWidth}
+                      longNeeds={(needsOf.get(id) ?? []).filter((need) => (layers.get(need) ?? 0) < index - 1)}
+                      onToggle={() => setCollapsed(folded.prefixes.get(id)!, false)}
+                      onBoxHeight={(height) => setHeights((current) => (current[id] === height ? current : { ...current, [id]: height }))}
+                    />
                   ) : (
                   <Node
                     step={byId.get(id)!}
-                    longNeeds={byId.get(id)!.needs.filter((need) => (layers.get(need) ?? 0) < index - 1)}
+                    longNeeds={(needsOf.get(id) ?? []).filter((need) => (layers.get(need) ?? 0) < index - 1)}
                     nodeWidth={widthOf(id)}
                     loops={loops.filter((loop) => loop.from === id)}
                     loopGroups={groups.filter((group) => group.from === id)}
-                    titleOf={(target) => (byId.get(target) ? stepTitle(byId.get(target)!) : target)}
+                    titleOf={(target) => (byId.get(target) ? stepTitle(byId.get(target)!) : blocks[folded.prefixes.get(target) ?? ""]?.title ?? target)}
                     selectedLoop={selectedKey}
                     loopTarget={selectedGroup?.to === id}
                     inLoops={groups.some((group) => group.from === id || group.to === id)}
@@ -261,8 +338,10 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
           centers={centers}
           offset={gutter}
           widthOf={widthOf}
+          nodeTopOf={nodeTopOf}
           laneStart={gutter + width + 6}
         />
+        <BlockHeaders theme={theme} frames={frames} stats={stats} titles={Object.fromEntries(Object.entries(blocks).map(([prefix, block]) => [prefix, block.title]))} onToggle={(prefix) => setCollapsed(prefix, true)} />
         {selectedGroup ? (
           <LoopList
             theme={theme}
@@ -281,13 +360,14 @@ function Dag(props: GraphProps & { steps: Step[]; terminals: boolean; available:
 /** Every outcome of the selected loop badge with its running counter. */
 function LoopList(props: { theme: Theme; group: LoopGroup; onClose(): void }) {
   const { theme, group } = props;
+  const { t } = useTranslation(messages);
   return (
     <View style={{ marginTop: 8, borderRadius: 8, borderWidth: 1, borderColor: theme.colors.accent, backgroundColor: theme.colors.surface1, padding: 8, gap: 4 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
         <Text style={{ flex: 1, color: theme.colors.foreground, fontSize: 12, fontWeight: "600" }}>
-          Loops from {group.from} back to {group.to}
+          {t("graph.loops.title", { from: group.from, to: group.to })}
         </Text>
-        <Pressable accessibilityRole="button" accessibilityLabel="Hide loops" hitSlop={8} onPress={props.onClose}>
+        <Pressable accessibilityRole="button" accessibilityLabel={t("graph.loops.hide")} hitSlop={8} onPress={props.onClose}>
           <Icon name="X" size={14} color={theme.colors.foregroundMuted} />
         </Pressable>
       </View>
@@ -302,16 +382,17 @@ function LoopList(props: { theme: Theme; group: LoopGroup; onClose(): void }) {
 
 function AfterTasks(props: GraphProps & { available: number }) {
   const { playbook, theme } = props;
+  const { t } = useTranslation(messages);
   const rule = <View style={{ flex: 1, height: 1, backgroundColor: theme.colors.border }} />;
   return (
     <View style={{ gap: 8, paddingBottom: 8 }}>
       <View accessibilityRole="header" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
         {rule}
-        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600" }}>After the run</Text>
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600" }}>{t("graph.after.heading")}</Text>
         {rule}
       </View>
       <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, textAlign: "center" }}>
-        Runs once the run has ended. Its result does not change the run's.
+        {t("graph.after.note")}
       </Text>
       {playbook.after.map((task) => (
         <AfterTaskFrame key={task.id} {...props} task={task} />
@@ -324,6 +405,7 @@ const FRAME_PAD = 8;
 
 function AfterTaskFrame(props: GraphProps & { available: number; task: AfterTask }) {
   const { playbook, run, theme, task } = props;
+  const { t } = useTranslation(messages);
   const start = useRpc(startAfterTaskRpc);
   const toast = useToast();
   const queryClient = useQueryClient();
@@ -335,24 +417,24 @@ function AfterTaskFrame(props: GraphProps & { available: number; task: AfterTask
     !run || status === "pending"
       ? theme.colors.foregroundMuted
       : status === "running"
-        ? theme.colors.accent
+        ? semanticColor(theme, "running")
         : status === "completed"
-          ? theme.colors.statusSuccess
-          : theme.colors.statusDanger;
+          ? semanticColor(theme, "done")
+          : semanticColor(theme, "failed");
   const ended = run !== null && isTerminal(run.status);
   const label = !run
     ? task.trigger === "auto"
-      ? "starts when the run completes or fails"
-      : "a human starts it once the run has ended"
+      ? t("graph.after.autoDefinition")
+      : t("graph.after.manualDefinition")
     : status === "pending"
       ? ended
-        ? "not started"
+        ? t("graph.after.notStarted")
         : task.trigger === "auto"
-          ? "starts when the run ends"
-          : "can be started once the run ends"
+          ? t("graph.after.autoPending")
+          : t("graph.after.manualPending")
       : status === "running"
-        ? "wrapping up"
-        : `${status}${state?.detail ? `: ${state.detail}` : ""}`;
+        ? t("graph.after.wrapping")
+        : `${t(`graph.status.${status}`)}${state?.detail ? `: ${state.detail}` : ""}`;
   const canStart = ended && task.trigger === "manual" && status === "pending";
   return (
     <View style={{ borderRadius: 12, borderWidth: 1, borderColor: status === "running" ? color : theme.colors.border, backgroundColor: theme.colors.surface0, padding: FRAME_PAD, gap: 6 }}>
@@ -371,9 +453,9 @@ function AfterTaskFrame(props: GraphProps & { available: number; task: AfterTask
           <Button
             theme={theme}
             kind="primary"
-            label={busy ? "Starting…" : "Start"}
+            label={busy ? t("common.starting") : t("common.start")}
             disabled={busy}
-            accessibilityLabel={`Start the after-task ${task.title}`}
+            accessibilityLabel={t("graph.after.start", { title: task.title })}
             onPress={() => {
               setBusy(true);
               void start({ runId: run!.id, taskId: task.id })
@@ -396,8 +478,13 @@ function Band(props: {
   centers: Map<string, number>;
   running: Set<string>;
   labels: Map<string, string>;
+  /** Extra height under the edge band for the headers of the frames that start on this layer. */
+  extra: number;
+  /** Frame headers in band coordinates: edges are cut where they would cross one. */
+  headers: Box[];
 }) {
-  const { theme, edges, centers, running } = props;
+  const { theme, edges, centers, running, extra } = props;
+  const full = BAND_H + extra;
   const sources = [...new Set(edges.map((edge) => edge.from))];
   const targets = [...new Set(edges.map((edge) => edge.to))];
   const xs = [...sources, ...targets].map((id) => centers.get(id) ?? 0);
@@ -412,13 +499,16 @@ function Band(props: {
   for (const id of targets) {
     const color = running.has(id) ? hot : line;
     // Stop the line above the arrowhead.
-    segments.push({ key: `t-${id}`, left: (centers.get(id) ?? 0) - stroke / 2, top: mid, width: stroke, height: BAND_H - mid - ARROW + 4, color });
+    const x = centers.get(id) ?? 0;
+    clearOfHeaders(x, stroke, mid, full - ARROW + 4, props.headers).forEach(([a, b], index) =>
+      segments.push({ key: `t-${id}-${index}`, left: x - stroke / 2, top: a, width: stroke, height: b - a, color }),
+    );
   }
   if (xs.length > 0 && Math.max(...xs) - Math.min(...xs) > 1) {
     segments.push({ key: "bus", left: Math.min(...xs) - stroke / 2, top: mid - stroke / 2, width: Math.max(...xs) - Math.min(...xs) + stroke, height: stroke, color: line });
   }
   return (
-    <View style={{ height: BAND_H, width: props.width }} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
+    <View style={{ height: full, width: props.width }} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
       {segments.map((segment) => (
         <View
           key={segment.key}
@@ -437,7 +527,7 @@ function Band(props: {
           </Text>
         ))}
       {targets.map((id) => (
-        <View key={`a-${id}`} style={{ position: "absolute", left: (centers.get(id) ?? 0) - ARROW / 2, top: BAND_H - ARROW, width: ARROW, height: ARROW }}>
+        <View key={`a-${id}`} style={{ position: "absolute", left: (centers.get(id) ?? 0) - ARROW / 2, top: full - ARROW, width: ARROW, height: ARROW }}>
           <Icon name="ChevronDown" size={ARROW} color={running.has(id) ? hot : line} />
         </View>
       ))}
@@ -457,21 +547,22 @@ function Terminal(props: {
   longNeeds: string[];
 }) {
   const { theme, run, playbook } = props;
+  const { t } = useTranslation(messages);
   const [open, setOpen] = useState(false);
   const start = props.kind === "start";
   const names = Object.keys(start ? playbook.inputs : playbook.outputs);
   const values = !start && run?.outputs ? Object.entries(run.outputs) : [];
   const color = start
     ? run
-      ? theme.colors.statusSuccess
+      ? semanticColor(theme, "done")
       : theme.colors.foregroundMuted
     : run?.status === "completed"
-      ? theme.colors.statusSuccess
+      ? semanticColor(theme, "done")
       : run?.status === "failed" || run?.status === "canceled"
-        ? theme.colors.statusDanger
+        ? semanticColor(theme, "failed")
         : theme.colors.foregroundMuted;
-  const label = start ? "Start" : run?.status === "failed" ? "Failed" : run?.status === "canceled" ? "Canceled" : "End";
-  const detail = names.length > 0 ? names.join(", ") : start ? "no inputs" : "no outputs";
+  const label = start ? t("graph.terminal.start") : run?.status === "failed" ? t("graph.terminal.failed") : run?.status === "canceled" ? t("graph.terminal.canceled") : t("graph.terminal.end");
+  const detail = names.length > 0 ? names.join(t("graph.sep")) : start ? t("graph.terminal.noInputs") : t("graph.terminal.noOutputs");
   const pill = (
     <>
       <Icon name={start ? "CirclePlay" : run?.status === "failed" || run?.status === "canceled" ? "CircleX" : "Flag"} size={13} color={color} />
@@ -502,14 +593,14 @@ function Terminal(props: {
         <Pressable
           accessibilityRole="button"
           accessibilityState={{ expanded: open }}
-          accessibilityLabel={`${label}. ${open ? "Hide" : "Show"} the run's outputs: ${detail}`}
+          accessibilityLabel={t(open ? "graph.terminal.hideOutputs" : "graph.terminal.showOutputs", { label, detail })}
           onPress={() => setOpen((value) => !value)}
           style={pillStyle}
         >
           {pill}
         </Pressable>
       ) : (
-        <View accessible accessibilityLabel={`${label}. ${start ? "Inputs" : "Outputs"}: ${detail}`} style={pillStyle}>
+        <View accessible accessibilityLabel={t(start ? "graph.terminal.inputs" : "graph.terminal.outputs", { label, detail })} style={pillStyle}>
           {pill}
         </View>
       )}
@@ -544,7 +635,7 @@ function Terminal(props: {
       ) : null}
       {props.longNeeds.length > 0 ? (
         <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, textAlign: "center" }}>
-          also after {props.longNeeds.join(", ")}
+          {t("graph.node.alsoAfter", { list: props.longNeeds.join(t("graph.sep")) })}
         </Text>
       ) : null}
     </View>
@@ -552,68 +643,138 @@ function Terminal(props: {
 }
 
 /** Dashed loop-back edges, drawn behind the nodes: out of the source's right side, up a lane, into the target's right side. */
-/** A labelled frame behind the steps of each sub-playbook (nested ones inside their parent's). */
-function BlockFrames(props: {
-  theme: Theme;
-  blocks: Playbook["blocks"];
-  stepIds: string[];
-  layers: Map<string, number>;
-  layerTops: Record<number, number>;
-  heights: Record<string, number>;
-  centers: Map<string, number>;
-  offset: number;
-  widthOf(id: string): number;
-}) {
+/** The frame behind the steps of each expanded sub-playbook (nested ones inside their parent's). Drawing only. */
+function BlockFrames(props: { theme: Theme; frames: FrameRect[] }) {
   const { theme } = props;
-  const frames = Object.entries(props.blocks).flatMap(([prefix, block]) => {
-    const members = props.stepIds.filter((id) => id.startsWith(`${prefix}.`));
-    let left = Infinity;
-    let right = -Infinity;
-    let top = Infinity;
-    let bottom = -Infinity;
-    for (const id of members) {
-      const layer = props.layers.get(id) ?? 0;
-      const layerTop = props.layerTops[layer];
-      const height = props.heights[id];
-      if (layerTop === undefined || !height) return [];
-      const nodeTop = layerTop + (layer > 0 ? BAND_H : 0);
-      const center = props.offset + (props.centers.get(id) ?? 0);
-      left = Math.min(left, center - props.widthOf(id) / 2);
-      right = Math.max(right, center + props.widthOf(id) / 2);
-      top = Math.min(top, nodeTop);
-      bottom = Math.max(bottom, nodeTop + height);
-    }
-    if (members.length === 0) return [];
-    const depth = prefix.split(".").length - 1;
-    const pad = Math.max(4, 10 - depth * 4);
-    return [{ prefix, title: block.title, depth, left: left - pad, top: top - pad - 8, width: right - left + 2 * pad, height: bottom - top + 2 * pad + 8 }];
-  });
   return (
     <View pointerEvents="none" style={{ position: "absolute", left: 0, top: 0, right: 0, bottom: 0 }}>
-      {frames
-        .sort((a, b) => a.depth - b.depth)
-        .map((frame) => (
-          <View
+      {props.frames.map((frame) => (
+        <View
+          key={frame.prefix}
+          style={{
+            position: "absolute",
+            left: frame.box.left,
+            top: frame.box.top,
+            width: frame.box.right - frame.box.left,
+            height: frame.box.bottom - frame.box.top,
+            borderRadius: 14,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            backgroundColor: frame.depth % 2 === 0 ? theme.colors.surface0 : theme.colors.surface1,
+          }}
+        />
+      ))}
+    </View>
+  );
+}
+
+/**
+ * The toggle strip of each expanded frame, drawn after (above) the steps, edges and loop lines so nothing
+ * paints over it or swallows its clicks; the layout reserves its room, so no card sits under it. The whole
+ * strip is the button.
+ */
+function BlockHeaders(props: { theme: Theme; frames: FrameRect[]; stats: Record<string, BlockStats>; titles: Record<string, string>; onToggle(prefix: string): void }) {
+  const { theme } = props;
+  const { t } = useTranslation(messages);
+  return (
+    <View pointerEvents="box-none" style={{ position: "absolute", left: 0, top: 0, right: 0, bottom: 0, zIndex: 10 }}>
+      {props.frames.map((frame) => {
+        const stat = props.stats[frame.prefix];
+        const title = props.titles[frame.prefix] ?? frame.prefix;
+        return (
+          <Pressable
             key={frame.prefix}
-            accessible
-            accessibilityLabel={`Sub-playbook ${frame.title}`}
-            style={{
-              position: "absolute",
-              left: frame.left,
-              top: frame.top,
-              width: frame.width,
-              height: frame.height,
-              borderRadius: 14,
-              borderWidth: 1,
-              borderColor: theme.colors.border,
-              backgroundColor: frame.depth % 2 === 0 ? theme.colors.surface0 : theme.colors.surface1,
+            accessibilityRole="button"
+            accessibilityLabel={t("graph.block.expanded", { title })}
+            accessibilityState={{ expanded: true }}
+            onPress={() => props.onToggle(frame.prefix)}
+            style={(state) => {
+              const hovered = (state as { hovered?: boolean }).hovered === true;
+              return {
+                position: "absolute",
+                left: frame.header.left + 1,
+                top: frame.header.top + 1,
+                width: frame.header.right - frame.header.left - 2,
+                height: HEADER_H - 1,
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 6,
+                paddingHorizontal: 10,
+                borderTopLeftRadius: 13,
+                borderTopRightRadius: 13,
+                backgroundColor: state.pressed ? theme.colors.surface2 : hovered ? theme.colors.surface1 : "transparent",
+                cursor: "pointer",
+              } as never;
             }}
           >
-            <Text numberOfLines={1} style={{ position: "absolute", top: 2, left: 10, right: 10, color: theme.colors.foregroundMuted, fontSize: 10, fontWeight: "600" }}>
-              {frame.title}
+            <Icon name="ChevronDown" size={18} color={theme.colors.foregroundMuted} />
+            <Text numberOfLines={1} style={{ flex: 1, color: theme.colors.foreground, fontSize: 12, fontWeight: "600" }}>
+              {title}
+            </Text>
+            {stat ? <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{`${stat.done}/${stat.total}`}</Text> : null}
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+/** A collapsed sub-playbook: one node with its name, status, progress and, while it runs, its elapsed time. Tap to expand. */
+function GroupNode(props: {
+  theme: Theme;
+  title: string;
+  stats: BlockStats;
+  depth: number;
+  nodeWidth: number;
+  longNeeds: string[];
+  onToggle(): void;
+  onBoxHeight(height: number): void;
+}) {
+  const { theme, stats } = props;
+  const { t } = useTranslation(messages);
+  const status = blockStatus(stats);
+  const now = useNow();
+  const elapsed = status === "running" ? runningFor(stats.startedAt, now) : null;
+  const color =
+    status === "failed" ? semanticColor(theme, "failed") : status === "running" ? semanticColor(theme, "running") : status === "waiting" ? semanticColor(theme, "waiting") : status === "completed" ? semanticColor(theme, "done") : theme.colors.border;
+  const summary = [t(`graph.block.${status}`), t("graph.block.progress", { done: stats.done, count: stats.total }), elapsed].filter(Boolean).join(" · ");
+  return (
+    <View style={{ width: props.nodeWidth }}>
+      <View style={{ borderRadius: 14, backgroundColor: theme.colors.surface1 }}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ expanded: false }}
+          accessibilityLabel={t("graph.block.collapsed", { title: props.title, summary })}
+          onLayout={(event) => props.onBoxHeight(Math.round(event.nativeEvent.layout.height))}
+          onPress={props.onToggle}
+          style={{
+            minHeight: 48,
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 6,
+            paddingHorizontal: 10,
+            paddingVertical: 8,
+            borderRadius: 14,
+            borderWidth: status === "running" ? 2 : 1,
+            borderStyle: "dashed",
+            borderColor: color,
+            backgroundColor: theme.colors.surface0,
+          }}
+        >
+          <Icon name="ChevronRight" size={16} color={theme.colors.foregroundMuted} />
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 12, fontWeight: "600" }}>
+              {props.title}
+            </Text>
+            <Text numberOfLines={2} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+              {summary}
             </Text>
           </View>
-        ))}
+        </Pressable>
+      </View>
+      {props.longNeeds.length > 0 ? (
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, textAlign: "center" }}>{t("graph.node.alsoAfter", { list: props.longNeeds.join(t("graph.sep")) })}</Text>
+      ) : null}
     </View>
   );
 }
@@ -634,6 +795,8 @@ function LoopLines(props: {
   centers: Map<string, number>;
   offset: number;
   widthOf(id: string): number;
+  nodeTopOf(layer: number, layerTop: number): number;
+  nodeTopOf(layer: number, layerTop: number): number;
   laneStart: number;
 }) {
   const { theme, on } = props;
@@ -650,7 +813,7 @@ function LoopLines(props: {
     const fromH = props.heights[group.from];
     const toH = props.heights[group.to];
     if (fromTop === undefined || toTop === undefined || !fromH || !toH) continue;
-    const top = (layer: number, layerTop: number) => layerTop + (layer > 0 ? BAND_H : 0);
+    const top = props.nodeTopOf;
     const y1 = Math.round(top(fromLayer, fromTop) + fromH * 0.6);
     const y2 = Math.round(top(toLayer, toTop) + toH * 0.4);
     const x1 = props.offset + (props.centers.get(group.from) ?? 0) + props.widthOf(group.from) / 2;
@@ -723,6 +886,7 @@ function LoopLines(props: {
 
 function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: number; loops: LoopEdge[]; loopGroups: LoopGroup[]; titleOf(id: string): string; selectedLoop: string | null; loopTarget: boolean; inLoops: boolean; pinned: boolean; onHover(over: boolean): void; onTogglePin(): void; onToggleLoop(key: string): void; onBoxHeight(height: number): void }) {
   const { step, run, theme, playbook, highlighted } = props;
+  const { t, locale } = useTranslation(messages);
   const state = run?.steps[step.id];
   const attempts = state?.attempts ?? [];
   const latest = attempts.at(-1);
@@ -757,25 +921,31 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
     return () => loop.stop();
   }, [nodeState, reduceMotion, pulse]);
 
-  const condition = step.when?.length ? ` · if ${step.when.map(conditionText).join(", ")}` : "";
+  const kindName = t(`graph.kind.${step.kind}`);
+  const condition = step.when?.length ? ` · ${t("graph.node.condition", { condition: step.when.map(conditionText).join(t("graph.sep")) })}` : "";
   const chosen = run?.steps[step.id]?.branch ?? null;
   const subtitle = (step.kind === "branch"
-    ? `Branch${chosen ? ` → ${chosen}` : ` · ${step.branch?.cases.map((candidate) => candidate.name).join(" | ") ?? ""}`}`
+    ? chosen
+      ? t("graph.node.arrow", { kind: kindName, target: chosen })
+      : t("graph.node.detail", { kind: kindName, detail: step.branch?.cases.map((candidate) => candidate.name).join(" | ") ?? "" })
     : isGate
-    ? "Gate"
+    ? kindName
     : isScript
-      ? `Script${nodeState === "running" && latest?.checks ? ` · check ${latest.checks}` : ""}`
+      ? nodeState === "running" && latest?.checks
+        ? t("graph.node.detail", { kind: kindName, detail: t("graph.node.check", { check: latest.checks }) })
+        : kindName
       : isHandoff
-        ? `Hand-off → ${step.handoff}`
+        ? t("graph.node.arrow", { kind: kindName, target: step.handoff ?? "" })
         : isFanout
-          ? `Fan-out → ${step.fanout?.playbook ?? ""}`
-        : `${role?.title ?? step.role}${role?.readonly ? " · ro" : ""}`) + condition;
+          ? t("graph.node.arrow", { kind: kindName, target: step.fanout?.playbook ?? "" })
+        : `${role?.title ?? step.role}${role?.readonly ? ` · ${t("graph.node.readonly")}` : ""}`) + condition;
   // A hand-off's job once handed off (its run does not follow it any further).
-  const jobLine = isFanout && state?.fanout ? engineText(state.fanout) : isHandoff ? (latest?.job ? `Handed off to ${step.handoff} (${latest.job.jobId})` : nodeState === "running" ? latest?.lastMessage ?? null : null) : latest?.waiting && nodeState === "running" ? `Waiting for tokens until ${new Date(latest.waiting.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : null;
-  const stateLabel = nodeStateLabel(nodeState);
+  const jobLine = isFanout && state?.fanout ? engineText(t, state.fanout) : isHandoff ? (latest?.job ? t("graph.node.handedOff", { target: step.handoff ?? "", job: latest.job.jobId }) : nodeState === "running" ? latest?.lastMessage ?? null : null) : latest?.waiting && nodeState === "running" ? t("graph.node.waitingTokens", { when: new Date(latest.waiting.until).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }) : null;
+  const stateLabel = nodeState === "definition" ? "" : t(`graph.state.${nodeState}`);
   // The current attempt's elapsed time while it runs; a gate waiting on a human is not running.
   const now = useNow();
   const elapsed = (nodeState === "running" || nodeState === "needs_permission") && !pendingGate ? runningFor(latest?.startedAt, now) : null;
+  const slowText = (info: SlowInfo) => t("graph.node.slowDetail", { elapsed: formatSlowDuration(info.elapsedMs), ratio: info.ratio.toFixed(1), baseline: formatSlowDuration(info.baselineMs) });
   const onPress = () => (latestAgent ? props.onOpenAgent(latestAgent) : props.onOpenSheet(step.id));
   const isHighlighted = highlighted === step.id || props.loopTarget;
   const [expanded, setExpanded] = useState(false);
@@ -797,7 +967,13 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
       >
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`${stepTitle(step)}, ${STEP_KINDS[step.kind].label} step, ${subtitle}${stateLabel ? `, ${stateLabel}` : ""}${props.loops.map((loop) => `, on ${loop.outcome} loops back to ${loop.to}${loop.max !== undefined ? ` (${loop.count} of ${loop.max})` : ""}`).join("")}${latest ? `, attempt ${latest.n}` : ""}${latestAgent ? ", opens conversation" : ", opens details"}`}
+          accessibilityLabel={[
+            t("graph.node.label", { title: stepTitle(step), kind: kindName, subtitle }),
+            ...(stateLabel ? [stateLabel] : []),
+            ...props.loops.map((loop) => (loop.max !== undefined ? t("graph.node.loopBackMax", { outcome: loop.outcome, to: loop.to, count: loop.count, max: loop.max }) : t("graph.node.loopBack", { outcome: loop.outcome, to: loop.to }))),
+            ...(latest ? [t("graph.node.attempt", { n: latest.n })] : []),
+            latestAgent ? t("graph.node.opensConversation") : t("graph.node.opensDetails"),
+          ].join(t("graph.sep"))}
           onPress={onPress}
           onHoverIn={() => props.onHover(true)}
           onHoverOut={() => props.onHover(false)}
@@ -812,7 +988,7 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
               <Pressable
                 accessibilityRole="button"
                 accessibilityState={{ selected: props.pinned }}
-                accessibilityLabel={`${props.pinned ? "Stop highlighting" : "Highlight"} the loops of ${step.id}`}
+                accessibilityLabel={t(props.pinned ? "graph.node.unhighlightLoops" : "graph.node.highlightLoops", { id: step.id })}
                 hitSlop={8}
                 onPress={props.onTogglePin}
               >
@@ -821,7 +997,7 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
             ) : null}
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel={`Details for ${step.id}`}
+              accessibilityLabel={t("graph.node.details", { id: step.id })}
               hitSlop={8}
               onPress={() => props.onOpenSheet(step.id)}
             >
@@ -840,16 +1016,21 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
               {stateLabel}
             </Text>
           ) : null}
+          {run && nodeState === "pending" && state?.waitUntil && !isTerminal(run.status) ? (
+            <Text numberOfLines={1} accessibilityLabel={t("graph.node.waitsUntilLabel", { when: new Date(state.waitUntil).toLocaleTimeString(locale) })} style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>
+              {t("graph.node.waitsUntil", { when: new Date(state.waitUntil).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) })}
+            </Text>
+          ) : null}
           {elapsed ? (
-            <Text numberOfLines={1} accessibilityLabel={`Running for ${elapsed}`} style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>
-              {`running for ${elapsed}`}
+            <Text numberOfLines={1} accessibilityLabel={t("graph.node.runningForLabel", { elapsed })} style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>
+              {t("graph.node.runningFor", { elapsed })}
             </Text>
           ) : null}
           {props.slow?.[step.id] ? (
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }} accessible accessibilityLabel={`Slow step: ${slowDetail(props.slow[step.id]!)}`}>
-              <Icon name="TriangleAlert" size={11} color={theme.colors.statusWarning} />
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }} accessible accessibilityLabel={t("graph.node.slowLabel", { detail: slowText(props.slow[step.id]!) })}>
+              <Icon name="TriangleAlert" size={11} color={semanticColor(theme, "waiting")} />
               <Text numberOfLines={1} style={{ flex: 1, color: theme.colors.foregroundMuted, fontSize: 10 }}>
-                {slowDetail(props.slow[step.id]!)}
+                {slowText(props.slow[step.id]!)}
               </Text>
             </View>
           ) : null}
@@ -864,25 +1045,25 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
             <GateActions theme={theme} run={run} gate={pendingGate} hostLabel={props.hostLabel} />
           </View>
         ) : pendingGate ? (
-          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, paddingHorizontal: 8, paddingBottom: 8 }}>Advisor deciding</Text>
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, paddingHorizontal: 8, paddingBottom: 8 }}>{t("graph.node.advisorDeciding")}</Text>
         ) : null}
         {attempts.length > 1 ? (
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 4, paddingHorizontal: 8, paddingBottom: 6 }}>
             {hidden > 0 || expanded ? (
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={expanded ? `Collapse the attempts of ${step.id}` : `Show all ${attempts.length} attempts of ${step.id}`}
+                accessibilityLabel={expanded ? t("graph.node.collapseLabel", { id: step.id }) : t("graph.node.showAllLabel", { count: attempts.length, id: step.id })}
                 onPress={() => setExpanded((current) => !current)}
                 style={{ borderRadius: 6, paddingHorizontal: 5, paddingVertical: 1, borderWidth: 1, borderColor: theme.colors.border }}
               >
-                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>{expanded ? "Collapse" : `${attempts.length} attempts · +${hidden} earlier`}</Text>
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10 }}>{expanded ? t("graph.node.collapse") : t("graph.node.attemptsChip", { count: attempts.length, hidden })}</Text>
               </Pressable>
             ) : null}
             {shown.map((attempt) => (
               <Pressable
                 key={attempt.n}
                 accessibilityRole="button"
-                accessibilityLabel={`Open attempt ${attempt.n} of ${step.id}`}
+                accessibilityLabel={t("graph.node.openAttempt", { n: attempt.n, id: step.id })}
                 onPress={() => (agentless ? props.onOpenSheet(step.id) : props.onOpenAgent(attempt.agentId))}
                 style={{ borderRadius: 6, paddingHorizontal: 5, paddingVertical: 1, backgroundColor: theme.colors.surface2 }}
               >
@@ -898,13 +1079,13 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
                 key={group.key}
                 accessibilityRole="button"
                 accessibilityState={{ selected: props.selectedLoop === group.key }}
-                accessibilityLabel={`Loops back to ${group.to}: ${group.edges.map(loopText).join(", ")}`}
+                accessibilityLabel={t("graph.loops.backTo", { to: group.to, list: group.edges.map(loopText).join(t("graph.sep")) })}
                 hitSlop={4}
                 onPress={() => props.onToggleLoop(group.key)}
                 style={{ borderRadius: 6, paddingHorizontal: 6, paddingVertical: 3, borderWidth: 1, borderColor: props.selectedLoop === group.key ? theme.colors.accent : theme.colors.border }}
               >
                 <Text numberOfLines={1} style={{ color: group.exhausted ? theme.colors.foregroundMuted : theme.colors.foreground, fontSize: 10 }}>
-                  {badgeText(group, props.titleOf(group.to))}
+                  {badgeText(group, props.titleOf(group.to), t)}
                 </Text>
               </Pressable>
             ))}
@@ -914,7 +1095,7 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
       </View>
       {props.longNeeds.length > 0 ? (
         <Text style={{ color: theme.colors.foregroundMuted, fontSize: 10, textAlign: "center", marginTop: 2 }}>
-          also needs {props.longNeeds.join(", ")}
+          {t("graph.node.alsoNeeds", { list: props.longNeeds.join(t("graph.sep")) })}
         </Text>
       ) : null}
     </View>
@@ -922,10 +1103,10 @@ function Node(props: GraphProps & { step: Step; longNeeds: string[]; nodeWidth: 
 }
 
 /** "2 of 5 done: 1 running": a fan-out step's progress on its node. */
-function engineText(state: NonNullable<Run["steps"][string]["fanout"]>): string {
+function engineText(t: Tr, state: NonNullable<Run["steps"][string]["fanout"]>): string {
   const done = state.children.filter((child) => ["completed", "failed", "canceled", "not_started"].includes(child.status)).length;
   const running = state.children.filter((child) => child.status === "running" || child.status === "starting").length;
   const queued = state.children.filter((child) => child.status === "pending").length;
-  if (state.pool) return `${running} running · ${done} done${queued ? ` · ${queued} queued` : ""} · refills ${state.pool.refills}`;
-  return `${done} of ${state.children.length} done${running ? `, ${running} running` : ""}`;
+  if (state.pool) return queued ? t("graph.fanout.poolQueued", { running, done, queued, refills: state.pool.refills }) : t("graph.fanout.pool", { running, done, refills: state.pool.refills });
+  return running ? t("graph.fanout.doneRunning", { done, total: state.children.length, running }) : t("graph.fanout.done", { done, total: state.children.length });
 }

@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readdir, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, rm, statfs } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Isolation } from "../shared/types";
-import { checkoutSnapshot, defaultBranch, freshRef, freshRefInfo } from "./git";
+import { assertBranchName, assertNotOption } from "./branch-name";
+import { checkoutSnapshot, defaultBranch, fetchBranch, freshRef, freshRefInfo } from "./git";
 
 const exec = promisify(execFile);
 
@@ -61,14 +62,16 @@ export async function createWorktree(input: { workspaceDir: string; worktreesDir
   const workspaceSnapshot = await checkoutSnapshot(input.workspaceDir);
   const base = input.isolation.base ?? (await defaultBranch(input.workspaceDir));
   if (!base) throw new Error(`cannot create a worktree: no base branch in ${input.workspaceDir}`);
+  assertBranchName(base, "isolation.base");
   const { ref, fetchError } = await freshRefInfo(input.workspaceDir, base);
+  assertNotOption(ref);
   await mkdir(input.worktreesDir, { recursive: true });
   const linked: string[] = [];
   try {
     const existing = input.reuseBranch ? await existingBranch(input.workspaceDir, input.branch) : null;
-    if (existing === "local") await git(input.workspaceDir, ["worktree", "add", "--quiet", dir, input.branch]);
-    else if (existing === "origin") await git(input.workspaceDir, ["worktree", "add", "--quiet", "-b", input.branch, dir, `origin/${input.branch}`]);
-    else await git(input.workspaceDir, ["worktree", "add", "--quiet", "-b", input.branch, dir, ref]);
+    if (existing === "local") await git(input.workspaceDir, ["worktree", "add", "--quiet", "--", dir, input.branch]);
+    else if (existing === "origin") await git(input.workspaceDir, ["worktree", "add", "--quiet", "-b", input.branch, "--", dir, `origin/${input.branch}`]);
+    else await git(input.workspaceDir, ["worktree", "add", "--quiet", "-b", input.branch, "--", dir, ref]);
     const baseSha = (await git(dir, ["rev-parse", "HEAD"])).trim();
     const declared = await submodulePaths(dir);
     const wanted = input.isolation.submodules === "none" ? [] : input.isolation.submodules === "all" ? declared : input.isolation.submodules;
@@ -80,7 +83,7 @@ export async function createWorktree(input: { workspaceDir: string; worktreesDir
         // Pinned commit of the worktree's gitlink, else the sub-repo's own fresh default branch.
         const pinned = (await git(dir, ["rev-parse", `HEAD:${sub}`])).trim();
         const target = (await hasCommit(source, pinned)) ? pinned : await subRef(source);
-        await git(source, ["worktree", "add", "--quiet", "--detach", path.join(dir, sub), target]);
+        await git(source, ["worktree", "add", "--quiet", "--detach", "--", path.join(dir, sub), target]);
       } else {
         await git(dir, ["submodule", "update", "--init", "--", sub]);
       }
@@ -97,7 +100,7 @@ export async function createWorktree(input: { workspaceDir: string; worktreesDir
 async function existingBranch(repo: string, branch: string): Promise<"local" | "origin" | null> {
   const has = (ref: string) => git(repo, ["rev-parse", "--verify", "--quiet", ref]).then(() => true, () => false);
   if (await has(`refs/heads/${branch}`)) return "local";
-  await git(repo, ["fetch", "--quiet", "origin", branch]).catch(() => undefined);
+  await fetchBranch(repo, branch).catch(() => undefined);
   return (await has(`refs/remotes/origin/${branch}`)) ? "origin" : null;
 }
 
@@ -138,13 +141,42 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-/** Paths with uncommitted changes in the worktree and in its linked submodules (ignored files excluded). */
+/** Scratch directories at a worktree's root (tool caches, temp files): never work to keep, deleted with the worktree or earlier. */
+export const SCRATCH_DIRS = [".cache", ".tmp"];
+
+const isScratch = (relative: string) => SCRATCH_DIRS.some((name) => relative === name || relative.startsWith(`${name}/`));
+
+/** Fraction (0..1) of the volume holding `dir` that is used; 0 when it cannot be read. */
+export async function diskUsedFraction(dir: string): Promise<number> {
+  try {
+    const stats = await statfs(dir);
+    return stats.blocks > 0 ? 1 - stats.bavail / stats.blocks : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Deletes `.cache` and `.tmp` at the root of a worktree inside `worktreesDir`, keeping the rest. Returns what was deleted. */
+export async function purgeScratch(worktreesDir: string, dir: string): Promise<string[]> {
+  if (!(await inside(worktreesDir, dir))) return [];
+  const purged: string[] = [];
+  for (const name of SCRATCH_DIRS) {
+    const target = path.join(dir, name);
+    if (!(await exists(target))) continue;
+    await unlock(target);
+    await rm(target, { recursive: true, force: true });
+    purged.push(name);
+  }
+  return purged;
+}
+
+/** Paths with uncommitted changes in the worktree and in its linked submodules (ignored files and the scratch directories excluded). */
 export async function dirtyPaths(dir: string, linked: string[]): Promise<string[]> {
   const out: string[] = [];
   for (const [prefix, cwd] of [["", dir] as const, ...linked.map((sub) => [`${sub}/`, path.join(dir, sub)] as const)]) {
     try {
       const status = await git(cwd, ["status", "--porcelain=v1", "--untracked-files=all", ...(prefix === "" ? ["--ignore-submodules=all"] : [])]);
-      out.push(...status.split("\n").filter(Boolean).map((line) => `${prefix}${line.slice(3)}`));
+      out.push(...status.split("\n").filter(Boolean).map((line) => line.slice(3)).filter((file) => prefix !== "" || !isScratch(file)).map((file) => `${prefix}${file}`));
     } catch {
       // A checkout git cannot read has nothing to lose.
     }
@@ -161,6 +193,15 @@ export async function hasUnpushedCommits(repo: string, branch: string, baseSha: 
     return remotes === "";
   } catch {
     return false;
+  }
+}
+
+/** Commits of the checkout at `dir` that are on no remote-tracking ref (so nowhere else). Null when git cannot tell: the caller keeps the checkout. */
+export async function unpushedCommits(dir: string): Promise<string[] | null> {
+  try {
+    return (await git(dir, ["rev-list", "HEAD", "--not", "--remotes"])).split("\n").filter(Boolean);
+  } catch {
+    return null;
   }
 }
 

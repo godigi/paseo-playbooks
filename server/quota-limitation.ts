@@ -1,0 +1,129 @@
+import { activeExhausted } from "./engine";
+import { isActive, type Run } from "../shared/types";
+import type { QuotaLimitation, QuotaProject, QuotaProvider, QuotaWindow } from "../shared/quota-limitation";
+import type { RateLimitsConfig } from "./config";
+import { windowKey } from "./rate-budget";
+import { admittedRunIds, runningStepCount, usedPct, windowRooms, type PacerView } from "./rate-limit";
+import { windowModel } from "./usage";
+import { closedKey, closedState, closedWeek, hostTimezone, type ClosedHours } from "./closed-hours";
+
+const closedView = (closed: ClosedHours | null | undefined) => (closed && closed.slots.length > 0 ? { timezone: closed.timezone ?? hostTimezone(), slots: closed.slots } : null);
+
+function closedNowView(closed: ClosedHours | null | undefined, nowMs: number) {
+  const state = closedState(closed, nowMs);
+  return { closed: state.closed, changeAt: state.changeAt === null ? null : new Date(state.changeAt).toISOString() };
+}
+
+/** A reservation as the runtime keeps it: points still to use per `windowKey`. */
+export interface ReservationView {
+  runId: string;
+  est: Record<string, number>;
+  spent: Record<string, number>;
+  endedAt: number | null;
+}
+
+/** A project with the limits its runs get, one entry per distinct set among its playbooks (`resolveQuotaLimits`: folder defaults, user config, built-in). */
+export interface ProjectLimitsInput {
+  projectId: string;
+  label: string;
+  unitCost?: Record<string, Record<string, number>>;
+  sets: Array<{ repos: string[]; config: RateLimitsConfig }>;
+}
+
+const round = (value: number) => Math.round(value * 10) / 10;
+const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString());
+
+/**
+ * What the Quota limitation tab shows: the limits each project's runs get, and for each provider the pacing tracks: its usage
+ * windows and the numbers the pacing decides from (usage, allowed so far, reservations, headroom), the runs held or paused for pace
+ * and the exhausted marks. The usage and reservations are global per provider; what is allowed so far, headroom and free share are
+ * given for each distinct `usable_percent` among the projects with pacing on. Read-only: it recomputes the figures from the same
+ * pieces the admission uses.
+ */
+export function buildQuotaLimitation(input: { projects: ProjectLimitsInput[]; nowMs: number; views: PacerView[]; runs: Run[]; reservations: ReservationView[] }): QuotaLimitation {
+  const { projects, nowMs, views, runs, reservations } = input;
+  /** The distinct (usable percent, closed hours) pairs of the projects that pace, with their labels. */
+  const pacing = new Map<string, { percent: number; closed: ClosedHours | null | undefined; labels: string[] }>();
+  for (const project of projects) {
+    for (const set of project.sets.filter((candidate) => candidate.config.quota.pacing)) {
+      const { usablePercent: percent, closedHours } = set.config.quota;
+      const key = `${percent}|${closedKey(closedHours) ?? ""}`;
+      const entry = pacing.get(key) ?? { percent, closed: closedHours, labels: [] };
+      if (!entry.labels.includes(project.label)) entry.labels.push(project.label);
+      pacing.set(key, entry);
+    }
+  }
+  const pacedBy = [...new Set([...pacing.values()].flatMap((entry) => entry.labels))];
+  const live = runs.filter((run) => !run.archivedAt && isActive(run));
+  const titleOf = (run: Run) => run.playbook.title;
+  const remaining = (reservation: ReservationView, key: string) => Math.max(0, (reservation.est[key] ?? 0) - (reservation.spent[key] ?? 0));
+  const open = reservations.filter((reservation) => reservation.endedAt === null);
+
+  const providers: QuotaProvider[] = views.map((view) => {
+    const rooms = view.entry ? [...pacing.values()].map(({ percent, closed, labels }) => ({ percent, closed, labels, rooms: windowRooms(view.entry!, percent, nowMs, closed) })) : [];
+    const windows: QuotaWindow[] = (view.entry?.windows ?? []).map((window) => {
+      const key = windowKey(view.provider, window.id);
+      const reserved = round(open.reduce((total, reservation) => total + remaining(reservation, key), 0));
+      const used = usedPct(window);
+      const resets = window.resetsAt ? Date.parse(window.resetsAt) : NaN;
+      return {
+        id: window.id,
+        name: window.label ?? window.id,
+        modelScoped: windowModel(window.id) !== null,
+        used: used === null ? null : round(used),
+        reserved,
+        paces: rooms.flatMap(({ percent, closed, labels, rooms: list }) => {
+          const room = list.find((candidate) => candidate.id === window.id);
+          if (!room) return [];
+          const headroom = round(room.ceiling - room.used);
+          return [{ usable: percent, ...(closedKey(closed) ? { closedKey: closedKey(closed) } : {}), ...(room.frozen ? { frozen: true } : {}), ...(room.closedIgnored ? { closedIgnored: true } : {}), ceiling: round(room.ceiling), headroom, free: round(headroom - reserved), projects: labels }];
+        }),
+        resetsAt: Number.isFinite(resets) ? new Date(resets).toISOString() : null,
+        stale: Number.isFinite(resets) && resets <= nowMs,
+      };
+    });
+    const mine = open.filter((reservation) => Object.keys(reservation.est).some((key) => key.startsWith(`${view.provider}\u0000`)));
+    return {
+      provider: view.provider,
+      pacedBy,
+      state: view.state,
+      readAt: iso(view.readAt),
+      usage: { available: view.usage.available, since: iso(view.usage.since), lastReadAt: iso(view.usage.lastReadAt), reason: view.usage.reason, failures: view.usage.failures },
+      overrideUntil: iso(view.overrideUntil),
+      windows,
+      reservations: mine.flatMap((reservation) => {
+        const run = runs.find((candidate) => candidate.id === reservation.runId);
+        if (!run) return [];
+        const left: Record<string, number> = {};
+        for (const key of Object.keys(reservation.est)) {
+          const [provider, windowId] = key.split("\u0000");
+          const value = remaining(reservation, key);
+          if (provider === view.provider && windowId && value > 0) left[windowId] = round(value);
+        }
+        return [{ runId: run.id, projectId: run.projectId, title: titleOf(run), remaining: left, ...(run.quotaExempt ? { exempt: true } : {}) }];
+      }),
+      held: live.flatMap((run) => (run.rateHold && run.rateHold.provider === view.provider ? [{ runId: run.id, projectId: run.projectId, title: titleOf(run), kind: run.rateHold.kind, reason: run.rateHold.reason, window: run.rateHold.window, retryAt: run.rateHold.retryAt, since: run.rateHold.since, estimatedCost: run.rateHold.estimatedCost }] : [])),
+      exhausted: live.flatMap((run) =>
+        run.exhausted
+          .filter((entry) => entry.target === view.provider || entry.target.startsWith(`${view.provider}/`))
+          .filter((entry) => activeExhausted({ exhausted: [entry], playbook: run.playbook }, nowMs).length > 0)
+          .map((entry) => ({ runId: run.id, projectId: run.projectId, title: titleOf(run), target: entry.target, until: new Date(Date.parse(entry.at) + run.playbook.exhaustedForMs).toISOString() })),
+      ),
+    };
+  });
+
+  const everyone: QuotaProject[] = projects.map(({ projectId, label, sets, unitCost }) => ({
+    projectId,
+    label,
+    ...(unitCost ? { unitCost } : {}),
+    limits: sets.map(({ repos, config }) => ({ repos, pacing: config.quota.pacing, usablePercent: config.quota.usablePercent, ...(closedView(config.quota.closedHours) ? { closedHours: closedView(config.quota.closedHours), closedKey: closedKey(config.quota.closedHours), closedNow: closedNowView(config.quota.closedHours, nowMs), closedWeek: closedWeek(config.quota.closedHours!, nowMs) } : {}), stepsLimit: config.steps, runsLimit: config.playbooks })),
+  }));
+  return {
+    now: new Date(nowMs).toISOString(),
+    projects: everyone,
+    stepsRunning: runningStepCount(runs),
+    runsActive: admittedRunIds(runs, Number.MAX_SAFE_INTEGER)?.size ?? 0,
+    providers,
+    limitHeld: live.flatMap((run) => (run.rateHold && !run.rateHold.provider ? [{ runId: run.id, projectId: run.projectId, title: titleOf(run), kind: run.rateHold.kind, reason: run.rateHold.reason }] : [])),
+  };
+}

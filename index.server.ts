@@ -1,6 +1,6 @@
 import { overviewSettings } from "./shared/overview-settings";
 import path from "node:path";
-import { waitsForHuman } from "./shared/gates";
+import { needsReview } from "./shared/gates";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 
 /** The daemon API handed to plugin handlers (typed via the SDK, so the build needs no @getpaseo/client). */
@@ -12,11 +12,15 @@ import {
   createExampleRpc,
   pauseRunRpc,
   resumeRunRpc,
+  overrideQuotaRpc,
   decideGateRpc,
+  deferGateRpc,
+  returnGateRpc,
   headerStateRpc,
   needsYouRpc,
   overviewStateRpc,
   analyticsStateRpc,
+  quotaLimitationRpc,
   listPlaybooks,
   listProjectProfilesRpc,
   setProfileRpc,
@@ -27,12 +31,16 @@ import {
   scriptOutputRpc,
   admissionStatusRpc,
   nudgeStepRpc,
+  addFanoutItemRpc,
   createSidekickFilesRpc,
   listSidekicksRpc,
   openSidekickRpc,
   restartSidekickRpc,
   saveSidekickAttachmentRpc,
   restartRunRpc,
+  setRunPriorityRpc,
+  setRunQuotaExemptRpc,
+  recoverManagerRpc,
   retryStepRpc,
   startAfterTaskRpc,
   startRun,
@@ -47,7 +55,7 @@ import { SIDEKICK_LABEL } from "./server/sidekick";
 import { createSidekickStarter, createStarter } from "./server/starter";
 import { migrateDataDir } from "./server/data-dir";
 import { defaultRunsDir, RunStore } from "./server/store";
-import { answerGateTool, gateTool, managerTools, runTools, sidekickStartTools, sidekickTool, stepTool, validateTool } from "./server/tools";
+import { deferGateTool, returnGateTool, gateTool, managerTools, resumeGateTool, runTools, sidekickStartTools, sidekickTool, stepTools, validateTool } from "./server/tools";
 
 let safetyNet = false;
 /** One bad call (a refused result, a failed timer) must not take every run's tools down: log it and keep serving. */
@@ -71,10 +79,10 @@ export default function contribute(server: PluginServerContext) {
   });
   const runtime = new Runtime(store);
 
-  /** Every entry point waits for the store and hands the runtime the daemon API. */
+  /** Every entry point waits for the store, hands the runtime the daemon API and waits (briefly) for the runs to be picked up again, never for the sweeps or the session reload. */
   const enter = async (paseo: PaseoApi) => {
     await ready;
-    await runtime.attach(paseo);
+    await runtime.enter(paseo);
   };
   const quietly = (label: string, fn: () => Promise<void>) =>
     fn().catch((error) => console.error(`[playbooks] ${label} failed:`, error));
@@ -89,10 +97,10 @@ export default function contribute(server: PluginServerContext) {
       }
     });
 
-  // Tools: report_step_result for step agents; manager tools for agents whose workspace has
+  // Tools: report_step_result and read-only validate_playbooks for step agents; manager tools for agents whose workspace has
   // playbooks (or that already manage a run); validate_playbooks, list_runs, cancel_run, start_after_task and
-  // restart_run for every other agent, so a human can stop, wrap up or restart a run from any chat.
-  const tools = { manager: managerTools(runtime), common: [validateTool(runtime), ...runTools(runtime)], step: stepTool(runtime), answerGate: answerGateTool(runtime), sidekick: sidekickTool(runtime), sidekickStart: sidekickStartTools(runtime), gate: gateTool(runtime) };
+  // restart_run and recover_manager for every other agent, so a human can stop, wrap up or restart a run from any chat.
+  const tools = { manager: managerTools(runtime), common: [validateTool(runtime), ...runTools(runtime), resumeGateTool(runtime), deferGateTool(runtime), returnGateTool(runtime)], step: (managerless: boolean) => stepTools(runtime, managerless), sidekick: sidekickTool(runtime), sidekickStart: sidekickStartTools(runtime), gate: gateTool(runtime) };
   server.before("agent.session_open", async ({ request }, context) => {
     if (request.purpose === "history") return;
     // Only the store is needed here. Do not wait for reconcile: its own sends (resume a step, wake a
@@ -101,7 +109,7 @@ export default function contribute(server: PluginServerContext) {
     void runtime.attach(context.paseo);
     await runtime.sessions.noteOpened(request.agentId);
     // A run with no manager (manager.mode: none) also gives its step agents answer_gate, to put a human gate's question in their conversation.
-    if (request.labels[STEP_LABEL]) return { ...request, tools: [...request.tools, tools.step, ...(runtime.isManagerlessRun(request.labels["playbooks/run"]) ? [tools.answerGate] : [])] };
+    if (request.labels[STEP_LABEL]) return { ...request, tools: [...request.tools, ...tools.step(runtime.isManagerlessRun(request.labels["playbooks/run"]))] };
     if (request.labels[GATE_LABEL]) return { ...request, tools: [...request.tools, tools.gate] };
     // The Sidekick sits on its project's root, which has playbooks: it gets the common tools and list_playbooks / start_playbook, never the rest of a manager's.
     if (request.labels[SIDEKICK_LABEL]) return { ...request, tools: [...request.tools, ...tools.common, ...tools.sidekickStart, tools.sidekick] };
@@ -120,6 +128,18 @@ export default function contribute(server: PluginServerContext) {
     quietly("turn_ended", async () => {
       await enter(context.paseo);
       await runtime.onTurnEnded(agent.id, outcome.kind, agent.parentAgentId ?? null);
+    }),
+  );
+  server.on("agent.permission_requested", ({ agent, request }, context) =>
+    quietly("permission_requested", async () => {
+      await enter(context.paseo);
+      await runtime.onPermissionRequested({ id: agent.id, parentAgentId: agent.parentAgentId ?? null }, request);
+    }),
+  );
+  server.on("agent.permission_resolved", ({ agent, requestId }, context) =>
+    quietly("permission_resolved", async () => {
+      await enter(context.paseo);
+      await runtime.onPermissionResolved(agent.id, requestId);
     }),
   );
   server.on("agent.archived", ({ agent }, context) =>
@@ -182,12 +202,17 @@ export default function contribute(server: PluginServerContext) {
     const withPlaybooks = await withPlaybooksOf(workspaceIds);
     const waiting = store
       .list()
-      .filter((run) => !run.archivedAt && run.gates.some(waitsForHuman) && workspaceIds.includes(run.workspaceId))
+      .filter((run) => !run.archivedAt && run.gates.some(needsReview) && workspaceIds.includes(run.workspaceId))
       .map((run) => run.workspaceId);
     return { withPlaybooks, waiting: [...new Set(waiting)] };
   });
-  handle(analyticsStateRpc, async ({ days, playbook, projectId }) => runtime.analytics({ days, playbook, projectId }));
-  handle(overviewStateRpc, async () => ({ runs: store.list().filter((run) => !run.archivedAt).map(summarizeRun) }));
+  handle(quotaLimitationRpc, async ({ workspaces }) => runtime.quotaLimitation(workspaces));
+  handle(analyticsStateRpc, async ({ days, playbook, projectId, timeZone }) => runtime.analytics({ days, playbook, projectId, timeZone }));
+  handle(overviewStateRpc, async () => {
+    const all = store.list();
+    const priorities = await runtime.priorityViews(all);
+    return { runs: all.filter((run) => !run.archivedAt).map((run) => summarizeRun(run, priorities.get(run.id) ?? null)) };
+  });
   handle(admissionStatusRpc, async ({ runId }) => {
     const stages = runtime.admissionStatus(runId);
     return { stages, stations: stages };
@@ -195,7 +220,7 @@ export default function contribute(server: PluginServerContext) {
   handle(scriptOutputRpc, async ({ runId, stepId }) => runtime.scriptOutput(runId, stepId));
   handle(markRunSeenRpc, async ({ runId }) => ({ seenAt: await runtime.markSeen(runId) }));
   handle(needsYouRpc, async () => ({
-    count: store.list().reduce((count, run) => count + (run.archivedAt ? 0 : run.gates.filter(waitsForHuman).length), 0),
+    count: store.list().reduce((count, run) => count + (run.archivedAt ? 0 : run.gates.filter(needsReview).length), 0),
   }));
   handle(listWorkspaceAgents, async ({ workspaceId }) => ({ agents: await runtime.workspaceAgents(workspaceId) }));
   handle(decideGateRpc, async ({ runId, gateId, decision, comment, hostLabel }) => {
@@ -208,6 +233,11 @@ export default function contribute(server: PluginServerContext) {
     });
     return { alreadyDecided: result.alreadyDecided, decision: result.gate.status };
   });
+  handle(deferGateRpc, async ({ runId, gateId, reason, condition, remindAt, hostLabel }) => {
+    await runtime.deferGate(runId, gateId, { reason, condition, remindAt: remindAt ?? null }, hostLabel);
+    return { deferred: true };
+  });
+  handle(returnGateRpc, async ({ runId, gateId, note, hostLabel }) => ({ returned: await runtime.returnGate(runId, gateId, hostLabel, note?.trim() || null, "human") }));
   handle(cancelRunRpc, async ({ runId, reason }) => ({
     status: (await runtime.cancelRun(runId, reason?.trim() || "canceled from the panel", "from the panel")).status,
   }));
@@ -215,9 +245,18 @@ export default function contribute(server: PluginServerContext) {
     const run = await runtime.startAfterTask(runId, taskId);
     return { status: run.after[taskId]?.status ?? "pending" };
   });
+  handle(recoverManagerRpc, async ({ runId, expectedManagerId, reason, model }) => runtime.recoverManager(runId, expectedManagerId, reason, model));
   handle(restartRunRpc, async ({ runId, stepId, comment, hostLabel }) => ({
     status: (await runtime.restartRun(runId, stepId, comment?.trim() || null, hostLabel)).run.status,
   }));
+  handle(setRunPriorityRpc, async ({ runId, priority, applyToChildren }) => {
+    const result = await runtime.setRunPriority(runId, priority, applyToChildren, "the Quota limitation tab");
+    return { priorityOverride: result.run.priorityOverride, inheritChildPriority: result.run.inheritChildPriority, from: result.from, changed: result.changed, cascaded: result.cascaded };
+  });
+  handle(setRunQuotaExemptRpc, async ({ runId, exempt, applyToChildren }) => {
+    const result = await runtime.setRunQuotaExempt(runId, exempt, applyToChildren, "the Runs view");
+    return { quotaExempt: result.run.quotaExempt, inheritChildExempt: result.run.inheritChildExempt, from: result.from, changed: result.changed, cascaded: result.cascaded };
+  });
   handle(retryStepRpc, async ({ runId, stepId }) => {
     await runtime.askManagerToRetry(runId, stepId);
     return { queued: true };
@@ -228,11 +267,14 @@ export default function contribute(server: PluginServerContext) {
   handle(saveSidekickAttachmentRpc, async (input) => ({ path: await saveAttachment(input) }));
   handle(createSidekickFilesRpc, async ({ workspaceId }) => ({ files: await createSidekickStarter(await runtime.projectRootOf(workspaceId)) }));
   handle(pauseRunRpc, async ({ runId }) => ({ pausedAt: (await runtime.pauseRun(runId)).pausedAt }));
+  handle(overrideQuotaRpc, async ({ provider, minutes }) => runtime.overrideQuota(provider, minutes));
   handle(resumeRunRpc, async ({ runId }) => ({ pausedAt: (await runtime.resumeRun(runId)).pausedAt }));
   handle(nudgeStepRpc, async ({ runId, stepId, message }) => {
     await runtime.nudgeStep(runId, stepId, message, true);
     return { sent: true };
   });
+
+  handle(addFanoutItemRpc, async ({ runId, stepId, item }) => ({ key: (await runtime.addFanoutItem({ runId, stepId, item, by: null })).key }));
 
   return () => runtime.dispose();
 }

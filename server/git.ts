@@ -1,11 +1,27 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { assertBranchName, assertNotOption } from "./branch-name";
 
 const run = promisify(execFile);
 
-async function git(cwd: string, args: string[]): Promise<string> {
+export async function git(cwd: string, args: string[]): Promise<string> {
   const { stdout } = await run("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 });
   return stdout;
+}
+
+/**
+ * Fetches `branch` from origin. The one place that does it: the name must be a valid branch name (so it cannot start
+ * with `-`) and `--` ends the options, so a value from a playbook or a tool argument is never read as a git option.
+ */
+export async function fetchBranch(cwd: string, branch: string): Promise<void> {
+  assertBranchName(branch);
+  await git(cwd, ["fetch", "--quiet", "origin", "--", branch]);
+}
+
+/** The commit `ref` (a branch, `origin/<branch>`, a sha) resolves to in `cwd`; throws when it does not, or starts with `-`. */
+export async function resolveCommit(cwd: string, ref: string): Promise<string> {
+  assertNotOption(ref);
+  return (await git(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).trim();
 }
 
 /**
@@ -46,6 +62,36 @@ export function snapshotDiff(before: string, after: string | null): string | nul
   const added = statusAfter.filter((line) => line && !statusBefore.includes(line));
   if (added.length > 0) parts.push(`changed files: ${added.slice(0, 10).map((line) => line.slice(3)).join(", ")}${added.length > 10 ? ", …" : ""}`);
   return parts.length > 0 ? parts.join("; ") : null;
+}
+
+/**
+ * Like `snapshotDiff`, for the original workspace checkout of an isolated run: a HEAD that only
+ * fast-forwarded (the baseline commit is an ancestor of the current one) is not a violation, as the
+ * checkout is synced to origin outside the run. A rewind, a switch to another line of history or any
+ * change to the working tree still is.
+ */
+export async function checkoutViolationSince(cwd: string, baseline: string): Promise<string | null> {
+  const after = await checkoutSnapshot(cwd);
+  const detail = snapshotDiff(baseline, after);
+  if (detail === null || after === null) return detail;
+  const headBefore = baseline.split("\n")[0] ?? "";
+  const headAfter = after.split("\n")[0] ?? "";
+  if (headBefore !== headAfter && (await isAncestor(cwd, headBefore, headAfter))) {
+    // Same working tree state, HEAD only moved forward.
+    const statusBefore = baseline.split("\n").slice(1).join("\n");
+    const statusAfter = after.split("\n").slice(1).join("\n");
+    return snapshotDiff(`x\n${statusBefore}`, `x\n${statusAfter}`);
+  }
+  return detail;
+}
+
+async function isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+  try {
+    await git(cwd, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Current branch name, or the commit when detached. */
@@ -90,7 +136,7 @@ export async function freshRef(cwd: string, branch: string): Promise<string> {
 export async function freshRefInfo(cwd: string, branch: string): Promise<{ ref: string; fetchError: string | null }> {
   let fetchError: string | null = null;
   try {
-    await git(cwd, ["fetch", "--quiet", "origin", branch]);
+    await fetchBranch(cwd, branch);
   } catch (error) {
     // Offline or no origin: whatever the remote-tracking ref already holds, if any.
     fetchError = (error instanceof Error ? error.message : String(error)).split("\n").find((line) => line.trim() && !line.startsWith("Command failed"))?.trim() ?? "git fetch failed";
@@ -108,6 +154,7 @@ export async function freshRefInfo(cwd: string, branch: string): Promise<{ ref: 
  * Paths the ref does not have are skipped.
  */
 export async function exportPaths(cwd: string, ref: string, paths: readonly string[], dest: string): Promise<void> {
+  assertNotOption(ref);
   const present: string[] = [];
   for (const rel of paths) {
     if ((await git(cwd, ["ls-tree", "--name-only", ref, "--", rel]).catch(() => "")).trim()) present.push(rel);
@@ -129,9 +176,45 @@ export async function exportPaths(cwd: string, ref: string, paths: readonly stri
 /** Best effort: fetches `branch` from origin and fast-forwards the checkout to it. Never fails. */
 export async function fastForward(cwd: string, branch: string): Promise<void> {
   try {
-    await git(cwd, ["fetch", "--quiet", "origin", branch]);
+    await fetchBranch(cwd, branch);
     await git(cwd, ["merge", "--ff-only", "--quiet", `origin/${branch}`]);
   } catch {
     // Offline, no origin, or not a fast-forward: keep the checkout as it is.
   }
+}
+
+/**
+ * Brings the checkout at `cwd` (a new workspace's worktree, branched off a possibly stale local `branch`) up to date with
+ * `origin/<branch>`: fetch, then `merge --ff-only`. Never throws: `note` says why it stayed where it was (offline, no origin,
+ * the checkout has diverged), null when it is current.
+ */
+export async function freshenCheckout(cwd: string, branch: string): Promise<{ updated: boolean; note: string | null }> {
+  const first = (error: unknown) => (error instanceof Error ? error.message : String(error)).split("\n").find((line) => line.trim() && !line.startsWith("Command failed"))?.trim() ?? "git failed";
+  try {
+    await fetchBranch(cwd, branch);
+  } catch (error) {
+    return { updated: false, note: `could not fetch origin/${branch}: ${first(error)}` };
+  }
+  try {
+    const before = (await git(cwd, ["rev-parse", "HEAD"])).trim();
+    await git(cwd, ["merge", "--ff-only", "--quiet", `origin/${branch}`]);
+    return { updated: (await git(cwd, ["rev-parse", "HEAD"])).trim() !== before, note: null };
+  } catch (error) {
+    return { updated: false, note: `could not fast-forward to origin/${branch}: ${first(error)}` };
+  }
+}
+
+/**
+ * Work in `cwd` that archiving its workspace could hide: uncommitted changes (untracked files included) or commits on a local
+ * branch that no remote has. Null when there is none, or when `cwd` is not a git checkout.
+ */
+export async function unsavedWork(cwd: string): Promise<string | null> {
+  try {
+    await git(cwd, ["rev-parse", "--git-dir"]);
+  } catch {
+    return null;
+  }
+  if ((await git(cwd, ["status", "--porcelain"])).trim()) return "it has uncommitted changes";
+  if ((await git(cwd, ["log", "--branches", "--not", "--remotes", "--oneline", "-n", "1"])).trim()) return "it has commits that are not pushed";
+  return null;
 }

@@ -1,14 +1,18 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { cp, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import path from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 
 /** The daemon API handed to plugin handlers (typed via the SDK, so the build needs no @getpaseo/client). */
 type PaseoApi = PluginHandlerContext["paseo"];
-import type { AdmissionStatus, ScriptOutput } from "../shared/types";
-import type { AgentSettings, AgentTarget, Attempt, FanoutChild as FanoutChildState, PoolPass as PoolPassState, Gate, Job, Playbook, Run, RunWorktree, Step, VarValue } from "../shared/types";
-import { addUsage } from "../shared/types";
+import type { AdmissionStatus, RunPriorityView, ScriptOutput } from "../shared/types";
+import type { DismissedFinding, GateWaitCondition } from "../shared/types";
+import { dismissRefusal, findingSignature, normalizeFindingFile, normalizeFindingText, normalizePr } from "./findings";
+import type { AgentSettings, AgentTarget, Attempt, FanoutChild as FanoutChildState, PoolPass as PoolPassState, Gate, Job, Playbook, Run, RunDefinition, RunWorktree, Step, VarValue, WardenFinding } from "../shared/types";
+import { addUsage, isUnavailableHold, DEFAULT_EXHAUSTED_FOR_MS, DEFAULT_PERMISSION_POLICY, workspaceKeptUntil } from "../shared/types";
 import { UsageLedger } from "./usage-ledger";
 import { analyze, type Analytics } from "../shared/analytics";
 import {
@@ -34,12 +38,13 @@ import { isQuotaError, isQuotaMessage } from "./quota";
 import { UsageCache, usageBlock, type UsageBlock, type UsageSnapshot } from "./usage";
 import * as engine from "./engine";
 import { ADMISSION_TIMEOUT_MS, admissionInput, readAdmission } from "./admission";
-import { checkoutSnapshot, currentRef, defaultBranch, fastForward, freshRef, removedGitlinks, snapshotDiff } from "./git";
+import { assertBranchName } from "./branch-name";
+import { checkoutSnapshot, currentRef, defaultBranch, exportPaths, fastForward, freshenCheckout, freshRef, freshRefInfo, git as gitOutput, resolveCommit, removedGitlinks, snapshotDiff, checkoutViolationSince, unsavedWork } from "./git";
 import { workspaceTitle } from "../shared/workspace-name";
-import { createWorktree, dirtyPaths, linkedSubmodules, listWorktreeDirs, pruneWorktrees, removeWorktree, repoOfWorktree, worktreeBranch, worktreePath } from "./worktree";
-import { chooseDefinition } from "./fresh";
+import { createWorktree, diskUsedFraction, dirtyPaths, purgeScratch, linkedSubmodules, listWorktreeDirs, pruneWorktrees, unpushedCommits, removeWorktree, repoOfWorktree, worktreeBranch, worktreePath } from "./worktree";
+import { chooseDefinition, definitionMismatch, isAdoptable, readAtRef, resolveForNewRun, shortReason, workspaceWarning } from "./fresh";
 import { runWorktreeTeardown } from "./teardown";
-import { loadPlaybooks, loadSidekick } from "./loader";
+import { gatesOnBehalfSetting, wardenPrSetting, loadPlaybooks, loadSidekick, type SidekickConfig, type SidekickProviders } from "./loader";
 import { findEntry } from "../shared/repos";
 
 /** The entry a stored or typed playbook id means: bare ids resolve to the one namespaced entry (and the reverse); ambiguity or absence gives undefined. */
@@ -47,20 +52,45 @@ function lookup(entries: Parameters<typeof findEntry>[0], ref: string) {
   const found = findEntry(entries, ref);
   return "entry" in found ? found.entry : undefined;
 }
-import { DEFAULT_SIDEKICK_RESTART_TOKENS, DEFAULT_SIDEKICK_SUBAGENT, SIDEKICK_LABEL, SIDEKICK_PROJECT_LABEL, sidekickGateSweep, sidekickHandoffRequest, sidekickKickoff, SIDEKICK_PASEO_TOOLS, SIDEKICK_PLUGIN_TOOLS, SidekickRegistry, sidekickPrompt, sidekickTitle } from "./sidekick";
+import { DEFAULT_SUBAGENT_ARCHIVE_AFTER_MS, subagentWorkspaceRefusal, SubagentArchiveStore } from "./sidekick-archive";
+import { DEFAULT_SIDEKICK_SUBAGENT, SIDEKICK_LABEL, SIDEKICK_PROJECT_LABEL, sidekickGateSweep, sidekickCompactCommand, sidekickCompactedNote, sidekickLimits, sidekickKickoff, SIDEKICK_PASEO_TOOLS, SIDEKICK_PLUGIN_TOOLS, SidekickRegistry, sidekickPrompt, sidekickTitle } from "./sidekick";
 import { BusError, EventBus, globToRegExp, type BusEvent, type Notifier, type Subscription } from "./bus";
-import { OversightProducer, registerOversightTypes } from "./oversight-events";
+import { blockedOnGate, MANAGER_WATCH_CHECK_MS, nudgeDue, STUCK_AFTER_NUDGES } from "./manager-watch";
+import type { WardenPrConfig } from "../shared/types";
+import { listOpenPrs, prCandidates, reposOfRun, rulesetChecks, rulesetKey, WardenPrStore, type OpenPr } from "./warden-prs";
+import { diffFindings, gateOpenCandidates, heldCandidates, loopCandidates, managerBlockedCandidates, slowCandidates, stalledCandidates, stalledInfo, staleDefinitionCandidate, WARDEN_CHECK_MS, WARDEN_MAX_RUNS_PER_PASS, wardenPrSummary, wardenSummary, type Act, type Candidate, type WardenIo } from "./warden";
+import { SlowIndex } from "./slow";
+import { gatePayload, OversightProducer, registerOversightTypes, runFieldsOf } from "./oversight-events";
 import { JOB_TYPES, publicJobEvents } from "./job-events";
 import { FANOUT_TYPES } from "./fanout-events";
 import { gateListing, listAttention, type GateFilter } from "./overseer";
-import { gateChatPrompt, managerLostNotice, gateDeciderPrompt, gateDeciderSystemPrompt, gateDecisionReminder, managerAfterRestart, managerKickoff, managerTakeover, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt, withPreamble } from "./prompts";
-import { askHumanText, choicesOfGate, waitsForHuman } from "../shared/gates";
+import { withCodexQuestionGuidance, gateChatPrompt, managerLostNotice, gateDeciderPrompt, gateDeciderSystemPrompt, gateDecisionReminder, managerAfterRestart, managerKickoff, managerTakeover, managerWaitingNudge, reportReminder, resumeAfterRestart, silenceReminder, singletonKickoff, stepSystemPrompt, withPreamble } from "./prompts";
+import { askHumanText, choicesOfGate, describeCondition, isDeferred, isTracked, managerQuestionAnswer, needsReview, waitsForHuman } from "../shared/gates";
+import { PERMISSION_POLICY_BY } from "./engine";
+import { DENY_MESSAGE, describePermission, describeQuestion, policyText, type PermissionRequestLike } from "./permissions";
+import { Backoff, describeRemovalError } from "./backoff";
 import { StaleSessions } from "./stale-sessions";
 import { fetchAllWorkspaces, WorkspaceLookup } from "./workspace-lookup";
 import type { RunStore } from "./store";
 import { holdsBlock, planAdmissions, slotHolders } from "../shared/slots";
+import { DEFAULT_MANAGER_RECOVERY, DEFAULT_RATE_LIMITS, readManagerRecoveryConfig, readQuotaLimitsLayer, resolveQuotaLimits, type ManagerRecoveryConfig, type QuotaLimitsLayer, type RateLimitsConfig } from "./config";
+import { buildQuotaLimitation } from "./quota-limitation";
+import type { QuotaLimitation } from "../shared/quota-limitation";
+import { candidateCost, CostHistory, exhaustionVerdict, planPace, type Admitted as AdmittedRun, orderCandidates, planHeadroom, windowKey, ZERO_COST_POINTS, type Candidate as RateCandidate, type PlanContext } from "./rate-budget";
+import { limitVerdict, parentIds, priorityViewOf, QuotaPacer, runPriority, runProviders, usedPct, type HoldVerdict, type ReadChange } from "./rate-limit";
+import { pluginDataDir } from "./data-dir";
 
 export class UserError extends Error {}
+
+/** Characters of rationale `dismiss_finding` needs: a reason, not a word. */
+const MIN_RATIONALE = 20;
+
+/** A step could not start because rate limiting holds the run (ADR 2026-11-20-rate-limiting): not a failure, the plugin starts the step itself once the hold is lifted. */
+export class RateHeldError extends UserError {
+  constructor(readonly hold: HoldVerdict) {
+    super(`rate limit: ${hold.reason}${hold.retryAt ? ` (the plugin looks again at ${hold.retryAt})` : ""}. The step stays ready and the plugin starts it by itself when capacity or quota returns; do not start it, retry or restart anything.`);
+  }
+}
 
 /** How often a batch's manager is reminded of detached jobs without a follow-up before the plugin stops holding it. */
 const FOLLOW_UP_REMINDERS = 3;
@@ -78,22 +108,41 @@ export const MANAGER_TOOL_NAMES = [
   "get_run",
   "list_runs",
   "cancel_run",
+  "refresh_scripts",
   "restart_run",
+  "set_run_priority",
+  "set_run_quota_exempt",
   "archive_run",
   "requeue_job",
   "validate_playbooks",
   "settle_job",
   "record_followup",
+  "dismiss_finding",
+  "list_dismissed_findings",
 ];
-export const STEP_TOOL_NAMES = ["report_step_result"];
+export const STEP_TOOL_NAMES = ["report_step_result", "validate_playbooks"];
 /** A run with no manager also lets its step agents put a human gate's question in their conversation. */
 export const MANAGERLESS_STEP_TOOL_NAMES = [...STEP_TOOL_NAMES, "answer_gate"];
 export const GATE_TOOL_NAMES = ["report_gate_decision"];
 
-type AgentConfig = { provider: string; modeId?: string; thinkingOptionId?: string; options?: { allowedTools: string[] } };
+type AgentConfig = { provider: string; systemPrompt?: string; modeId?: string; thinkingOptionId?: string; options?: { allowedTools: string[] } };
 
 /** Pre-approves our own tools so unattended agents in `default` mode are not blocked on them. */
 /** A model the manager picks for one step attempt: `provider/model`, and optionally a thinking option. */
+/** What `refresh_scripts` did: the source it read from (`ref` names it), whether anything changed, and what happened to the definition. */
+export interface RefreshResult {
+  ref: string;
+  sha: string;
+  before: string | null;
+  changed: boolean;
+  /** `origin`: the fetched origin/<branch>; `workspace`: the checkout, because origin's playbook is invalid or missing (see `note`). */
+  source: "origin" | "workspace";
+  /** `refreshed`/`unchanged`: an ended run re-read its definition; `pinned`: kept (an active run, or no compatible definition: see `note`). */
+  definition: "refreshed" | "unchanged" | "pinned";
+  /** The warning or reason behind a fallback or a definition that was not replaced. */
+  note: string | null;
+}
+
 export interface ModelChoice {
   target: string;
   thinking?: string;
@@ -111,12 +160,20 @@ function inheritTarget(base: AgentTarget, provider: string, model: string): Agen
   return { provider, model, ...(same && base.mode ? { mode: base.mode } : {}), ...(same && base.thinking ? { thinking: base.thinking } : {}) };
 }
 
+/** Provider, model and mode of `sidekick.subagents`: the archive options are not agent settings. */
+function pickAgentSettings(subagents: { provider?: string; model?: string; mode?: string; thinking?: string } | undefined) {
+  return { ...(subagents?.provider ? { provider: subagents.provider } : {}), ...(subagents?.model ? { model: subagents.model } : {}), ...(subagents?.mode ? { mode: subagents.mode } : {}), ...(subagents?.thinking ? { thinking: subagents.thinking } : {}) };
+}
+
 function preapprove(config: AgentConfig, provider: string, tools: string[]): AgentConfig {
   if (provider === "claude") config.options = { allowedTools: tools.map((tool) => `mcp__paseo__${tool}`) };
   return config;
 }
 
 const MANAGER_LABEL = "playbooks/manager";
+/** `auto_archive`: runs looked into per tick, and how long one that was not archived waits before it is looked into again. */
+const AUTO_ARCHIVE_PER_TICK = 3;
+const AUTO_ARCHIVE_RETRY_MS = 10 * 60_000;
 export const STEP_LABEL = "playbooks/step";
 export const RUN_LABEL = "playbooks/run";
 /** On a gate's role decider agent: the gate id. */
@@ -179,6 +236,10 @@ interface Reservation {
   created?: boolean;
   /** Set when a fan-out step started the run. */
   parent?: Run["parent"];
+  /** `start_playbook`'s priority for the run (rate limiting). */
+  priority?: number;
+  /** `start_playbook`'s `quota.exempt` for the run. */
+  quotaExempt?: boolean;
 }
 
 /** Kept of a script's output: the end of stdout and stderr, shown in the panel and to the manager. */
@@ -347,9 +408,18 @@ function silenceDue(step: Step, attempt: Attempt, activeAt: number): number | nu
   return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
+/** How long the worktree of a failed run is kept for inspection (`workspace.keep_failed`). */
+const FAILED_RETENTION_MS = 24 * 60 * 60 * 1000;
+/** Used fraction of the volume from which failed runs' worktrees are removed early (the 85% guard of the pr playbooks). */
+const DISK_PRESSURE = 0.85;
+/** Stale sessions reloaded at once after a plugin update: the daemon calls back into the plugin for each. */
+const RELOAD_CONCURRENCY = 4;
+
 export class Runtime {
   private paseo: PaseoApi | null = null;
   private reconciled: Promise<void> | null = null;
+  /** The first phase of reconcile (the runs picked up again): what hooks and RPCs wait for, with a budget. */
+  private reconciledRuns: Promise<void> | null = null;
   private readonly busyManagers = new Set<string>();
   /** `run/step` whose agent is being created (the plugin's auto-start and the manager's start_step must not both create one). */
   private readonly startingSteps = new Set<string>();
@@ -361,6 +431,17 @@ export class Runtime {
   private readonly wokenManagers = new Set<string>();
   /** Managers of a run where a gate was decided since they were last checked for compaction. */
   private readonly gateManagers = new Set<string>();
+  /** Serializes manager delivery and recovery, including sends already in flight. */
+  private readonly recoveringManagers = new Set<string>();
+  private readonly managerOperations = new Map<string, Promise<unknown>>();
+  private managerOperation<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const next = (this.managerOperations.get(runId) ?? Promise.resolve()).then(fn);
+    const settled = next.catch(() => undefined);
+    this.managerOperations.set(runId, settled);
+    return next.finally(() => {
+      if (this.managerOperations.get(runId) === settled) this.managerOperations.delete(runId);
+    });
+  }
   /**
    * Managers of a stage's previous batch: archived once their turn ends, and never woken
    * again (sending to an archived agent brings it back).
@@ -375,12 +456,16 @@ export class Runtime {
   /** Batch step attempts whose `settle` output was applied, as "<batchId>/<stepId>/<attempt>". */
   private readonly settledSteps = new Set<string>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** One timer per delayed step (`run/step/due`): runs the tick when its loop-back delay is over. */
+  private readonly delayTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Silence checks of running agent steps, by agent id. */
   private readonly watches = new Map<string, ReturnType<typeof setTimeout>>();
   /** Start reserves a run id and playbook snapshot for the worktree it creates. */
   private readonly reservations = new Map<string, Reservation[]>();
   /** Where isolated runs' worktrees live: `<plugin data>/worktrees/<runId>`. */
   readonly worktreesDir: string;
+  /** Per-run copies of the scripts taken by `refresh_scripts`: `<dir>/run-scripts/<runId>`. */
+  readonly runScriptsDir: string;
   /** Worktrees being created, which the orphan sweep must not touch. */
   private readonly creatingWorktrees = new Set<string>();
   /** Runs started from the panel for a busy agent: agent id → run id, delivered when its turn ends. */
@@ -411,12 +496,20 @@ export class Runtime {
 
   private readonly usageLedger: UsageLedger;
   private readonly sidekickRegistry: SidekickRegistry;
-  /** Sidekick agents that handed off and restart when their turn ends; those already asked to hand off; finish notices held for a busy Sidekick. */
-  private readonly sidekickRolling = new Set<string>();
-  private readonly sidekickAsked = new Set<string>();
+  /** Sidekick agents that asked for a compaction (`sidekick_handoff` with `restart`) once their turn ends; those being compacted now (a `/compact` is running); finish notices held for a busy Sidekick. */
+  private readonly sidekickCompactNext = new Set<string>();
+  private readonly sidekickCompacting = new Set<string>();
+  /** The context size a Sidekick was left at by its last compaction when that was still above the threshold: it is not compacted again until it grows well past that. */
+  private readonly sidekickCompactedAt = new Map<string, number>();
+  /** Per project: the chain of Sidekick creations, restarts and replacements, so two of them never overlap (at most one live Sidekick per project). */
+  private readonly sidekickChains = new Map<string, Promise<unknown>>();
   /** Gates (runId:gateId) already put to each Sidekick by an end-of-turn sweep, so a gate left for the human is not repeated every turn. */
   private readonly sidekickSwept = new Map<string, Set<string>>();
   private readonly sidekickHeld = new Map<string, string[]>();
+  /** The subagents behind the finish notices held for each Sidekick: their workspace archive starts once the notice is delivered. */
+  private readonly sidekickHeldAgents = new Map<string, string[]>();
+  private readonly subagentArchives: SubagentArchiveStore;
+  private readonly subagentArchiveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly sidekickOpening = new Map<string, Promise<{ projectId: string; workspaceId: string; agentId: string; created: boolean }>>();
 
   /** The event bus (bus.ts) and its first producer, the runs (oversight-events.ts). */
@@ -427,13 +520,15 @@ export class Runtime {
 
   constructor(
     private readonly store: RunStore,
-    private readonly options: { dataDir?: string; debounceMs?: number; pollMs?: number; wakeGapMs?: number; admissionTimeoutMs?: number; /** Tests: false keeps the old manual flow (the plugin starts no ready agent step by itself). */ autoStartAgents?: boolean } = {},
+    private readonly options: { dataDir?: string; debounceMs?: number; pollMs?: number; wakeGapMs?: number; /** Tests: how long a failed run's worktree is kept (default 24h). */ failedRetentionMs?: number; /** Tests: the used fraction of the volume holding the worktrees. */ diskUsedFraction?: (dir: string) => Promise<number>; admissionTimeoutMs?: number; /** Tests: false keeps the old manual flow (the plugin starts no ready agent step by itself). */ autoStartAgents?: boolean; /** Tests: the grace period of a Sidekick subagent's workspace archive when the project sets none. */ subagentArchiveAfterMs?: number; /** Tests: the open PRs of a project (default: `gh pr list`). */ listOpenPrs?: (dir: string, repo: string | null) => Promise<OpenPr[]>; /** Tests: the checks a base branch's ruleset requires (default: `gh api`). */ rulesetChecks?: (repo: string, base: string) => Promise<string[]>; /** Tests: sessions reloaded at once after a plugin update (default 4). */ reloadConcurrency?: number; /** Tests: pause after each reload (default 20 ms). */ reloadPauseMs?: number; /** Tests: debounce of the immediate re-check of held runs when capacity frees (default 250 ms). */ limitKickMs?: number } = {},
   ) {
     const dir = options.dataDir ?? path.dirname(store.dir);
     this.worktreesDir = path.join(dir, "worktrees");
+    this.runScriptsDir = path.join(dir, "run-scripts");
     this.sessions = new StaleSessions(path.join(dir, "sessions.json"));
     this.usageLedger = new UsageLedger(path.join(dir, "agent-usage.json"));
     this.sidekickRegistry = new SidekickRegistry(path.join(dir, "sidekick.json"));
+    this.subagentArchives = new SubagentArchiveStore(path.join(dir, "sidekick-archive.json"));
     this.bus = new EventBus({ events: path.join(dir, "events.json"), subscriptions: path.join(dir, "subscriptions.json"), pending: path.join(dir, "pending-events.json") }, options.debounceMs === undefined ? {} : { debounceMs: options.debounceMs });
     registerOversightTypes(this.bus);
     for (const def of JOB_TYPES) this.bus.register(def);
@@ -444,6 +539,11 @@ export class Runtime {
       for (const event of publicJobEvents(run, events)) {
         jobEvents = jobEvents.then(() => this.bus.emit(event.type, event.payload, { runId: run.id, source: "pipelines" })).catch((error: unknown) => console.error(`[playbooks] could not emit ${event.type}:`, errorText(error)));
       }
+    });
+    // Capacity freed (a run ends or is archived, a step ends): held and paused runs are looked at again at once, not at the next 15 s timer.
+    store.onChange((before, after) => {
+      const running = (run: Run) => Object.values(run.steps).filter((state) => state.status === "running").length;
+      if ((isActive(before) && !isActive(after)) || (!before.archivedAt && after.archivedAt) || running(after) < running(before) || before.priorityOverride !== after.priorityOverride) this.kickLimits();
     });
     // Script steps with `wake_on` (script-wake.ts logic below): an internal listener, not an agent subscription.
     this.bus.onEmit((event) => {
@@ -466,6 +566,9 @@ export class Runtime {
     return {
       deliver: async (subscription: Subscription, _events: BusEvent[], text: string) => {
         const id = subscription.sink.target;
+        const managerRun = this.store.list().find((run) => run.managerAgentId === id || run.managerRecoveries.some((entry) => entry.from === id));
+        const suppressed = () => managerRun && (this.store.get(managerRun.id)?.managerAgentId !== id || this.store.get(managerRun.id)?.managerQuotaBlockedId === id);
+        if (suppressed()) return "held";
         const steer = subscription.delivery === "steer";
         if (!steer && this.busyManagers.has(id)) return "held";
         const agent = await this.api().agents.ref(id).refresh().catch(() => null);
@@ -479,7 +582,14 @@ export class Runtime {
         }
         if (!steer) this.busyManagers.add(id);
         try {
-          await this.api().agents.ref(id).send(text, { activeTurnBehavior: "steer" });
+          if (managerRun) {
+            const delivered = await this.managerOperation(managerRun.id, async () => {
+              if (suppressed()) return false;
+              await this.api().agents.ref(id).send(text, { activeTurnBehavior: "steer" });
+              return true;
+            });
+            if (!delivered) return "held";
+          } else await this.api().agents.ref(id).send(text, { activeTurnBehavior: "steer" });
         } catch (error) {
           if (!steer) this.busyManagers.delete(id);
           throw error;
@@ -491,22 +601,91 @@ export class Runtime {
 
   // ---------------------------------------------------------------- lifecycle
 
+  /** Repairs only committed handoffs; startup never guesses that a live manager needs replacement. */
+  private async reconcileManagerSubscriptions(): Promise<void> {
+    for (const run of this.store.list()) {
+      for (const recovery of run.managerRecoveries) await this.bus.rebindOwner(recovery.from, run.managerAgentId);
+    }
+  }
+
   /** Every hook, tool and RPC context hands us the daemon API; the first one triggers reconcile. */
   attach(paseo: PaseoApi): Promise<void> {
     this.paseo ??= paseo;
-    this.reconciled ??= this.reconcile()
-      .catch((error) => console.error("[playbooks] reconcile failed:", error))
-      .then(() => this.reloadStaleSessions())
-      .catch((error) => console.error("[playbooks] stale session reload failed:", errorText(error)));
+    if (!this.reconciled) {
+      this.reconciledRuns = this.reconcileManagerSubscriptions().then(() => this.reconcileRuns()).catch((error) => console.error("[playbooks] reconcile failed:", error));
+      this.reconciled = this.reconciledRuns
+        .then(() => this.reconcileSweeps())
+        .catch((error) => console.error("[playbooks] reconcile failed:", error))
+        .then(() => this.reloadStaleSessions())
+        .catch((error) => console.error("[playbooks] stale session reload failed:", errorText(error)))
+        .then(() => this.reconcileSidekicks())
+        .catch((error) => console.error("[playbooks] Sidekick duplicate check failed:", errorText(error)))
+        .then(() => this.rearmSubagentArchives())
+        .catch((error) => console.error("[playbooks] could not re-arm the pending subagent workspace archives:", errorText(error)));
+    }
     if (!this.eventsTimer) {
       this.eventsTimer = setInterval(() => void this.watchEvents().catch((error) => console.error("[playbooks] event watch failed:", errorText(error))), this.options.pollMs ?? 2000);
       (this.eventsTimer as unknown as { unref?: () => void }).unref?.();
     }
+    if (!this.limitTimer) {
+      // Held runs are looked at again while any is held (a quota ceiling catches up with time, a backoff ends).
+      this.limitTimer = setInterval(() => {
+        void this.syncProviderUsage();
+        if (this.store.list().some((run) => run.rateHold || (isActive(run) && run.managerQuotaBlockedId !== null && run.managerQuotaBlockedId === run.managerAgentId))) void this.tick().catch((error) => console.error("[playbooks] tick for held runs failed:", errorText(error)));
+      }, 15_000);
+      (this.limitTimer as unknown as { unref?: () => void }).unref?.();
+    }
     return this.reconciled;
+  }
+
+  /**
+   * The entry point of hooks and RPCs: starts reconcile if needed and waits only for its first phase
+   * (runs picked up again), for at most `budgetMs`. The worktree sweep, the first tick and the reload
+   * of stale sessions run on in the background: a hook or the panel never waits for them, which took
+   * minutes after a plugin update and made every hook and RPC time out.
+   */
+  async enter(paseo: PaseoApi, budgetMs = 3_000): Promise<void> {
+    void this.attach(paseo);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, budgetMs);
+      (timer as unknown as { unref?: () => void }).unref?.();
+    });
+    try {
+      await Promise.race([this.reconciledRuns, budget]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** Provider usage of the host (`providers.listUsage`): shared by every run, read at most once at a time and reused for a short while. */
   private readonly usage = new UsageCache(async () => (await this.api().providers.listUsage()) as unknown as UsageSnapshot);
+  /** Quota pacing of playbook steps: provider usage readings with their freshness, backoff and "continue anyway" overrides. */
+  private readonly pacer = new QuotaPacer(
+    async () => (await this.api().providers.listUsage()) as unknown as UsageSnapshot,
+    (changes) => {
+      try {
+        this.observeUsage(changes);
+      } catch (error) {
+        console.error("[playbooks] could not attribute quota usage:", errorText(error));
+      }
+      void this.syncProviderUsage();
+      void this.tick().catch((error) => console.error("[playbooks] tick after a quota read failed:", errorText(error)));
+    },
+    Date.now,
+    () => void this.syncProviderUsage(),
+  );
+  /** Providers whose usage reading is unavailable, with the `since` announced (provider.usage_unavailable): memory only, a restart announces again at most once. */
+  private readonly usageAnnounced = new Map<string, { since: string; reason: string }>();
+  /** What steps cost in quota per playbook, measured from the usage readings (ADR 2026-11-20-dynamic-rate-limits); kept in a file. */
+  private readonly costs = new CostHistory(path.join(pluginDataDir(), "rate-history.json"));
+  /** Quota that started work has yet to use, per run: est − spent counts against the headroom until the readings catch up. */
+  private readonly reservedQuota = new Map<string, { runId: string; est: Record<string, number>; spent: Record<string, number>; at: number; endedAt: number | null }>();
+  /** The quota points each running or just ended agent attempt has been measured to use so far, folded into `costs` when it ends. */
+  private readonly attemptUse = new Map<string, { playbookId: string; provider: string; points: Record<string, number> }>();
+  private readonly warnedUnreported = new Set<string>();
+  private rateConfig: { at: number; value: QuotaLimitsLayer } | null = null;
+  private limitTimer: ReturnType<typeof setInterval> | null = null;
   /** Usage skips already written to a run's log (`run|target|window|reset`), so a skip is logged once. */
   private readonly usageLogged = new Set<string>();
   /** Workspace lookups by id: one fetch of the daemon's list serves every id (the SDK's `ref().refresh()` fetched it per call). */
@@ -542,12 +721,18 @@ export class Runtime {
 
   /** Stops timers and scripts; resolves once the run files written in flight are on disk, after which nothing is written. */
   dispose(): Promise<void> {
+    this.sessions.stop();
     if (this.eventsTimer) clearInterval(this.eventsTimer);
     this.eventsTimer = null;
     for (const timer of [...this.timers.values(), ...this.watches.values()]) clearTimeout(timer);
     this.timers.clear();
     this.watches.clear();
+    for (const timer of this.delayTimers.values()) clearTimeout(timer);
+    this.delayTimers.clear();
+    for (const timer of this.subagentArchiveTimers.values()) clearTimeout(timer);
+    this.subagentArchiveTimers.clear();
     for (const id of [...this.scripts.keys()]) this.stopScript(id);
+    if (this.limitKick) clearTimeout(this.limitKick);
     return Promise.all([this.store.close(), this.bus.close(), this.sessions.flush(), this.usageLedger.flush()]).then(() => undefined);
   }
 
@@ -555,7 +740,7 @@ export class Runtime {
    * After a (re)start: re-arm timeouts, ask step agents whose turn the restart cut to carry on,
    * treat the ones that cannot as lost, wake idle managers of stalled runs, flush wake-ups.
    */
-  private async reconcile(): Promise<void> {
+  private async reconcileRuns(): Promise<void> {
     // Logged before anything ticks: a step found ready now was dropped by the previous plugin process.
     await this.logRecoveredSteps().catch((error) => console.error("[playbooks] recovery log failed:", errorText(error)));
     for (const run of this.store.list()) {
@@ -571,7 +756,12 @@ export class Runtime {
       if (!run.batch || isTerminal(run.status)) continue;
       for (const gate of run.gates) if (gate.status === "pending") this.batchGates.add(`${run.id}/${gate.id}`);
     }
+  }
+
+  /** The slow second phase of reconcile: removing orphan worktrees, permissions, admission, the first tick. Nothing waits for it. */
+  private async reconcileSweeps(): Promise<void> {
     await this.sweepWorktrees().catch((error) => console.error("[playbooks] worktree sweep failed:", errorText(error)));
+    await this.sweepPermissions(true).catch((error) => console.error("[playbooks] permission sweep failed:", errorText(error)));
     await this.admitQueued().catch((error) => console.error("[playbooks] admission after reconcile failed:", errorText(error)));
     await this.tick().catch((error) => console.error("[playbooks] tick after reconcile failed:", errorText(error)));
   }
@@ -693,6 +883,158 @@ export class Runtime {
     return this.runsOfManager(agentId).find((run) => isActive(run));
   }
 
+  // ---------------------------------------------------------------- tool permission requests (permissions.on_request)
+
+  /** Requests already handled (`agentId/requestId`), so a hook and a sweep never answer one twice. */
+  private readonly permissionsHandled = new Set<string>();
+
+  /** The run an agent belongs to and where to put its request: its step, or "manager". Subagents count through their parents. */
+  private async permissionOwner(agent: { id: string; parentAgentId: string | null }): Promise<{ run: Run; stepId: string; who: string } | null> {
+    let current: { id: string; parentAgentId: string | null } | null = agent;
+    for (let depth = 0; current && depth < 10; depth++) {
+      const own = this.ownedPlace(current.id);
+      if (own) return { ...own, who: depth === 0 ? own.who : `a subagent of the ${own.who}` };
+      if (!current.parentAgentId) return null;
+      const parent: string = current.parentAgentId;
+      const snapshot = (await this.api().agents.ref(parent).refresh().catch(() => null))?.agent as { parentAgentId?: string | null } | undefined;
+      current = { id: parent, parentAgentId: snapshot?.parentAgentId ?? null };
+    }
+    return null;
+  }
+
+  /** The active run that owns this agent directly (manager, step, gate decider or gate chat), and the step it sits on. */
+  private ownedPlace(agentId: string): { run: Run; stepId: string; who: string } | null {
+    const step = this.stepRunOf(agentId);
+    if (step && isActive(step.run)) return { run: step.run, stepId: step.stepId, who: `step agent of "${step.stepId}"` };
+    const manager = this.activeRunOfManager(agentId);
+    if (manager) return { run: manager, stepId: "manager", who: "Playbook Manager" };
+    for (const run of this.store.list()) {
+      if (!isActive(run)) continue;
+      const gate = run.gates.find((candidate) => candidate.deciderAgentId === agentId || candidate.chatAgentId === agentId);
+      if (gate) return { run, stepId: gate.stepId, who: `gate agent of "${gate.stepId}"` };
+    }
+    return null;
+  }
+
+  /**
+   * An agent of a run raised a tool permission request (the daemon's `agent.permission_requested`, or a sweep after a restart).
+   * The run's `permissions.on_request` decides: allow it for the human, refuse it, or open a `permission` gate. Questions,
+   * plans and mode changes are not tool requests: they stay with the human. Every outcome is written to the run's history.
+   */
+  async onPermissionRequested(agent: { id: string; parentAgentId: string | null }, request: PermissionRequestLike & { kind: string }): Promise<void> {
+    if (request.kind === "question") return this.onManagerQuestion(agent, request);
+    if (request.kind !== "tool") return;
+    const key = `${agent.id}/${request.id}`;
+    if (this.permissionsHandled.has(key)) return;
+    const owner = await this.permissionOwner(agent);
+    if (!owner) return;
+    this.permissionsHandled.add(key);
+    const policy = owner.run.playbook.permissions?.onRequest ?? DEFAULT_PERMISSION_POLICY;
+    const text = describePermission(request, `${owner.who} ${agent.id.slice(0, 8)}`);
+    const handle = this.api().agents.ref(agent.id);
+    try {
+      if (policy === "escalate") {
+        const opened = await this.store.mutate(owner.run.id, (run) => {
+          const gate = engine.openPermissionGate(run, { stepId: owner.stepId, agentId: agent.id, requestId: request.id, ...text }, nowIso());
+          if (gate) engine.noteEvent(run, "permission_escalated", owner.stepId, `${text.summary} (${policyText(policy)}) → gate ${gate.id}`, nowIso());
+          return gate;
+        });
+        if (opened) await this.tick();
+        return;
+      }
+      const allow = policy === "authorize";
+      await handle.respondToPermission({ requestId: request.id, response: allow ? { behavior: "allow" } : { behavior: "deny", message: DENY_MESSAGE } });
+      await this.store.mutate(owner.run.id, (run) => engine.noteEvent(run, allow ? "permission_authorized" : "permission_denied", owner.stepId, `${text.summary}: ${allow ? "allowed" : "denied"} by ${PERMISSION_POLICY_BY} (${policyText(policy)})`, nowIso()));
+    } catch (error) {
+      // Not answered: a later sweep tries again.
+      this.permissionsHandled.delete(key);
+      console.error(`[playbooks] could not handle the permission request ${request.id} of agent ${agent.id}:`, errorText(error));
+    }
+  }
+
+  /**
+   * The Playbook Manager of an active run has an AskUserQuestion-style question open: it opens a `manager_question` gate, so the human
+   * sees it in the panel and `list_gates` like any gate (ADR 2026-11-18-manager-questions-as-gates). Only the manager's own questions
+   * (not a step agent's or a subagent's), and not while the run has a gate step, ask or loop-limit gate held by a human: the manager is then asking that
+   * gate's question in chat (the gate already shows it).
+   */
+  private async onManagerQuestion(agent: { id: string; parentAgentId: string | null }, request: PermissionRequestLike & { kind: string }): Promise<void> {
+    const run = this.activeRunOfManager(agent.id);
+    if (!run || isPaused(run) || this.retiredManagers.has(agent.id)) return;
+    const key = `${agent.id}/${request.id}`;
+    if (this.permissionsHandled.has(key)) return;
+    const text = describeQuestion(request, `the Playbook Manager ${agent.id.slice(0, 8)}`);
+    if (!text) return;
+    if (run.gates.some((gate) => waitsForHuman(gate) && (gate.kind === "gate" || gate.kind === "ask" || gate.kind === "loop_limit"))) return;
+    this.permissionsHandled.add(key);
+    try {
+      const opened = await this.store.mutate(run.id, (current) => {
+        const gate = engine.openManagerQuestionGate(current, { agentId: agent.id, requestId: request.id, ...text }, nowIso());
+        if (gate) engine.noteEvent(current, "manager_question_opened", "manager", `${text.summary} → gate ${gate.id}`, nowIso());
+        return gate;
+      });
+      if (opened) await this.tick();
+    } catch (error) {
+      this.permissionsHandled.delete(key);
+      console.error(`[playbooks] could not open a gate for the manager's question ${request.id} of agent ${agent.id}:`, errorText(error));
+    }
+  }
+
+  /** The request was answered (by a human in the daemon, a canceled turn…): a gate still holding it closes. */
+  async onPermissionResolved(agentId: string, requestId: string | null, why = "the request was answered elsewhere"): Promise<void> {
+    for (const run of this.store.list()) {
+      if (!run.gates.some((gate) => (gate.kind === "permission" || gate.kind === "manager_question") && gate.status === "pending" && gate.permission?.agentId === agentId && (requestId === null || gate.permission.requestId === requestId))) continue;
+      await this.store.mutate(run.id, (current) => engine.dismissPermissionGates(current, agentId, requestId, why, nowIso()));
+    }
+  }
+
+  /** A permission gate was decided: the agent's request gets the answer; the run goes on. */
+  private async answerPermissionGate(runId: string, gate: Gate): Promise<void> {
+    const permission = gate.permission;
+    if (!permission) return;
+    if (gate.kind === "manager_question") {
+      // The first answer wins: if the manager's conversation answered meanwhile, the daemon refuses this one (logged) and nothing is delivered twice.
+      const answer = gate.question ? managerQuestionAnswer(gate.question, gate.status, gate.comment) : "";
+      await this.api()
+        .agents.ref(permission.agentId)
+        .respondToPermission({ requestId: permission.requestId, response: { behavior: "allow", updatedInput: { answers: { [gate.question?.text ?? ""]: answer } } } })
+        .catch((error: unknown) => console.error(`[playbooks] could not deliver the answer of gate ${gate.id} to the manager:`, errorText(error)));
+      await this.store.mutate(runId, (run) => engine.noteEvent(run, "manager_question_answered", "manager", `${gate.summary}: answered by ${gate.decidedBy ?? "a human"} (gate ${gate.id})`, nowIso()));
+      return;
+    }
+    const allow = gate.status === "allow";
+    const message = gate.comment?.trim() ? `The human denied this request: ${gate.comment.trim()}. Pick another way.` : "The human denied this request. Pick another way, with simple separate commands and the file tools for edits.";
+    await this.api()
+      .agents.ref(permission.agentId)
+      .respondToPermission({ requestId: permission.requestId, response: allow ? { behavior: "allow" } : { behavior: "deny", message } })
+      .catch((error: unknown) => console.error(`[playbooks] could not answer the permission request of gate ${gate.id}:`, errorText(error)));
+    await this.store.mutate(runId, (run) => engine.noteEvent(run, allow ? "permission_authorized" : "permission_denied", gate.stepId, `${gate.summary}: ${allow ? "allowed" : "denied"} by ${gate.decidedBy ?? "a human"} (gate ${gate.id})`, nowIso()));
+  }
+
+  /**
+   * After a restart, and while a permission gate is open: requests raised while the plugin was away are handled, and a gate whose
+   * request is gone (the agent was canceled, its session reloaded, someone answered in the daemon) is closed.
+   */
+  private async sweepPermissions(scanAgents: boolean): Promise<void> {
+    const runs = this.store.list().filter((run) => isActive(run));
+    if (scanAgents && runs.length > 0) {
+      const listed = await this.api().agents.list({ filter: { projectKeys: [...new Set(runs.map((run) => run.projectId))] } });
+      for (const entry of listed.entries) {
+        const snapshot = entry.agent as { id: string; parentAgentId?: string | null; archivedAt?: string | null; pendingPermissions?: Array<PermissionRequestLike & { kind: string }> };
+        if (snapshot.archivedAt) continue;
+        for (const request of snapshot.pendingPermissions ?? []) await this.onPermissionRequested({ id: snapshot.id, parentAgentId: snapshot.parentAgentId ?? null }, request);
+      }
+    }
+    for (const run of this.store.list()) {
+      for (const gate of run.gates) {
+        if ((gate.kind !== "permission" && gate.kind !== "manager_question") || gate.status !== "pending" || !gate.permission) continue;
+        const current = await this.api().agents.ref(gate.permission.agentId).refresh().catch(() => null);
+        const still = !current || current.agent.archivedAt ? false : (current.agent.pendingPermissions ?? []).some((request) => request.id === gate.permission!.requestId);
+        if (!still) await this.onPermissionResolved(gate.permission.agentId, gate.permission.requestId, "the request no longer exists");
+      }
+    }
+  }
+
   /** Open gates and asks across the runs (see overseer.ts). */
   attention(filter: GateFilter = {}) {
     return listAttention(this.store.list(), Date.now(), filter);
@@ -720,14 +1062,359 @@ export class Runtime {
     if (this.eventsScanning) return;
     this.eventsScanning = true;
     try {
+      await this.deferralPass(now).catch((error) => console.error("[playbooks] deferral pass failed:", errorText(error)));
       await this.producer.scan(this.store.list(), now);
       await this.bus.flush(now);
+      await this.watchManagers(now).catch((error) => console.error("[playbooks] manager watch failed:", errorText(error)));
+      await this.wardenPass(now).catch((error) => console.error("[playbooks] warden pass failed:", errorText(error)));
+      await this.wardenPrPass(now).catch((error) => console.error("[playbooks] warden PR pass failed:", errorText(error)));
+      if (this.store.list().some((run) => run.gates.some((gate) => (gate.kind === "permission" || gate.kind === "manager_question") && gate.status === "pending"))) await this.sweepPermissions(false);
       // Fan-out children end in other runs: the scan is what notices them (no tokens, no agent).
       if (this.store.list().some((run) => isActive(run) && Object.values(run.steps).some((state) => state.fanout && state.status === "running"))) await this.tick();
     } finally {
       this.eventsScanning = false;
     }
   }
+
+  private managerWatchAt = 0;
+  private wardenAt = 0;
+  /** When the warden last looked at each run (memory only: a restart looks again, and the persisted findings stop a storm). */
+  private readonly wardenSeen = new Map<string, number>();
+
+  /**
+   * The warden (ADR 2026-11-18-warden): at most every WARDEN_CHECK_MS, from the event scan, the runs whose `warden.enabled`
+   * is true and whose own `interval` passed get one deterministic pass (at most WARDEN_MAX_RUNS_PER_PASS, the longest
+   * waiting first). A run with the warden off is never touched: with no `warden` block nothing here does any work.
+   * Deterministic: no LLM, no message to an agent. One check failing does not stop the others or the next run.
+   */
+  private async wardenPass(now: number): Promise<void> {
+    if (now - this.wardenAt < WARDEN_CHECK_MS) return;
+    const due = this.store
+      .list()
+      .filter((run) => run.playbook.warden.enabled && isActive(run) && !run.archivedAt)
+      .filter((run) => now - (this.wardenSeen.get(run.id) ?? 0) >= run.playbook.warden.intervalMs)
+      .sort((a, b) => (this.wardenSeen.get(a.id) ?? 0) - (this.wardenSeen.get(b.id) ?? 0))
+      .slice(0, WARDEN_MAX_RUNS_PER_PASS);
+    if (due.length === 0) return;
+    this.wardenAt = now;
+    const iso = new Date(now).toISOString();
+    const origins = new Map<string, Promise<string | null>>();
+    const managers = new Map<string, Promise<"running" | "idle" | "gone">>();
+    const io: WardenIo = {
+      originSha: (run) => {
+        const wt = run.worktree;
+        if (!wt || wt.state === "removed" || !wt.base.startsWith("origin/")) return Promise.resolve(null);
+        const key = `${run.workspaceDir}|${wt.base}`;
+        if (!origins.has(key)) origins.set(key, this.wardenOriginSha(run, wt));
+        return origins.get(key)!;
+      },
+      manager: async (run) => {
+        if (isManagerless(run) || isPipeline(run) || !run.managerAgentId) return null;
+        const id = run.managerAgentId;
+        if (!managers.has(id)) managers.set(id, this.wardenManagerState(id));
+        return managers.get(id)!;
+      },
+      managerQuota: async (run) => (run.managerAgentId ? this.wardenManagerQuota(run.managerAgentId) : false),
+    };
+    let slowIndex: SlowIndex | null = null;
+    const notices = new Map<string, Array<{ runId: string; playbook: string; runName: string | null; findings: WardenFinding[] }>>();
+    for (const listed of due) {
+      this.wardenSeen.set(listed.id, now);
+      try {
+        const config = listed.playbook.warden;
+        // Closed hours (ADR 2026-11-23-closed-hours-shared) pause the time thresholds: the run's own resolved schedule.
+        const closed = this.limitsOf(listed).quota.closedHours ?? null;
+        const found: Candidate[] = [];
+        const guarded = async (name: string, check: () => Promise<Candidate[]> | Candidate[]) => {
+          try {
+            found.push(...(await check()));
+          } catch (error) {
+            console.error(`[playbooks] warden check ${name} failed on ${listed.id}:`, errorText(error));
+          }
+        };
+        const { staleDefinition, managerBlocked, loops, slow, gateOpen, stalled, held } = config.checks;
+        if (staleDefinition.action !== "none") await guarded("stale_definition", async () => staleDefinitionCandidate(listed, await io.originSha(listed), staleDefinition.afterMs, now, staleDefinition.action as Act, closed));
+        if (managerBlocked.action !== "none") await guarded("manager_blocked", async () => managerBlockedCandidates(listed, await io.manager(listed), managerBlocked.action as Act));
+        if (loops.action !== "none") await guarded("loops", () => loopCandidates(listed, loops.above, loops.action as Act));
+        if (slow.action !== "none") await guarded("slow", () => slowCandidates(listed, (slowIndex ??= new SlowIndex(this.store.list())).of(listed, now), slow.action as Act, now, closed));
+        if (gateOpen.action !== "none") await guarded("gate_open", () => gateOpenCandidates(listed, gateOpen.afterMs, now, gateOpen.action as Act, closed));
+        if (stalled.action !== "none") {
+          await guarded("stalled", async () => {
+            const info = stalledInfo(listed);
+            if (!info || now - info.idleSince < stalled.afterMs) return [];
+            const manager = await io.manager(listed);
+            return stalledCandidates(listed, info, stalled.afterMs, now, manager, manager === null || manager === "running" ? false : await io.managerQuota(listed), stalled.action as Act, closed);
+          });
+        }
+        if (held.action !== "none") await guarded("held", () => heldCandidates(listed, this.store.list(), held.afterMs, now, held.action as Act, closed));
+        // The state is written before any effect: a crash or a failed effect never repeats a report.
+        const reported = await this.store.mutate(listed.id, (run) => {
+          const { next, report } = diffFindings(run.warden.findings, found, iso, config.cooldownMs);
+          const before = JSON.stringify(run.warden.findings);
+          run.warden.findings = next;
+          if (JSON.stringify(next) !== before) engine.noteEvent(run, "warden", null, `${report.length} finding(s) reported, ${Object.keys(next).length} open`, iso);
+          for (const entry of report) if (entry.fresh && entry.candidate.action === "refresh_scripts") entry.finding.acted = "refresh_scripts";
+          return report;
+        });
+        for (const { finding, candidate, fresh } of reported) {
+          // slow, gate_open: step.slow and gate.stale already announce them; the finding only joins the panel and the summary.
+          if (finding.check !== "slow" && finding.check !== "gate_open") {
+            await this.bus.emit("warden.finding", { ...runFieldsOf(listed), check: finding.check, subject: finding.subject, detail: finding.detail, since: finding.since }, { runId: listed.id, source: "runs" }).catch((error: unknown) => console.error("[playbooks] could not emit warden.finding:", errorText(error)));
+          }
+          if (fresh && candidate.action === "refresh_scripts") {
+            await this.refreshScripts(listed.id, `the warden found: ${finding.detail}`, "warden").catch((error: unknown) => console.error(`[playbooks] warden refresh_scripts of ${listed.id} failed:`, errorText(error)));
+          }
+        }
+        if (reported.length > 0) {
+          const list = notices.get(listed.projectId) ?? [];
+          list.push({ runId: listed.id, playbook: listed.playbook.id, runName: listed.name ?? null, findings: reported.map((entry) => entry.finding) });
+          notices.set(listed.projectId, list);
+        }
+      } catch (error) {
+        console.error(`[playbooks] warden pass on ${listed.id} failed:`, errorText(error));
+      }
+    }
+    for (const [projectId, items] of notices) await this.wardenTellSidekick(projectId, wardenSummary(items)).catch((error: unknown) => console.error("[playbooks] warden summary failed:", errorText(error)));
+  }
+
+  private wardenPrAt = 0;
+  private readonly wardenPrSeen = new Map<string, number>();
+  private wardenPrStore: WardenPrStore | null = null;
+
+  /**
+   * The warden's PR checks (ADR 2026-11-20-warden-pr-checks): per project that has a Sidekick, whose `defaults/main.yaml` sets
+   * `warden.enabled` and a `warden.pr_checks` check, every `interval` one read of the open PRs (`gh`) and the configured checks.
+   * Nothing is read, run or written for a project without that configuration. Findings are kept per project (a file, so a
+   * restart does not repeat them), deduplicated like the run findings, and sent to the Sidekick in one message; it only proposes.
+   */
+  private async wardenPrPass(now: number): Promise<void> {
+    if (now - this.wardenPrAt < WARDEN_CHECK_MS) return;
+    this.wardenPrAt = now;
+    const registry = await this.sidekickRegistry.all();
+    const store = (this.wardenPrStore ??= new WardenPrStore(path.join(this.options.dataDir ?? path.dirname(this.store.dir), "warden-prs.json")));
+    for (const [projectId, record] of Object.entries(registry)) {
+      try {
+        if (now - (this.wardenPrSeen.get(projectId) ?? 0) < 60_000) continue;
+        const project = await this.projectOf(record.workspaceId).catch(() => null);
+        const setting = project ? await wardenPrSetting(project.root) : null;
+        if (!project || !setting || now - (this.wardenPrSeen.get(projectId) ?? 0) < setting.intervalMs) continue;
+        this.wardenPrSeen.set(projectId, now);
+        const runs = this.store.list().filter((run) => run.projectId === projectId && !run.archivedAt);
+        const { prs, failedRepos, rulesets } = await this.wardenPrRead(project.root, setting.checks, runs, projectId);
+        const candidates = prCandidates(prs, runs, setting.checks, now, rulesets, setting.closedHours !== undefined ? setting.closedHours : (await this.userQuotaLayer()).quota?.closedHours ?? null);
+        const iso = new Date(now).toISOString();
+        const existing = await store.read(projectId);
+        const { next, report } = diffFindings(existing, candidates, iso, setting.cooldownMs);
+        // A repository that could not be read keeps what was found there: its findings are neither cleared nor repeated.
+        for (const [key, finding] of Object.entries(existing)) if (failedRepos.some((repo) => finding.subject?.startsWith(`${repo}#`))) next[key] = finding;
+        // The state is written before the message: a failed send never repeats a report.
+        await store.write(projectId, next);
+        if (report.length > 0) await this.wardenTellSidekick(projectId, wardenPrSummary(report.map((entry) => entry.finding)));
+      } catch (error) {
+        console.error(`[playbooks] warden PR pass on project ${projectId} failed:`, errorText(error));
+      }
+    }
+  }
+
+  /**
+   * What the PR checks read from GitHub (`gh`): the open PRs of each repository to scan (the project root's repository unless
+   * `repos` is set; `repos.names` plus, with `from_runs`, the repositories of the project's runs' PR URLs), and the required
+   * checks of each base branch's ruleset when `required_checks.from_ruleset` is set. With `repos`, a repository that fails is
+   * logged and skipped (`failedRepos`); so is a ruleset that cannot be read (that branch then has its static names only).
+   * Nothing is read when only `failed_run` is configured.
+   */
+  private async wardenPrRead(root: string, config: WardenPrConfig, runs: Run[], projectId: string): Promise<{ prs: OpenPr[]; failedRepos: string[]; rulesets: Map<string, string[]> }> {
+    const prs: OpenPr[] = [];
+    const failedRepos: string[] = [];
+    const rulesets = new Map<string, string[]>();
+    const { fixStep: _fix, reviewBot: _bot, failedRuns: _failed, repos, ...checks } = config;
+    if (!Object.values(checks).some((value) => value !== null)) return { prs, failedRepos, rulesets };
+    const list = this.options.listOpenPrs ?? listOpenPrs;
+    if (!repos) prs.push(...(await list(root, null)));
+    else {
+      const names = [...new Set([...repos.names, ...(repos.fromRuns ? runs.flatMap(reposOfRun) : [])])];
+      for (const repo of names) {
+        try {
+          prs.push(...(await list(root, repo)));
+        } catch (error) {
+          failedRepos.push(repo);
+          console.error(`[playbooks] warden PR checks (project ${projectId}): skipped repository ${repo}: ${errorText(error)}`);
+        }
+      }
+    }
+    if (config.requiredChecks?.fromRuleset) {
+      const read = this.options.rulesetChecks ?? rulesetChecks;
+      for (const pr of prs) {
+        const key = rulesetKey(pr.repo, pr.baseRefName);
+        if (!pr.repo || !pr.baseRefName || rulesets.has(key)) continue;
+        rulesets.set(key, []);
+        try {
+          rulesets.set(key, await read(pr.repo, pr.baseRefName));
+        } catch (error) {
+          console.error(`[playbooks] warden PR checks (project ${projectId}): required checks of ${pr.repo}@${pr.baseRefName} not read, using the configured names only: ${errorText(error)}`);
+        }
+      }
+    }
+    return { prs, failedRepos, rulesets };
+  }
+
+  /** The commit origin/<base> is at after a fetch; null when it cannot be read (offline, no such ref). */
+  private async wardenOriginSha(run: Run, wt: RunWorktree): Promise<string | null> {
+    const repo = await this.repoOf(run, wt);
+    const fresh = await freshRefInfo(repo, wt.base.slice("origin/".length));
+    if (fresh.fetchError || fresh.ref !== wt.base) return null;
+    return await resolveCommit(repo, fresh.ref);
+  }
+
+  private async wardenManagerState(id: string): Promise<"running" | "idle" | "gone"> {
+    if (this.retiredManagers.has(id)) return "gone";
+    const agent = (await this.api().agents.ref(id).refresh().catch(() => null))?.agent;
+    if (!agent || agent.archivedAt || agent.status === "closed" || agent.status === "error") return "gone";
+    return agent.status === "running" || agent.status === "initializing" || agent.activeTurn || this.busyManagers.has(id) ? "running" : "idle";
+  }
+
+  /** Whether the manager's last turn ended on its provider's out-of-tokens notice (it is stopped until the quota returns). */
+  private async wardenManagerQuota(id: string): Promise<boolean> {
+    const page = await this.api().agents.ref(id).timeline.refetch({ direction: "tail", limit: 30 }).catch(() => null);
+    if (!page) return false;
+    const entries = page.entries as never;
+    return isQuotaError(failureText(entries)) || isQuotaMessage(lastAssistantText(entries));
+  }
+
+  /** One summary to the project's Sidekick, when there is one: sent now when it is idle, else held until its turn ends. */
+  private async wardenTellSidekick(projectId: string, text: string): Promise<void> {
+    const record = await this.sidekickRegistry.read(projectId);
+    if (!record) return;
+    const sidekick = await this.api().agents.ref(record.agentId).refresh().catch(() => null);
+    if (!sidekick || sidekick.agent.archivedAt) return;
+    if (sidekick.agent.status === "idle" && !this.busyManagers.has(record.agentId)) await this.api().agents.ref(record.agentId).send(text);
+    else this.sidekickHeld.set(record.agentId, [...(this.sidekickHeld.get(record.agentId) ?? []), text]);
+  }
+
+  /**
+   * The manager watchdog (manager.nudge; ADR 2026-11-18-manager-waiting-watchdog), looked at every MANAGER_WATCH_CHECK_MS
+   * from the event scan: for each active, unpaused run with a manager,
+   * - a question or permission request open on the manager for `after` is announced once (`manager.question_pending`);
+   * - a reported step that waited `after` (then 2x, 4x ..., capped at `max_interval`) prompts the manager, only when it is
+   *   idle with no open question and no open gate held by a human or a role; the second prompt without progress emits
+   *   `step.waiting_manager_stuck` (once per report).
+   * The state (prompts sent, when) is in the run (`managerWatch`), so a restart neither forgets nor repeats it.
+   */
+  private async watchManagers(now: number): Promise<void> {
+    if (now - this.managerWatchAt < MANAGER_WATCH_CHECK_MS) return;
+    const runs = this.store.list().filter((run) => isActive(run) && !run.archivedAt && !isPaused(run) && !isPipeline(run) && !isManagerless(run) && run.managerAgentId);
+    if (runs.length === 0) return;
+    this.managerWatchAt = now;
+    const iso = new Date(now).toISOString();
+    const snapshots = new Map<string, { status: string; activeTurn: unknown; pendingPermissions?: Array<PermissionRequestLike & { kind: string }> } | null>();
+    for (const listed of runs) {
+      const runId = listed.id;
+      const managerId = listed.managerAgentId;
+      const policy = listed.playbook.managerNudge;
+      const reportedOf = (run: Run) =>
+        Object.entries(run.steps)
+          .filter(([id, state]) => state.status === "reported" && isStepLive(run, id) && state.attempts.at(-1)?.endedAt)
+          .map(([id, state]) => ({ stepId: id, attempt: state.attempts.at(-1)! }));
+      // Progress (a step moved or reported again) or a watchdog turned off: forget what was counted.
+      const stale = (run: Run) => {
+        const live = policy.enabled ? reportedOf(run) : [];
+        return Object.entries(run.managerWatch.steps).filter(([id, w]) => live.find((entry) => entry.stepId === id)?.attempt.endedAt !== w.reportedAt).map(([id]) => id);
+      };
+      if (stale(listed).length > 0 || (!policy.enabled && listed.managerWatch.question)) {
+        await this.store.mutate(runId, (run) => {
+          for (const id of stale(run)) delete run.managerWatch.steps[id];
+          if (!policy.enabled) run.managerWatch.question = null;
+        });
+      }
+      if (!policy.enabled || this.retiredManagers.has(managerId) || listed.managerQuotaBlockedId === managerId) continue;
+      if (!snapshots.has(managerId)) {
+        const current = await this.api().agents.ref(managerId).refresh().catch(() => null);
+        snapshots.set(managerId, current && !current.agent.archivedAt ? (current.agent as never) : null);
+      }
+      const manager = snapshots.get(managerId);
+      if (!manager) continue; // gone: the lost-manager logic handles it
+      const pending = manager.pendingPermissions ?? [];
+      const question = this.store.get(runId)!.managerWatch.question;
+      if (pending.length === 0) {
+        if (question) await this.store.mutate(runId, (run) => void (run.managerWatch.question = null));
+      } else {
+        if (!question) await this.store.mutate(runId, (run) => void (run.managerWatch.question ??= { since: iso, emitted: false }));
+        const since = Date.parse((question ?? { since: iso }).since);
+        if (now - since >= policy.afterMs) {
+          const marked = await this.store.mutate(runId, (run) => {
+            if (!run.managerWatch.question || run.managerWatch.question.emitted) return false;
+            run.managerWatch.question.emitted = true;
+            return true;
+          });
+          if (marked) {
+            const text = describePermission(pending[0]!, "the manager").summary;
+            await this.bus.emit("manager.question_pending", { ...runFieldsOf(listed), managerAgentId: managerId, pendingMs: now - since, question: text }, { runId, source: "runs" });
+          }
+        }
+        continue; // blocked on someone else: a prompt cannot help
+      }
+      if (manager.status === "running" || manager.status === "initializing" || manager.activeTurn || this.busyManagers.has(managerId)) continue;
+      const current = this.store.get(runId)!;
+      if (current.inbox.length > 0 || blockedOnGate(current)) continue;
+      const due = reportedOf(current)
+        .map(({ stepId, attempt }) => {
+          const w = current.managerWatch.steps[stepId];
+          const same = w?.reportedAt === attempt.endedAt;
+          const count = same ? w.count : 0;
+          const from = Date.parse(same && w.lastAt ? w.lastAt : attempt.endedAt!);
+          return { stepId, attempt, count, due: nudgeDue(policy, count, from, now) };
+        })
+        .filter((entry) => entry.due);
+      if (due.length === 0 || this.nudging.has(runId)) continue;
+      this.nudging.add(runId);
+      try {
+        const sent = await this.store.mutate(runId, (run) => {
+          if (isPaused(run)) return [];
+          const out: Array<{ stepId: string; attempt: number; outcome: string; summary: string; waitedMin: number; waitedMs: number; count: number; stuck: boolean }> = [];
+          for (const entry of due) {
+            const state = run.steps[entry.stepId];
+            const live = state?.attempts.at(-1);
+            const endedAt = live?.endedAt;
+            if (state?.status !== "reported" || !live || !endedAt || endedAt !== entry.attempt.endedAt) continue;
+            const w = run.managerWatch.steps[entry.stepId];
+            const mine = w?.reportedAt === endedAt ? w : { reportedAt: endedAt, count: 0, lastAt: null as string | null, stuckEmitted: false };
+            // A second look at the same count (another path nudged meanwhile) must not send again.
+            if (mine.count !== entry.count) continue;
+            mine.count += 1;
+            mine.lastAt = iso;
+            const stuck = mine.count >= STUCK_AFTER_NUDGES && !mine.stuckEmitted;
+            if (stuck) mine.stuckEmitted = true;
+            run.managerWatch.steps[entry.stepId] = mine;
+            const waitedMs = Math.max(0, now - Date.parse(endedAt));
+            out.push({ stepId: entry.stepId, attempt: live.n, outcome: live.report?.outcome ?? live.turnEnd ?? "none", summary: live.report?.summary ?? live.lastMessage ?? "", waitedMin: Math.round(waitedMs / 60_000), waitedMs, count: mine.count, stuck });
+          }
+          return out;
+        });
+        if (sent.length === 0) continue;
+        this.busyManagers.add(managerId);
+        try {
+          await this.managerOperation(runId, async () => {
+            const live = this.store.get(runId)!;
+            if (live.managerAgentId !== managerId || live.managerQuotaBlockedId === managerId) return;
+            await this.api().agents.ref(managerId).send(managerWaitingNudge(runId, sent), { activeTurnBehavior: "steer" });
+          });
+          this.wokenManagers.add(managerId);
+        } catch (error) {
+          this.busyManagers.delete(managerId);
+          console.error(`[playbooks] could not prompt manager of ${runId} about its reported steps:`, errorText(error));
+          continue;
+        }
+        for (const entry of sent.filter((item) => item.stuck)) {
+          await this.bus.emit("step.waiting_manager_stuck", { ...runFieldsOf(current), stepId: entry.stepId, attempt: entry.attempt, outcome: entry.outcome, summary: entry.summary.slice(0, 500), waitingMs: entry.waitedMs, nudges: entry.count, managerAgentId: managerId }, { runId, source: "runs" });
+        }
+      } finally {
+        this.nudging.delete(runId);
+      }
+    }
+  }
+
+  /** Run ids with a watchdog prompt in flight: a run never gets two at once. */
+  private readonly nudging = new Set<string>();
 
   /** A page of any agent's timeline, newest first when no cursor is given, else the entries before it. */
   async readTimeline(agentId: string, options: { limit: number; before?: { epoch: string; seq: number } }) {
@@ -761,6 +1448,7 @@ export class Runtime {
     const run = runId ? this.store.get(runId) : this.activeRunOfManager(managerId) ?? this.runsOfManager(managerId)[0];
     if (!run) throw new UserError(runId ? `unknown run "${runId}"` : "you have no run; call start_playbook first");
     if (isManagerless(run)) throw new UserError(`run ${run.id} has no Playbook Manager (manager.mode: none): the plugin starts its steps, applies the reports, opens the gates and stops the run on a failure by itself. Nothing to start, complete, nudge or request; a human decides its gates in the panel`);
+    if (this.recoveringManagers.has(managerId)) throw new UserError("manager recovery is in progress; retry after ownership is settled");
     if (run.managerAgentId !== managerId) throw new UserError(`run ${run.id} belongs to another manager`);
     return run;
   }
@@ -779,26 +1467,29 @@ export class Runtime {
 
   /** Sends queued wake-ups to the manager when it is idle, merged into one prompt. A paused run keeps them until resume. */
   async deliver(runId: string): Promise<void> {
+    return this.managerOperation(runId, () => this.deliverManager(runId));
+  }
+
+  private async deliverManager(runId: string): Promise<void> {
     const run = this.store.get(runId);
     // A pipeline has no manager: nothing to wake.
-    if (!run || !run.managerAgentId || isManagerless(run) || run.inbox.length === 0 || isPaused(run) || this.busyManagers.has(run.managerAgentId)) return;
+    if (!run || !run.managerAgentId || isManagerless(run) || (run.inbox.length === 0 && !run.managerRecoveryPrompt) || run.managerQuotaBlockedId === run.managerAgentId || isPaused(run) || this.busyManagers.has(run.managerAgentId)) return;
     if (this.retiredManagers.has(run.managerAgentId)) return;
-    const text = await this.store.mutate(runId, (current) => {
-      const merged = current.inbox.join("\n\n");
-      current.inbox = [];
-      return merged;
-    });
+    const inbox = [...run.inbox];
+    const takeover = run.managerRecoveryPrompt;
+    const text = [takeover, ...inbox].filter(Boolean).join("\n\n");
     if (!text) return;
     try {
       this.busyManagers.add(run.managerAgentId);
       await this.api().agents.ref(run.managerAgentId).send(text, { activeTurnBehavior: "steer" });
       this.wokenManagers.add(run.managerAgentId);
+      await this.store.mutate(runId, (current) => {
+        if (current.managerRecoveryPrompt === takeover) current.managerRecoveryPrompt = null;
+        if (inbox.every((line, index) => current.inbox[index] === line)) current.inbox.splice(0, inbox.length);
+      });
     } catch (error) {
       this.busyManagers.delete(run.managerAgentId);
       console.error(`[playbooks] could not wake manager of ${runId}:`, errorText(error));
-      await this.store.mutate(runId, (current) => {
-        current.inbox.unshift(text);
-      });
     }
   }
 
@@ -852,8 +1543,12 @@ export class Runtime {
         const used = current?.agent.lastUsage?.contextWindowUsedTokens ?? 0;
         if (used <= policy.above_tokens) return;
       }
-      this.busyManagers.add(agentId);
-      await this.api().agents.ref(agentId).send("/compact");
+      await this.managerOperation(runs[0]!.id, async () => {
+        const live = this.store.get(runs[0]!.id)!;
+        if (live.managerAgentId !== agentId || live.managerQuotaBlockedId === agentId) return;
+        this.busyManagers.add(agentId);
+        await this.api().agents.ref(agentId).send("/compact");
+      });
     } catch (error) {
       this.busyManagers.delete(agentId);
       console.error(`[playbooks] could not compact manager ${agentId}:`, errorText(error));
@@ -936,7 +1631,7 @@ export class Runtime {
     const agent = await this.api()
       .workspaces.ref(run.workspaceId)
       .agents.create({
-        config: { ...config, systemPrompt: gateDeciderSystemPrompt(run.playbook, gate, role, choices, run) },
+        config: withCodexQuestionGuidance({ ...config, systemPrompt: gateDeciderSystemPrompt(run.playbook, gate, role, choices, run) }),
         ...(run.managerAgentId ? { parent: run.managerAgentId } : {}),
         title: `${run.playbook.title} · ${role.title} · ${gate.id}`,
         labels: { [RUN_LABEL]: run.id, [GATE_LABEL]: gate.id },
@@ -1048,7 +1743,7 @@ export class Runtime {
     manager: { id: string; workspaceId: string | null; cwd: string },
     playbookId: string,
     inputs: Record<string, unknown>,
-    options: { playbook?: Playbook; name?: string; hold?: boolean } = {},
+    options: { playbook?: Playbook; name?: string; hold?: boolean; priority?: number; quotaExempt?: boolean } = {},
   ): Promise<Run> {
     if (!manager.workspaceId) throw new UserError("this agent has no workspace");
     const workspace = await this.lookupWorkspace(manager.workspaceId);
@@ -1090,6 +1785,11 @@ export class Runtime {
         ...(chosen ? { definition: chosen.definition } : {}),
         name: runName(options.name),
         ...(reservation?.parent ? { parent: reservation.parent } : {}),
+        ...((options.priority ?? reservation?.priority) !== undefined ? { priority: (options.priority ?? reservation?.priority)! } : {}),
+        ...this.inheritedPriority(reservation?.parent),
+        ...this.inheritedExemptFlag(reservation?.parent),
+        // Exempt when asked (start_playbook, or the reservation the caller made), or when the parent run is (children inherit).
+        ...((options.quotaExempt ?? reservation?.quotaExempt) || this.parentExempt(reservation?.parent) ? { quotaExempt: true } : {}),
         inputs,
         now: nowIso(),
       });
@@ -1103,6 +1803,10 @@ export class Runtime {
       this.creatingWorktrees.delete(runId);
     }
     if (reservation) this.dropReservation(workspace.id, reservation);
+    if (run.definition?.warning) {
+      await this.store.mutate(run.id, (current) => engine.noteEvent(current, "definition_fallback", null, current.definition?.warning ?? "", nowIso()));
+      await this.announceDefinitionFallback(run.id, "start");
+    }
     await this.admitQueued(run.id);
     return this.store.get(run.id)!;
   }
@@ -1156,12 +1860,12 @@ export class Runtime {
     const wt = run.worktree;
     if (!wt) return null;
     const workspaceSnapshot = await checkoutSnapshot(workspaceDir);
-    if (wt.state !== "removed" && existsSync(wt.path)) return { ...wt, state: "active", workspaceSnapshot };
+    if (wt.state !== "removed" && existsSync(wt.path)) return { ...wt, state: "active", keptFor: null, workspaceSnapshot };
     this.creatingWorktrees.add(run.id);
     try {
       const created = await createWorktree({ workspaceDir, worktreesDir: this.worktreesDir, runId: run.id, branch: wt.branch, isolation: run.playbook.isolation, reuseBranch: true });
       const { fetchError: _fetchError, ...recreated } = created;
-      return { ...recreated, base: wt.base, baseSha: wt.baseSha, state: "active" };
+      return { ...recreated, base: wt.base, baseSha: wt.baseSha, state: "active", keptFor: null };
     } catch (error) {
       throw new UserError(`could not recreate the run's worktree: ${errorText(error)}`);
     } finally {
@@ -1180,15 +1884,28 @@ export class Runtime {
    * when the worktree has uncommitted changes, or when the original checkout changed during the run.
    */
   private async cleanupEndedWorktrees(): Promise<void> {
+    let pressure: boolean | null = null;
+    const underPressure = async () => (pressure ??= (await (this.options.diskUsedFraction ?? diskUsedFraction)(this.worktreesDir)) >= DISK_PRESSURE);
     for (const candidate of this.store.list()) {
       const wt = candidate.worktree;
-      if (!wt || wt.state !== "active" || !isTerminal(candidate.status) || isActive(candidate)) continue;
+      if (!wt || !isTerminal(candidate.status) || isActive(candidate)) continue;
+      // A worktree kept for a failure is looked at again: it goes once the retention window has passed or the disk is under pressure. Any other kept one stays.
+      if (wt.state === "kept" && wt.keptFor !== "failed") continue;
+      if (wt.state === "removed") continue;
+      if (!this.cleanupBackoff.ready(candidate.id)) continue;
+      const retained = candidate.status === "failed" && candidate.playbook.workspace.keepFailed;
+      if (wt.state === "kept" && !this.failedRetentionOver(candidate) && !(await underPressure())) continue;
       try {
         if (await this.runAgentsBusy(candidate)) continue;
-        const keep = await this.worktreeKeepReason(candidate, wt);
+        // Another active run still works in this very worktree: it is not ours to delete.
+        if (this.store.list().some((other) => other.id !== candidate.id && isActive(other) && other.worktree && other.worktree.state !== "removed" && other.worktree.path === wt.path)) continue;
+        const expired = retained && (this.failedRetentionOver(candidate) || (await underPressure()));
+        const keep = await this.worktreeKeepReason(candidate, wt, expired);
         if (keep) {
+          if (keep.purgeScratch) await purgeScratch(this.worktreesDir, wt.path).catch((error) => console.error(`[playbooks] could not purge the scratch directories of ${candidate.id}:`, errorText(error)));
+          if (wt.state === "kept" && (wt.keptFor ?? null) === (keep.keptFor ?? null)) continue;
           await this.store.mutate(candidate.id, (run) => {
-            run.worktree = { ...wt, state: "kept" };
+            run.worktree = { ...wt, state: "kept", keptFor: keep.keptFor ?? null };
             engine.noteEvent(run, "worktree_kept", null, `worktree ${wt.path} kept: ${keep.reason}`, nowIso());
             if (keep.violation) engine.noteEvent(run, "isolation_violation", null, keep.violation, nowIso());
           });
@@ -1204,25 +1921,53 @@ export class Runtime {
           continue;
         }
         const removed = await this.dropWorktree(candidate.id, wt, await this.repoOf(candidate, wt), false);
+        this.cleanupBackoff.clear(candidate.id);
+        await this.dropRunScripts(candidate.id);
         await this.store.mutate(candidate.id, (run) => {
           run.worktree = { ...wt, state: "removed" };
+          run.scripts = null;
           engine.noteEvent(run, "worktree_removed", null, `worktree ${wt.path} removed${removed.keptBranch ? `; branch ${removed.keptBranch} kept: it has commits that are not pushed` : `; branch ${wt.branch} deleted`}`, nowIso());
         });
       } catch (error) {
-        console.error(`[playbooks] could not clean up the worktree of ${candidate.id}:`, errorText(error));
+        await this.noteCleanupFailure(candidate.id, wt, error);
       }
     }
   }
 
-  private async worktreeKeepReason(run: Run, wt: RunWorktree): Promise<{ reason: string; violation?: string } | null> {
-    if (run.status === "failed" && run.playbook.workspace.keepFailed) return { reason: "the run failed and workspace.keep_failed is true" };
+  /** Waits (growing) between the tries to remove an ended run's worktree; after the last one the worktree is kept, marked "cleanup failed". */
+  private readonly cleanupBackoff = new Backoff([60_000, 300_000, 900_000]);
+
+  private async noteCleanupFailure(runId: string, wt: RunWorktree, error: unknown): Promise<void> {
+    const reason = await describeRemovalError(error);
+    const { attempt, waitMs } = this.cleanupBackoff.fail(runId);
+    if (waitMs !== null) {
+      console.error(`[playbooks] could not clean up the worktree of ${runId} (attempt ${attempt}); retrying in ${Math.round(waitMs / 60_000)} min: ${reason}`);
+      return;
+    }
+    console.error(`[playbooks] could not clean up the worktree of ${runId} after ${attempt} attempts, giving up (the worktree is kept): ${reason}`);
+    await this.store
+      .mutate(runId, (run) => {
+        run.worktree = { ...wt, state: "kept" };
+        engine.noteEvent(run, "worktree_kept", null, `cleanup failed: ${reason}; worktree ${wt.path} kept, remove it by hand`, nowIso());
+      })
+      .catch((failure) => console.error(`[playbooks] could not record the failed cleanup of ${runId}:`, errorText(failure)));
+  }
+
+  /** Whether a failed run ended long enough ago that its worktree is no longer worth keeping. */
+  private failedRetentionOver(run: Run): boolean {
+    const ended = [...run.history].reverse().find((event) => event.type === "run_failed")?.at ?? run.updatedAt;
+    return Date.now() - Date.parse(ended) >= (this.options.failedRetentionMs ?? FAILED_RETENTION_MS);
+  }
+
+  private async worktreeKeepReason(run: Run, wt: RunWorktree, expired = false): Promise<{ reason: string; violation?: string; keptFor?: "failed"; purgeScratch?: boolean } | null> {
+    if (run.status === "failed" && run.playbook.workspace.keepFailed && !expired) return { reason: `the run failed and workspace.keep_failed is true (removed ${Math.round((this.options.failedRetentionMs ?? FAILED_RETENTION_MS) / 3_600_000)}h after the failure, or earlier when the disk is under pressure)`, keptFor: "failed" };
     if (wt.workspaceSnapshot) {
-      const violation = snapshotDiff(wt.workspaceSnapshot, await checkoutSnapshot(run.workspaceDir));
+      const violation = await checkoutViolationSince(run.workspaceDir, wt.workspaceSnapshot);
       if (violation) return { reason: "the original workspace checkout changed during the run", violation };
     }
     if (existsSync(wt.path)) {
       const dirty = await dirtyPaths(wt.path, wt.linked);
-      if (dirty.length > 0) return { reason: `it has uncommitted changes (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? ", …" : ""}); remove it by hand once they are saved` };
+      if (dirty.length > 0) return { reason: `it has uncommitted changes (${dirty.slice(0, 5).join(", ")}${dirty.length > 5 ? ", …" : ""}); remove it by hand once they are saved; its .cache and .tmp were deleted`, purgeScratch: true };
     }
     return null;
   }
@@ -1258,10 +2003,151 @@ export class Runtime {
         console.error(`[playbooks] could not remove orphan worktree ${dir}:`, errorText(error));
       }
     }
+    for (const name of await readdir(this.runScriptsDir).catch(() => [] as string[])) {
+      const record = runs.get(name);
+      if (record?.worktree && record.worktree.state !== "removed") continue;
+      await this.dropRunScripts(name);
+    }
     for (const repo of new Set(this.store.list().map((run) => run.workspaceDir))) {
       await pruneWorktrees(repo);
     }
     return removed;
+  }
+
+  /** Removes the per-run script copy of `refresh_scripts` (and its half-written temp dirs); never fails. */
+  private async dropRunScripts(runId: string): Promise<void> {
+    await rm(path.join(this.runScriptsDir, runId), { recursive: true, force: true }).catch(() => undefined);
+    for (const name of await readdir(this.runScriptsDir).catch(() => [] as string[])) {
+      if (name.startsWith(`.${runId}.`)) await rm(path.join(this.runScriptsDir, name), { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** Why an ended run cannot be restarted from any step (so refresh_scripts has nothing to prepare), else null. */
+  private refreshBlocker(run: Run): string | null {
+    if (isPipeline(run)) return "a singleton pipeline is not restarted";
+    if (run.batch) return `a batch of pipeline ${run.batch.pipelineId} is not restarted`;
+    let first: string | null = null;
+    for (const step of run.playbook.steps) {
+      const blocker = restartBlocker(run, step.id);
+      if (blocker === null) return null;
+      first ??= blocker;
+    }
+    return first ?? "it has no step";
+  }
+
+  /**
+   * `refresh_scripts`: copies the run's `<relDir>/scripts/` tree from a freshly fetched origin/<branch> into
+   * `<data>/run-scripts/<runId>`, which script steps then run from. On an active run the step definitions stay pinned.
+   * On an ended run that restart_run can reopen, the definition is re-read from the same source too (when its steps
+   * are the same), so a restart picks up the current scripts and rules; history and outputs are kept. The source is
+   * origin/<branch>; when the playbook there is invalid (or missing), the workspace checkout is the source, said in `note`.
+   */
+  async refreshScripts(runId: string, reason: string, by: string): Promise<RefreshResult> {
+    const run = this.store.get(runId);
+    if (!run) throw new UserError(`unknown run "${runId}"`);
+    const ended = !isActive(run);
+    if (ended) {
+      const blocker = this.refreshBlocker(run);
+      if (blocker) throw new UserError(`run ${runId} has ended (${run.status}) and cannot be restarted (${blocker}): its scripts are not run again`);
+    }
+    const wt = run.worktree;
+    if (!wt || (wt.state === "removed" && !ended)) throw new UserError(`run ${runId} has no worktree: its scripts already run from the workspace checkout`);
+    if (!wt.base.startsWith("origin/")) throw new UserError(`run ${runId}'s worktree was created from "${wt.base}", not from origin/<branch>: there is no fresh remote ref to refresh from`);
+    const branch = wt.base.slice("origin/".length);
+    const dirs = new Set<string>();
+    for (const step of run.playbook.steps) if (step.kind === "script" && step.script) dirs.add(path.posix.dirname(step.script));
+    if (dirs.size === 0) throw new UserError(`run ${runId} has no script step`);
+    const repo = await this.repoOf(run, wt);
+    const fresh = await freshRefInfo(repo, branch);
+    if (fresh.fetchError) throw new UserError(`could not fetch origin/${branch}: ${fresh.fetchError}`);
+    if (fresh.ref !== wt.base) throw new UserError(`no ref ${wt.base} after the fetch (got ${fresh.ref})`);
+    const originSha = await resolveCommit(repo, fresh.ref);
+
+    // An ended run re-reads its definition from origin, else (origin's playbook unusable) from the workspace checkout.
+    let source: "origin" | "workspace" = "origin";
+    let why: string | null = null;
+    let next: Playbook | null = null;
+    if (ended) {
+      const read = await readAtRef(repo, fresh.ref, { projectId: run.projectId });
+      if ("error" in read) why = `the playbooks of ${fresh.ref} could not be read: ${shortReason(read.error)}`;
+      else {
+        const entry = read.loaded.entries.find((candidate) => candidate.id === run.playbook.id);
+        if (!entry) why = `${fresh.ref} has no playbook "${run.playbook.id}"`;
+        else if (!entry.playbook) why = `${fresh.ref} is invalid: ${shortReason(entry.errors[0] ?? "unknown error")}`;
+        else if (!isAdoptable(entry)) why = `"${run.playbook.id}" on ${fresh.ref} is no longer an isolated, non-singleton playbook`;
+        else next = entry.playbook;
+      }
+      if (why) {
+        source = "workspace";
+        const local = await loadPlaybooks(run.workspaceDir, { projectId: run.projectId }).catch(() => null);
+        const entry = local?.entries.find((candidate) => candidate.id === run.playbook.id);
+        next = isAdoptable(entry) ? entry.playbook : null;
+      }
+    }
+    const notes: string[] = [];
+    if (why) notes.push(`${workspaceWarning(why)}; the scripts were copied from the workspace checkout too`);
+    let definition: RefreshResult["definition"] = "pinned";
+    let record: RunDefinition | null = null;
+    if (ended) {
+      const mismatch = next ? definitionMismatch(run.playbook, next) : null;
+      if (!next) notes.push("no valid playbook to read the definition from: the run keeps its pinned definition");
+      else if (mismatch) notes.push(`the definition was not replaced: ${mismatch}; the run keeps its pinned definition (only the scripts were refreshed)`);
+      else {
+        definition = JSON.stringify(next) === JSON.stringify(run.playbook) ? "unchanged" : "refreshed";
+        record = source === "origin"
+          ? { source: "origin", ref: fresh.ref, sha: originSha, note: null, warning: null }
+          : { source: "workspace", ref: null, sha: null, note: `${why}; using the workspace checkout's playbook`, warning: workspaceWarning(why!) };
+      }
+    }
+    const scriptsSha = source === "origin" ? originSha : (await gitOutput(run.workspaceDir, ["rev-parse", "HEAD"]).catch(() => "workspace")).trim();
+    const before = run.scripts?.sha ?? null;
+    const label = source === "origin" ? fresh.ref : "the workspace checkout";
+    const scriptsSame = source === "origin" && run.scripts?.source === "origin" && before === originSha && existsSync(run.scripts.dir);
+    const definitionChanged = record !== null && JSON.stringify(record) !== JSON.stringify(run.definition);
+    const result = (changed: boolean): RefreshResult => ({ ref: label, sha: scriptsSha, before, changed, source, definition, note: notes.length > 0 ? notes.join("; ") : null });
+    if (scriptsSame && !definitionChanged) return result(false);
+    const final = path.join(this.runScriptsDir, runId);
+    if (!scriptsSame) {
+      await mkdir(this.runScriptsDir, { recursive: true });
+      const tmp = await mkdtemp(path.join(this.runScriptsDir, `.${runId}.`));
+      try {
+        if (source === "origin") await exportPaths(repo, fresh.ref, [...dirs], tmp);
+        else {
+          for (const rel of dirs) {
+            const from = path.join(run.workspaceDir, rel);
+            if (existsSync(from)) await cp(from, path.join(tmp, rel), { recursive: true });
+          }
+        }
+        // Written aside and renamed, so a running check never sees a half-written copy.
+        const old = `${tmp}.old`;
+        await rename(final, old).catch(() => undefined);
+        await rename(tmp, final);
+        await rm(old, { recursive: true, force: true }).catch(() => undefined);
+      } catch (error) {
+        await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+        throw new UserError(`could not copy the scripts of ${label}: ${errorText(error)}`);
+      }
+    }
+    await this.store.mutate(runId, (current) => {
+      if (!scriptsSame) current.scripts = { sha: scriptsSha, dir: final, refreshedAt: nowIso(), source };
+      if (record && next && definition !== "pinned") {
+        current.playbook = next;
+        current.definition = record;
+      }
+      const defText = ended ? `; definition ${definition === "pinned" ? "kept pinned" : definition === "unchanged" ? "unchanged" : `re-read from ${label}`}` : "";
+      engine.noteEvent(current, "scripts_refreshed", null, `scripts refreshed from ${label} by ${by}: ${before ?? wt.baseSha} -> ${scriptsSha}${defText}${reason ? ` (${reason})` : ""}${notes.length > 0 ? `. ${notes.join("; ")}` : ""}`, nowIso());
+      if (record?.warning) engine.noteEvent(current, "definition_fallback", null, record.warning, nowIso());
+    });
+    if (record?.warning) await this.announceDefinitionFallback(runId, "refresh_scripts");
+    return result(true);
+  }
+
+  /** Emits `run.definition_fallback` for a run whose definition came from the workspace checkout; never fails. */
+  private async announceDefinitionFallback(runId: string, trigger: "start" | "refresh_scripts"): Promise<void> {
+    const run = this.store.get(runId);
+    const warning = run?.definition?.warning;
+    if (!run || !warning) return;
+    await this.bus.emit("run.definition_fallback", { ...runFieldsOf(run), warning, source: "workspace", trigger }, { runId, source: "runs" }).catch((error: unknown) => console.error("[playbooks] could not emit run.definition_fallback:", errorText(error)));
   }
 
   /** Removes a run's worktree and records nothing; callers write the history. */
@@ -1325,6 +2211,53 @@ export class Runtime {
     await this.tick();
   }
 
+  /**
+   * A step a `goto` with `delay` sent back waits, pending, until its `waitUntil` (kept in the run, so a restart resumes it).
+   * Due ones are made ready here, before the phases that start ready steps; for the others one timer per step runs the
+   * tick again when they are due. A paused run keeps its delayed steps: the tick that resume runs releases them.
+   */
+  private async releaseDelayed(): Promise<void> {
+    for (const listed of this.store.list()) {
+      if (!isActive(listed) || isPaused(listed) || isPipeline(listed)) continue;
+      for (const { stepId, due } of engine.delayedSteps(listed)) {
+        const key = `${listed.id}/${stepId}/${due}`;
+        const wait = Date.parse(due) - Date.now();
+        if (wait > 0) {
+          if (this.delayTimers.has(key)) continue;
+          const timer = setTimeout(() => {
+            this.delayTimers.delete(key);
+            void this.tick().catch((error: unknown) => console.error("[playbooks] tick after a loop-back delay failed:", errorText(error)));
+          }, wait);
+          this.delayTimers.set(key, timer);
+          continue;
+        }
+        await this.store.mutate(listed.id, (current) => {
+          if (!isActive(current) || isPaused(current)) return;
+          engine.releaseDelayed(current, nowIso());
+        });
+      }
+      for (const key of [...this.delayTimers.keys()]) {
+        const [rid, sid, due] = key.split("/");
+        if (rid === listed.id && this.store.get(rid)?.steps[sid!]?.waitUntil !== due) {
+          clearTimeout(this.delayTimers.get(key));
+          this.delayTimers.delete(key);
+        }
+      }
+    }
+  }
+
+  private limitKick: ReturnType<typeof setTimeout> | null = null;
+
+  /** Re-checks held runs soon (a burst of events makes one tick); the 15 s timer stays as the fallback. */
+  private kickLimits(): void {
+    if (this.limitKick) return;
+    this.limitKick = setTimeout(() => {
+      this.limitKick = null;
+      if (this.store.list().some((run) => run.rateHold)) void this.tick().catch((error) => console.error("[playbooks] tick for held runs failed:", errorText(error)));
+    }, this.options.limitKickMs ?? 250);
+    (this.limitKick as unknown as { unref?: () => void }).unref?.();
+  }
+
   /** Starts ready script and hand-off steps, ends the jobs of ended singleton runs, and starts boarding runs. */
   private async tick(): Promise<void> {
     if (this.ticking) {
@@ -1335,6 +2268,9 @@ export class Runtime {
     try {
       do {
         this.tickAgain = false;
+        await this.tickPhase("releaseDelayed", () => this.releaseDelayed());
+        await this.tickPhase("releaseHolds", () => this.releaseHolds());
+        await this.tickPhase("retryBlockedManagers", () => this.retryBlockedManagers());
         await this.tickPhase("driveManagerless", () => this.driveManagerless());
         await this.tickPhase("settleGateChats", () => this.settleGateChats());
         await this.tickPhase("askGatesInChat", () => this.askGatesInChat());
@@ -1351,10 +2287,499 @@ export class Runtime {
         await this.tickPhase("startBatches", () => this.startBatches());
         await this.tickPhase("cleanupEndedWorktrees", () => this.cleanupEndedWorktrees());
         await this.tickPhase("archiveEndedWorkspaces", () => this.archiveEndedWorkspaces());
+        await this.tickPhase("archiveAgedWorkspaces", () => this.archiveAgedWorkspaces());
+        await this.tickPhase("autoArchiveRuns", () => this.autoArchiveRuns());
+        await this.tickPhase("autoArchiveFailedWorkspaces", () => this.autoArchiveFailedWorkspaces());
+        await this.tickPhase("retryAutoArchivedWorkspaces", () => this.retryAutoArchivedWorkspaces());
       } while (this.tickAgain);
     } finally {
       this.ticking = false;
     }
+  }
+
+
+  // ---------------------------------------------------------------- rate limiting (ADR 2026-11-20-rate-limiting)
+
+  /** `quota_limits` of config.yaml (or the deprecated `rate_limits`), re-read at most every 5 s so a change applies without a reload. */
+  private async userQuotaLayer(): Promise<QuotaLimitsLayer> {
+    const now = Date.now();
+    if (!this.rateConfig || now - this.rateConfig.at > 5_000) this.rateConfig = { at: now, value: await readQuotaLimitsLayer().catch(() => ({})) };
+    return this.rateConfig.value;
+  }
+
+  /** The user-level limits (built-in defaults under config.yaml): what no project's defaults change. */
+  private async rateLimits(): Promise<RateLimitsConfig> {
+    return resolveQuotaLimits(await this.userQuotaLayer());
+  }
+
+  /**
+   * The limits in effect for a run (ADR 2026-11-23-quota-limits-in-defaults): the built-in defaults, then config.yaml, then the
+   * `quota_limits` of the run's own playbook defaults (the order `manager_recovery` and the other defaults follow: the folder's defaults win).
+   * Uses the layer read by the last `userQuotaLayer()`.
+   */
+  private limitsOf(run: Run): RateLimitsConfig {
+    return resolveQuotaLimits(this.rateConfig?.value, run.playbook.quotaLimits);
+  }
+
+  /** Steps being started right now (agent created, attempt not yet running), other than `exceptKey`: they count against the step limit. */
+  private reservedStarts(exceptKey: string): number {
+    let count = 0;
+    for (const key of this.startingSteps) {
+      if (key === exceptKey) continue;
+      const [runId, stepId] = key.split("/");
+      if (this.store.get(runId!)?.steps[stepId!]?.status !== "running") count += 1;
+    }
+    return count;
+  }
+
+  /**
+   * Whether rate limiting holds `run` from starting a step now: the verdict (also recorded in the run, announced when it changes)
+   * or null, which also lifts a hold the run had. Only agent and script steps count and are held; a gate, a hand-off or a
+   * fan-out is never held (a fan-out's own step would deadlock the runs it started). `starting` reserves the quota of work that passes.
+   */
+  private async rateCheck(run: Run, exceptKey = "", quota = true): Promise<HoldVerdict | null> {
+    await this.userQuotaLayer();
+    const config = this.limitsOf(run);
+    // A run exempt from quota limiting (ADR 2026-11-23-quota-exempt-runs) is never held: no cap, no exhausted or unavailable window, no
+    // headroom queue, no pace pause, and so no hold notice. It still reserves its estimated cost, which the others' headroom loses.
+    if (run.quotaExempt) {
+      this.reserveExempt(run, config);
+      await this.applyHold(run.id, null);
+      return null;
+    }
+    let verdict: HoldVerdict | null = null;
+    if (config.steps !== null || config.playbooks !== null) verdict = limitVerdict(run, this.store.list(), config, this.reservedStarts(exceptKey));
+    if (!verdict && quota && config.quota.pacing) verdict = this.paceVerdict(this.store.get(run.id) ?? run, config, exceptKey !== "");
+    await this.noteUnreported(run.id, config);
+    // A check that skips the quota (script starts) never lifts a quota hold: it only looked at the limits, so the hold it did not look at stays.
+    if (!verdict && !quota && this.store.get(run.id)?.rateHold && ["quota", "headroom", "pace"].includes(this.store.get(run.id)!.rateHold!.kind)) return null;
+    await this.applyHold(run.id, verdict);
+    return verdict;
+  }
+
+  /**
+   * The reservation of a run exempt from quota limiting, taken once when its first step starts: its estimated cost per window
+   * (steps still to run × the playbook's measured cost), so the headroom the other runs see shrinks by it. Nothing here can hold the
+   * run: it is not a candidate of the queue, nor part of the pace plan; later `refreshAdmittedNeeds` keeps the figure current.
+   */
+  private reserveExempt(run: Run, config: RateLimitsConfig): void {
+    if (!config.quota.pacing || this.reservedQuota.has(`run:${run.id}`)) return;
+    this.pruneQuotaReservations();
+    const ctx = this.planContext(config);
+    const est: Record<string, number> = {};
+    const demand = this.rateDemand(run);
+    for (const [provider, count] of demand) {
+      const probe = ctx.probe(provider, run);
+      if (probe.state !== "ok") continue;
+      for (const room of probe.rooms) {
+        const { cost, estimated } = candidateCost({ run, priority: 0, demand }, room, ctx, count);
+        if (estimated && cost > ZERO_COST_POINTS) est[windowKey(provider, room.id)] = cost;
+      }
+    }
+    this.reservedQuota.set(`run:${run.id}`, { runId: run.id, est, spent: {}, at: Date.now(), endedAt: null });
+  }
+
+  private planContext(config: RateLimitsConfig): PlanContext {
+    return {
+      now: Date.now(),
+      config,
+      probe: (provider, run) => this.pacer.probe(provider, run ? this.limitsOf(run).quota : config.quota),
+      stepCost: (run, provider, windowId) => this.costs.stepCost(run.playbook.id, provider, windowId),
+      reserved: (provider, windowId) => {
+        const key = windowKey(provider, windowId);
+        let total = 0;
+        for (const entry of this.reservedQuota.values()) total += Math.max(0, (entry.est[key] ?? 0) - (entry.spent[key] ?? 0));
+        return total;
+      },
+    };
+  }
+
+  /** The provider each agent step of the run starts on (the step's, else the default). */
+  private stepProvider(run: Run, stepId: string): string {
+    const step = engine.stepDef(run, stepId);
+    return step.kind === "agent" ? step.agent.provider ?? DEFAULT_PROVIDER : DEFAULT_PROVIDER;
+  }
+
+  /** A run is admitted once an agent step of it has started, or its quota is reserved. */
+  private rateAdmitted(run: Run): boolean {
+    return this.reservedQuota.has(`run:${run.id}`) || run.playbook.steps.some((step) => step.kind === "agent" && (run.steps[step.id]?.attempts.length ?? 0) > 0);
+  }
+
+  /** What the run wants to start: providers → steps (all its remaining agent steps: a run is admitted whole). */
+  private rateDemand(run: Run): Map<string, number> {
+    const demand = new Map<string, number>();
+    for (const step of run.playbook.steps) {
+      const status = run.steps[step.id]?.status;
+      if (step.kind !== "agent" || status === "completed" || status === "skipped") continue;
+      const provider = this.stepProvider(run, step.id);
+      demand.set(provider, (demand.get(provider) ?? 0) + 1);
+    }
+    return demand;
+  }
+
+  /** Runs that wait for headroom, in queue order (the asking run always included). */
+  private rateCandidates(asking: Run): RateCandidate[] {
+    const runs = this.store.list();
+    const out: RateCandidate[] = [];
+    for (const run of runs) {
+      const isAsking = run.id === asking.id;
+      // An exempt run is never in the queue: it blocks nobody (its reservation already took its cost from the headroom).
+      if (!isAsking && (run.archivedAt || run.quotaExempt || isPipeline(run) || !isActive(run) || isPaused(run))) continue;
+      if (!isAsking && this.rateAdmitted(run)) continue;
+      const demand = this.rateDemand(isAsking ? asking : run);
+      if (demand.size === 0 && !isAsking) continue;
+      out.push({ run: isAsking ? asking : run, priority: runPriority(run, runs), demand });
+    }
+    return orderCandidates(out, runs);
+  }
+
+  /** The quota hold for work wanting to start, or null; with `reserve`, work that passes has its estimated cost reserved. */
+  private paceVerdict(run: Run, config: RateLimitsConfig, reserve: boolean): HoldVerdict | null {
+    const providers = runProviders(run, DEFAULT_PROVIDER);
+    if (providers.length === 0) return null;
+    this.refreshAdmittedNeeds();
+    const ctx = this.planContext(config);
+    if (this.rateAdmitted(run)) return exhaustionVerdict(providers, ctx, run).verdict ?? this.paceFit(run, ctx);
+    this.pruneQuotaReservations();
+    const plan = planHeadroom(this.rateCandidates(run), ctx);
+    const hold = plan.holds.get(run.id) ?? null;
+    const est = plan.admitted.get(run.id);
+    if (!hold && reserve && est && Object.keys(est).length > 0) {
+      this.reservedQuota.set(`run:${run.id}`, { runId: run.id, est, spent: {}, at: Date.now(), endedAt: null });
+    }
+    return hold;
+  }
+
+  /**
+   * An admitted run between steps (no step running): paused when the capacity the pace allows no longer holds it
+   * (ADR 2026-11-21-pause-admitted-runs-to-fit-pace). All admitted runs compete by priority then oldest; the remaining cost of each
+   * (its reservation's remainder) is taken from the headroom, and the ones that do not fit are paused; they come back one by one in
+   * the same order as the pace relaxes or a run ends. A running step is never interrupted: such a run is only left as it is.
+   */
+  private paceFit(run: Run, ctx: PlanContext): HoldVerdict | null {
+    if (Object.values(run.steps).some((state) => state.status === "running")) return null;
+    const runs = this.store.list();
+    const admitted: AdmittedRun[] = [];
+    for (const other of runs) {
+      // An exempt run does not compete: it is not paused, and its reservation counts in `others` (taken from the headroom first).
+      if (other.archivedAt || other.parent || other.quotaExempt || isPipeline(other) || !isActive(other) || !this.rateAdmitted(other)) continue;
+      const reserved = this.reservedQuota.get(`run:${other.id}`);
+      const need: Record<string, number> = {};
+      for (const [key, est] of Object.entries(reserved?.est ?? {})) need[key] = Math.max(0, est - (reserved?.spent[key] ?? 0));
+      admitted.push({ run: other, priority: runPriority(other, runs), providers: runProviders(other, DEFAULT_PROVIDER), need });
+    }
+    const counted = new Set(admitted.map((entry) => `run:${entry.run.id}`));
+    const others = (provider: string, windowId: string) => {
+      const key = windowKey(provider, windowId);
+      let total = 0;
+      for (const [id, entry] of this.reservedQuota) if (!counted.has(id) && entry.endedAt === null) total += Math.max(0, (entry.est[key] ?? 0) - (entry.spent[key] ?? 0));
+      return total;
+    };
+    return planPace(admitted, ctx, others).get(run.id) ?? null;
+  }
+
+  /**
+   * The remaining need of every admitted run, recomputed from the CURRENT cost history (ADR 2026-11-23-admitted-need-from-current-history):
+   * per-step cost × its remaining agent steps, minus what its running steps already used. A run admitted before its playbook had a
+   * history (so with an empty or zero reservation) becomes pace-able as soon as the history exists. The reservation is stored as
+   * est = spent + need, so everything reading `est - spent` (pace, headroom, the quota tab) sees the new figure. A provider whose
+   * playbook still has no history keeps what it had (no need: not paced).
+   */
+  private refreshAdmittedNeeds(): void {
+    for (const run of this.store.list()) {
+      if (run.archivedAt || isPipeline(run) || !isActive(run) || !this.rateAdmitted(run)) continue;
+      const need: Record<string, number> = {};
+      const demand = this.rateDemand(run);
+      for (const [provider, count] of demand) {
+        for (const windowId of this.costs.windows(run.playbook.id, provider)) {
+          const unit = this.costs.stepCost(run.playbook.id, provider, windowId);
+          if (unit !== null) need[windowKey(provider, windowId)] = count * unit;
+        }
+      }
+      if (Object.keys(need).length === 0) continue;
+      for (const [key, entry] of this.attemptUse) {
+        if (!key.startsWith(`${run.id}/`)) continue;
+        for (const [windowId, points] of Object.entries(entry.points)) {
+          const k = windowKey(entry.provider, windowId);
+          if (k in need) need[k] = Math.max(0, need[k]! - points);
+        }
+      }
+      const reserved = this.reservedQuota.get(`run:${run.id}`) ?? { runId: run.id, est: {}, spent: {}, at: Date.now(), endedAt: null };
+      reserved.est = Object.fromEntries(Object.entries(need).map(([k, value]) => [k, (reserved.spent[k] ?? 0) + value]));
+      reserved.at = Date.now();
+      reserved.endedAt = null;
+      this.reservedQuota.set(`run:${run.id}`, reserved);
+    }
+  }
+
+  /** A reservation whose work ended stays until the next successful usage read (the readings then include its use); an old one is dropped. */
+  private pruneQuotaReservations(): void {
+    const now = Date.now();
+    for (const [id, entry] of this.reservedQuota) {
+      if (entry.endedAt === null) {
+        const run = this.store.get(entry.runId);
+        if (!run || !isActive(run)) entry.endedAt = now;
+      }
+      if (now - entry.at > 6 * 3_600_000) this.reservedQuota.delete(id);
+    }
+  }
+
+  /** Sets (or clears) the run's note that a provider it uses reports no usage, so its work is not paced; logs it once per provider. */
+  private async noteUnreported(runId: string, config: RateLimitsConfig): Promise<void> {
+    const run = this.store.get(runId);
+    if (!run) return;
+    let note: string | null = null;
+    if (config.quota.pacing) {
+      const silent = runProviders(run, DEFAULT_PROVIDER).filter((provider) => this.pacer.probe(provider, config.quota).state === "unreported");
+      for (const provider of silent) {
+        if (!this.warnedUnreported.has(provider)) console.warn(`[playbooks] rate limiting: provider "${provider}" reports no usage, so its work is not paced`);
+        this.warnedUnreported.add(provider);
+      }
+      if (silent.length > 0) note = `quota pacing is on but ${silent.join(", ")} report${silent.length === 1 ? "s" : ""} no usage: that work is not paced`;
+    }
+    if (note !== run.rateNote) await this.store.mutate(runId, (current) => void (current.rateNote = note));
+  }
+
+  /**
+   * Learns what steps cost: each successful usage read's increase per window is shared among the agent attempts running on that
+   * provider in the interval, by time overlap. An ended attempt's total joins the playbook's history; the same increase reduces what
+   * its reservation still holds back. Reservations of ended work are dropped: the readings include their use now.
+   */
+  private observeUsage(changes: ReadChange[]): void {
+    const runs = this.store.list();
+    for (const { provider, before, after } of changes) {
+      if (!before?.entry || !after.entry) continue;
+      const weights: Array<{ runId: string; stepId: string; n: number; playbookId: string; weight: number }> = [];
+      for (const run of runs) {
+        if (run.archivedAt || isPipeline(run) || run.updatedAt < new Date(before.at).toISOString()) continue;
+        for (const step of run.playbook.steps) {
+          if (step.kind !== "agent") continue;
+          for (const attempt of run.steps[step.id]?.attempts ?? []) {
+            const started = Date.parse(attempt.startedAt);
+            const ended = attempt.endedAt ? Date.parse(attempt.endedAt) : after.at;
+            const attemptProvider = attempt.target ? attempt.target.split("/")[0]! : this.stepProvider(run, step.id);
+            const overlap = Math.min(ended, after.at) - Math.max(started, before.at);
+            if (attemptProvider === provider && overlap > 0) weights.push({ runId: run.id, stepId: step.id, n: attempt.n, playbookId: run.playbook.id, weight: overlap });
+          }
+        }
+      }
+      const total = weights.reduce((sum, item) => sum + item.weight, 0);
+      if (total <= 0) continue;
+      const afterWindows = new Map((after.entry.windows ?? []).map((window) => [window.id, window]));
+      for (const window of before.entry.windows ?? []) {
+        const next = afterWindows.get(window.id);
+        const was = usedPct(window);
+        const now = next ? usedPct(next) : null;
+        // A window that reset between the readings cannot be compared.
+        if (!next || was === null || now === null || Math.abs(Date.parse(next.resetsAt ?? "") - Date.parse(window.resetsAt ?? "")) > 60_000) continue;
+        const delta = Math.max(0, now - was);
+        for (const item of weights) {
+          const key = `${item.runId}/${item.stepId}/${item.n}`;
+          const entry = this.attemptUse.get(key) ?? { playbookId: item.playbookId, provider, points: {} };
+          const share = (delta * item.weight) / total;
+          entry.points[window.id] = (entry.points[window.id] ?? 0) + share;
+          this.attemptUse.set(key, entry);
+          const reserved = this.reservedQuota.get(`run:${item.runId}`);
+          if (reserved) reserved.spent[windowKey(provider, window.id)] = (reserved.spent[windowKey(provider, window.id)] ?? 0) + share;
+        }
+      }
+    }
+    let learned = false;
+    for (const [key, entry] of [...this.attemptUse]) {
+      const [runId, stepId, n] = key.split("/");
+      const attempt = this.store.get(runId!)?.steps[stepId!]?.attempts.find((candidate) => String(candidate.n) === n);
+      if (attempt && !attempt.endedAt) continue;
+      this.costs.add(entry.playbookId, entry.provider, entry.points);
+      this.attemptUse.delete(key);
+      learned = true;
+    }
+    if (learned) void this.costs.save().catch((error) => console.error("[playbooks] could not save the quota cost history:", errorText(error)));
+    this.pruneQuotaReservations();
+    for (const [id, entry] of this.reservedQuota) if (entry.endedAt !== null) this.reservedQuota.delete(id);
+  }
+
+  /** Records a hold (or its end) in the run and tells the manager when it starts and when it ends. */
+  private async applyHold(runId: string, verdict: HoldVerdict | null): Promise<void> {
+    const before = this.store.get(runId)?.rateHold ?? null;
+    if (!verdict && !before) return;
+    if (verdict && before && before.kind === verdict.kind && before.provider === verdict.provider && before.window === verdict.window && before.reason === verdict.reason && before.retryAt === verdict.retryAt && before.position === (verdict.position ?? null)) return;
+    let change: "held" | "released" | null = null;
+    await this.store.mutate(runId, (run) => void (change = engine.setRateHold(run, verdict, nowIso())));
+    const run = this.store.get(runId);
+    if (!run) return;
+    if (!isActive(run)) return;
+    // One notice per hold episode (ADR 2026-11-23-hold-notice-per-episode): the episode lasts until a step starts again, whatever
+    // the kind, reason, provider, window or position does in between. The decision and its record are one mutation.
+    // A hold that only waits for the provider's usage reading is a condition of the provider, not of the run: no notice (ADR 2026-11-23-provider-usage-unavailable),
+    // and the episode stays armed, so a later real hold of the same run is still told once. A switch between the two is a plain update (change null).
+    if (verdict && isUnavailableHold(verdict)) return;
+    if ((change === "held" || change === null) && verdict) {
+      let send = false;
+      await this.store.mutate(runId, (current) => {
+        if (engine.holdEpisodeState(current) !== "armed") return;
+        send = true;
+        engine.noteEvent(current, "hold_notice", null, verdict.reason, nowIso());
+      });
+      if (!send) return;
+      await this.enqueue(runId, [`Rate limit hold (${verdict.reason}). The plugin resumes the run by itself: do not start, retry or restart steps, or cancel the run.`]);
+      await this.deliver(runId);
+    } else if (change === "released") {
+      // Only a manager that was told of the hold has something to learn, only once, and only when a step now waits for it.
+      let ready: string[] = [];
+      let send = false;
+      await this.store.mutate(runId, (current) => {
+        ready = engine.readyForManager(current);
+        if (engine.holdEpisodeState(current) !== "told" || ready.length === 0) return;
+        send = true;
+        engine.noteEvent(current, "hold_release_notice", null, ready.join(", "), nowIso());
+      });
+      if (!send) return;
+      await this.enqueue(runId, [`Rate limit lifted. Ready for you: ${ready.join(", ")}.`]);
+      await this.deliver(runId);
+    }
+  }
+
+  /**
+   * Emits `provider.usage_unavailable` when a provider's usage reading becomes unavailable and `provider.usage_restored` when it
+   * is back: on transitions only (ADR 2026-11-23-provider-usage-unavailable). The state is the pacer's; this keeps only what was announced.
+   */
+  private async syncProviderUsage(): Promise<void> {
+    try {
+      const states = this.pacer.usageStates((await this.rateLimits()).quota);
+      for (const [provider, state] of states) {
+        const announced = this.usageAnnounced.get(provider);
+        if (!state.available && !announced) {
+          const since = new Date(state.since ?? Date.now()).toISOString();
+          const reason = state.reason ?? "read failed";
+          this.usageAnnounced.set(provider, { since, reason });
+          await this.bus.emit("provider.usage_unavailable", { provider, since, reason, failures: state.failures, lastReadAt: state.lastReadAt === null ? null : new Date(state.lastReadAt).toISOString() }, { runId: null, source: "runs" });
+        } else if (state.available && announced) {
+          this.usageAnnounced.delete(provider);
+          await this.bus.emit("provider.usage_restored", { provider, since: announced.since, reason: announced.reason, unavailableMs: Math.max(0, Date.now() - Date.parse(announced.since)) }, { runId: null, source: "runs" });
+        }
+      }
+    } catch (error) {
+      console.error("[playbooks] could not announce the provider usage state:", errorText(error));
+    }
+  }
+
+  /** Per run: when a quota-blocked manager's recovery is tried again, and how many tries have not recovered it (the interval doubles, 30 s to 10 min). */
+  private readonly managerRetry = new Map<string, { next: number; failures: number }>();
+
+  /**
+   * A manager blocked by its provider's quota with work pending (a queued wake-up, a recovery prompt, a ready step) is
+   * recovered by itself (`manager_recovery.retry`, default on): recoverManager runs as if called by hand, but only
+   * succeeds once a target of the chain (or `manager_recovery.fallback`) has headroom in the provider's usage reading.
+   * Runs from the 15 s limit timer, with a per-run backoff, and reads usage through the shared cache: it never hammers the endpoint.
+   */
+  private async retryBlockedManagers(): Promise<void> {
+    const blocked = new Set<string>();
+    for (const listed of this.store.list()) {
+      const managerId = listed.managerAgentId;
+      if (!managerId || listed.managerQuotaBlockedId !== managerId || !isActive(listed) || listed.archivedAt || isPaused(listed) || isManagerless(listed) || isPipeline(listed)) continue;
+      blocked.add(listed.id);
+      if (listed.inbox.length === 0 && !listed.managerRecoveryPrompt && engine.readyForManager(listed).length === 0) continue;
+      const state = this.managerRetry.get(listed.id) ?? { next: 0, failures: 0 };
+      if (Date.now() < state.next || this.recoveringManagers.has(managerId)) continue;
+      if (!(await this.managerRecovery(listed.playbook)).retry) continue;
+      state.failures += 1;
+      state.next = Date.now() + Math.min(30_000 * 2 ** (state.failures - 1), 600_000);
+      this.managerRetry.set(listed.id, state);
+      const result = await this.recoverManager(listed.id, managerId, "provider quota (automatic retry)", undefined, undefined, true).catch((error: unknown) => {
+        console.error(`[playbooks] automatic manager recovery of ${listed.id}:`, errorText(error));
+        return null;
+      });
+      if (result?.changed) this.managerRetry.delete(listed.id);
+    }
+    for (const id of [...this.managerRetry.keys()]) if (!blocked.has(id)) this.managerRetry.delete(id);
+  }
+
+  /** Lifts, by itself, every hold that no longer applies (capacity or quota returned, the run ended); runs again from the timer while any run is held. */
+  private async releaseHolds(): Promise<void> {
+    for (const listed of this.store.list()) {
+      if (!listed.rateHold) continue;
+      if (!isActive(listed) || isPaused(listed)) {
+        if (!isActive(listed)) await this.applyHold(listed.id, null);
+        continue;
+      }
+      await this.rateCheck(listed);
+    }
+  }
+
+  /**
+   * The quota priority of each active run whose limits have pacing on (resolved like `limitsOf`), for the Runs view; the other runs
+   * are absent. A run's own priority is changed with `setRunPriority` whatever pacing says: this only decides who sees the control.
+   */
+  async priorityViews(runs: Run[]): Promise<Map<string, RunPriorityView>> {
+    await this.userQuotaLayer();
+    const parents = parentIds(runs);
+    return new Map(runs.filter((run) => !run.archivedAt && isActive(run) && (run.quotaExempt || this.limitsOf(run).quota.pacing)).map((run) => [run.id, priorityViewOf(run, runs, parents)]));
+  }
+
+  /** The global limits and pacing for the panel: the settings, running steps, the overrides and every held run. */
+  async rateLimitStatus(): Promise<{ config: RateLimitsConfig; overrides: Record<string, string>; held: Array<{ runId: string; hold: NonNullable<Run["rateHold"]> }> }> {
+    return { config: await this.rateLimits(), overrides: this.pacer.activeOverrides(), held: this.store.list().flatMap((run) => (run.rateHold && isActive(run) ? [{ runId: run.id, hold: run.rateHold }] : [])) };
+  }
+
+  /**
+   * The Quota limitation tab (see `buildQuotaLimitation`): the limits a new run of each given project gets, resolved like a run does
+   * (the playbook folder's defaults of the project's main checkout, with isolated playbooks read from their base on origin like `list_playbooks`, then config.yaml, then the built-in ones; one set per distinct result among the project's
+   * playbooks), and the pacing's numbers per provider. A reading's freshness is judged at the user-level settings.
+   */
+  async quotaLimitation(workspaces: Array<{ projectId: string; workspaceId: string }> = []): Promise<QuotaLimitation> {
+    const user = await this.rateLimits();
+    const layer = this.rateConfig?.value;
+    this.pruneQuotaReservations();
+    const views = this.pacer.view(user.quota);
+    const seen = new Set<string>();
+    const projects = await Promise.all(
+      workspaces
+        .filter(({ projectId }) => !seen.has(projectId) && seen.add(projectId))
+        .map(async ({ projectId, workspaceId }) => {
+          const workspace = await this.peekWorkspace(workspaceId).catch(() => null);
+          if (!workspace) return null;
+          // The project's main checkout, not whichever workspace the panel listed first (an old run worktree may predate a change of
+          // the defaults); isolated playbooks then come from their base on origin, as `list_playbooks` and a new run resolve them.
+          const root = workspace.projectRootPath;
+          const loaded = await loadPlaybooks(root, { projectId }).catch(() => null);
+          const resolved = loaded ? await resolveForNewRun(root, loaded).catch(() => loaded.entries.map((entry) => ({ entry }))) : [];
+          const sets = new Map<string, { repos: string[]; config: RateLimitsConfig }>();
+          // The largest measured cost of one step among the project's playbooks, per provider and window (the throttle's fallback need).
+          const unitCost: Record<string, Record<string, number>> = {};
+          for (const { entry } of resolved) {
+            if (!entry.playbook) continue;
+            for (const { provider } of views) {
+              for (const windowId of this.costs.windows(entry.playbook.id, provider)) {
+                const unit = this.costs.stepCost(entry.playbook.id, provider, windowId);
+                if (unit === null) continue;
+                const byWindow = (unitCost[provider] ??= {});
+                byWindow[windowId] = Math.max(byWindow[windowId] ?? 0, unit);
+              }
+            }
+            const config = resolveQuotaLimits(layer, entry.playbook.quotaLimits);
+            const key = JSON.stringify(config);
+            const set = sets.get(key) ?? { repos: [], config };
+            if (!set.repos.includes(entry.repo)) set.repos.push(entry.repo);
+            sets.set(key, set);
+          }
+          return { projectId, label: workspace.projectDisplayName || path.basename(workspace.projectRootPath), unitCost, sets: sets.size > 0 ? [...sets.values()] : [{ repos: [], config: user }] };
+        }),
+    );
+    this.refreshAdmittedNeeds();
+    return buildQuotaLimitation({
+      projects: projects.filter((project) => project !== null).sort((a, b) => a.label.localeCompare(b.label)),
+      nowMs: Date.now(),
+      views,
+      runs: this.store.list(),
+      reservations: [...this.reservedQuota.values()].map((entry) => ({ runId: entry.runId, est: entry.est, spent: entry.spent, endedAt: entry.endedAt })),
+    });
+  }
+
+  /** "Continue anyway": steps whose run uses `provider` start despite the quota pacing for `minutes` (default 60, at most 1440). */
+  async overrideQuota(provider: string, minutes?: number): Promise<{ until: string }> {
+    const until = this.pacer.override(provider, minutes === undefined ? undefined : minutes * 60_000);
+    await this.tick();
+    return { until };
   }
 
   /**
@@ -1376,6 +2801,8 @@ export class Runtime {
         try {
           await this.startStep(run.managerAgentId, run.id, stepId, "");
         } catch (error) {
+          // Held by rate limiting: the step stays ready and the plugin starts it when the hold is lifted.
+          if (error instanceof RateHeldError) break;
           // Started by someone else meanwhile: nothing failed.
           if (this.store.get(run.id)?.steps[stepId]?.status !== "ready" || this.startingSteps.has(key)) continue;
           this.autoStartFailed.set(key, errorText(error));
@@ -1465,6 +2892,7 @@ export class Runtime {
           try {
             await this.startStep("", runId, stepId, "");
           } catch (error) {
+            if (error instanceof RateHeldError) break;
             await this.stopRunByPlugin(runId, `step "${stepId}" could not start: ${errorText(error)}`);
           }
         }
@@ -1529,7 +2957,7 @@ export class Runtime {
       if (!isManagerless(run) || !isActive(run) || isPaused(run)) continue;
       for (const gate of run.gates) {
         const key = `${run.id}:${gate.id}`;
-        if (!waitsForHuman(gate) || gate.chatAgentId || this.chatSkipped.has(key)) continue;
+        if (!waitsForHuman(gate) || gate.kind === "permission" || gate.kind === "manager_question" || gate.chatAgentId || this.chatSkipped.has(key)) continue;
         const step = engine.stepDef(run, gate.stepId);
         const owners = gate.kind === "ask" ? [gate.stepId] : step.needs;
         const candidates = owners
@@ -1946,11 +3374,46 @@ export class Runtime {
       return { restarts: item.child.previous.length };
     });
     if (!result) throw new UserError(`the fan-out step of run ${target.parent.id} changed while replacing: try again`);
-    if (created) await this.store.mutate(created.id, (current) => void (current.parent = link));
+    if (created) {
+      const inherited = this.inheritedPriority(link);
+      await this.store.mutate(created.id, (current) => {
+        current.parent = link;
+        if (inherited.priorityOverride !== undefined && current.priorityOverride === null) Object.assign(current, inherited);
+        if (this.inheritedExemptFlag(link).inheritChildExempt) current.inheritChildExempt = true;
+        if (this.parentExempt(link) && !current.quotaExempt) {
+          current.quotaExempt = true;
+          engine.noteEvent(current, "quota_exempt", null, `quota: exempt (inherited from parent run ${link.runId})`, nowIso());
+        }
+      });
+    }
     else if (reservation) reservation.parent = link;
     if (wasActive) await this.cancelRun(input.runId, `replaced by run ${input.newRunId}${input.reason ? `: ${input.reason}` : ""}`, input.cancelBy).catch((error: unknown) => console.error(`[playbooks] could not cancel replaced child run ${input.runId}:`, errorText(error)));
     await this.bus.emit("fanout.child_replaced", { runId: target.parent.id, stepId: target.stepId, key: link.key, replacedRunId: input.runId, newRunId: input.newRunId, reason: input.reason, restarts: result.restarts }, { runId: target.parent.id, source: "fanout" }).catch((error: unknown) => console.error("[playbooks] could not emit fanout.child_replaced:", errorText(error)));
     return report(true);
+  }
+
+  /**
+   * add_fanout_item / the panel: one more item joins a running fan-out step. It is a `pending` child like any list or refill item:
+   * the next tick starts it under `max_active`, and the pool planner sees its key in `pool.known` / `pending` / `active`.
+   * `by` is the calling agent (it must manage the run), or null for a human in the panel.
+   */
+  async addFanoutItem(input: { runId: string; stepId: string; item: unknown; by: string | null }): Promise<{ key: string; status: string }> {
+    const run = this.store.get(input.runId);
+    if (!run) throw new UserError(`unknown run "${input.runId}"`);
+    if (input.by !== null && run.managerAgentId !== input.by) throw new UserError(`only the manager of run ${run.id} (or a human, in the panel) adds an item to its fan-out: you do not manage it`);
+    if (!isActive(run)) throw new UserError(`run ${run.id} has ended (${run.status})`);
+    const added = await this.store.mutate(run.id, (current) => {
+      try {
+        return engine.addFanoutItem(current, input.stepId, input.item, nowIso(), input.by === null ? null : `agent ${input.by}`);
+      } catch (error) {
+        throw error instanceof engine.EngineError ? new UserError(error.message) : error;
+      }
+    });
+    await this.bus.emit("fanout.item_added", { runId: run.id, stepId: input.stepId, key: added.key, by: input.by }, { runId: run.id, source: "fanout" }).catch((error: unknown) => console.error("[playbooks] could not emit fanout.item_added:", errorText(error)));
+    // Do not wait for the next poll: a free slot starts the item now.
+    void this.tick().catch((error: unknown) => console.error("[playbooks] tick after add_fanout_item failed:", errorText(error)));
+    const child = this.store.get(run.id)?.steps[input.stepId]?.fanout?.children.find((candidate) => candidate.key === added.key);
+    return { key: added.key, status: child?.status ?? "pending" };
   }
 
   // ---------------------------------------------------------------- hand-offs and singleton pipelines
@@ -2011,6 +3474,7 @@ export class Runtime {
       requeued: null,
       requeues: {},
       followUps: [],
+      reopens: [],
     };
     await this.store.mutate(pipeline.id, (current) => engine.addJob(current, job, nowIso()));
     await this.store.mutate(run.id, (current) => {
@@ -2043,6 +3507,7 @@ export class Runtime {
   /** Creates the singleton's shared workspace from its branch, and its pipeline run there. */
   private async createPipeline(playbook: Playbook, projectId: string, sourceDir: string): Promise<Run> {
     const base = playbook.singleton?.branch ?? (await defaultBranch(sourceDir)) ?? undefined;
+    if (base) assertBranchName(base, "singleton.branch");
     // Branch off origin's copy: the source checkout's local branch may be far behind.
     const ref = base ? await freshRef(sourceDir, base) : undefined;
     const id = shortId();
@@ -2339,17 +3804,17 @@ export class Runtime {
   }
 
   /**
-   * requeue_job: a failed, detached job of a pipeline waits again at its stages, with the same id. `runId` is the pipeline,
+   * requeue_job: a failed or non-success settled, detached job of a pipeline waits again at its stages, with the same id. `runId` is the pipeline,
    * or one of its batches. Idempotent: an open job is left as it is. Any agent may call it (like cancel_run).
    */
-  async requeueJob(runId: string, jobId: string, reason: string): Promise<{ pipeline: Run; job: Job; changed: boolean }> {
+  async requeueJob(runId: string, jobId: string, reason: string, fromOutcome: string | null = null): Promise<{ pipeline: Run; job: Job; changed: boolean }> {
     const given = this.store.get(runId);
     if (!given) throw new UserError(`unknown run "${runId}"`);
     const pipeline = given.batch ? this.store.get(given.batch.pipelineId) : given;
     if (!pipeline) throw new UserError(`the pipeline of batch ${given.id} no longer exists`);
     if (!isPipeline(pipeline)) throw new UserError(`run ${pipeline.id} is not a singleton pipeline: it carries no jobs`);
     try {
-      const result = await this.store.mutate(pipeline.id, (current) => engine.reopenJob(current, jobId, reason, nowIso()));
+      const result = await this.store.mutate(pipeline.id, (current) => engine.reopenJob(current, jobId, reason, nowIso(), fromOutcome));
       if (result.changed) await this.tick();
       return { pipeline: this.store.get(pipeline.id)!, ...result };
     } catch (error) {
@@ -2439,6 +3904,7 @@ export class Runtime {
     for (const run of this.store.list()) {
       if (!isActive(run) || isPaused(run)) continue;
       for (const stepId of engine.readyScripts(run)) {
+        if (await this.rateCheck(this.store.get(run.id) ?? run, "", false)) break;
         const started = await this.store.mutate(run.id, (current) => {
           if (current.steps[stepId]!.status !== "ready" || isPaused(current)) return null;
           const feedback = current.steps[stepId]!.feedback;
@@ -2515,8 +3981,18 @@ export class Runtime {
     };
     try {
       // An isolated run's scripts run in its worktree; one the worktree's commit lacks (uncommitted in the workspace) runs from the workspace.
+      // After refresh_scripts, the run's own copy of origin/<branch>'s scripts comes first.
+      const refreshed = run.scripts ? path.join(run.scripts.dir, step.script!) : null;
       const inWorktree = run.worktree ? path.join(run.worktree.path, step.script!) : null;
-      const child = spawn(inWorktree && existsSync(inWorktree) ? inWorktree : path.join(run.workspaceDir, step.script!), [], {
+      const scriptFile = refreshed && existsSync(refreshed) ? refreshed : inWorktree && existsSync(inWorktree) ? inWorktree : path.join(run.workspaceDir, step.script!);
+      if (!existsSync(scriptFile)) {
+        // Fail fast with where it looked, instead of a bare ENOENT: a checkout behind origin is the usual cause.
+        const dir = engine.workDir(run);
+        void gitOutput(dir, ["rev-parse", "HEAD"]).then((sha) => sha.trim(), () => "unknown").then((sha) =>
+          done({ code: null, signal: null }, `script file not found: ${scriptFile} (workspace ${dir}, head ${sha}); the workspace checkout may be behind origin or the path is wrong`));
+        return;
+      }
+      const child = spawn(scriptFile, [], {
         cwd: engine.workDir(run),
         env: scriptEnv(run, stepId, attempt, this.scriptFeedback.get(attemptId) ?? null),
         stdio: ["ignore", "pipe", "pipe"],
@@ -2964,6 +4440,8 @@ export class Runtime {
     if (this.startingSteps.has(startKey)) throw new UserError(`step "${stepId}" is being started right now (the plugin starts ready agent steps by itself)`);
     this.startingSteps.add(startKey);
     try {
+      const held = await this.rateCheck(run, startKey, true);
+      if (held) throw new RateHeldError(held);
       return await this.startStepNow(managerId, run, step, brief, model);
     } finally {
       this.startingSteps.delete(startKey);
@@ -2989,7 +4467,7 @@ export class Runtime {
     const agent = await this.api()
       .workspaces.ref(run.workspaceId)
       .agents.create({
-        config: { ...config, systemPrompt: stepSystemPrompt(run.playbook, step, role, run) },
+        config: withCodexQuestionGuidance({ ...config, systemPrompt: stepSystemPrompt(run.playbook, step, role, run) }),
         ...(managerId ? { parent: managerId } : {}),
         title: `${run.playbook.title} · ${role.title} #${attemptNo}`,
         labels: { [RUN_LABEL]: run.id, [STEP_LABEL]: stepId, "playbooks/attempt": String(attemptNo) },
@@ -3168,6 +4646,11 @@ export class Runtime {
   /** A gate decision from the panel (wakes the manager) or from chat via resume (does not). */
   async decideGate(runId: string, gateId: string, decision: engine.GateDecision): Promise<{ alreadyDecided: boolean; gate: Run["gates"][number] }> {
     const result = await this.store.mutate(runId, (current) => engine.decideGate(current, gateId, decision));
+    if (result.gate.kind === "permission" || result.gate.kind === "manager_question") {
+      // Not a step's decision: the agent that asked gets the answer and goes on. The manager is not woken.
+      if (!result.alreadyDecided) await this.answerPermissionGate(runId, result.gate);
+      return { alreadyDecided: result.alreadyDecided, gate: result.gate };
+    }
     if (result.gate.kind === "admission") {
       // A pipeline has no manager to tell: the decision acts on the job and the stage's queue.
       if (!result.alreadyDecided) await this.afterAdmissionDecision(runId, result.gate);
@@ -3213,14 +4696,248 @@ export class Runtime {
     }
   }
 
-  /** Hides a finished run from the panel; nothing else changes (no agent is archived or stopped). */
+  /**
+   * Hides a finished run from the panel. No agent is archived or stopped, except that with
+   * `workspace: { archive_with_run: true }` the run's workspace is archived too when it is safe.
+   */
   async archiveRun(runId: string): Promise<string> {
-    return this.store.mutate(runId, (run) => {
+    return (await this.archiveRunAndWorkspace(runId)).archivedAt;
+  }
+
+  /** archiveRun, with what happened to the workspace (`workspaceArchived: null` when the run was already archived: nothing was tried). */
+  async archiveRunAndWorkspace(runId: string, keepWorkspace: string | null = null, auto = false): Promise<{ archivedAt: string; workspaceArchived: { archived: boolean; reason: string; retry?: boolean } | null }> {
+    const first = await this.store.mutate(runId, (run) => {
       if (!isTerminal(run.status)) throw new UserError(`run ${runId} is ${run.status}: cancel it before archiving`);
       if (isActive(run)) throw new UserError(`run ${runId} is wrapping up (after-tasks running): wait or cancel them before archiving`);
+      const fresh = !run.archivedAt;
       run.archivedAt ??= nowIso();
-      return run.archivedAt;
+      return { archivedAt: run.archivedAt, fresh };
     });
+    if (!first.fresh) return { archivedAt: first.archivedAt, workspaceArchived: null };
+    const run = this.store.get(runId)!;
+    if (!run.playbook.workspace.archiveWithRun) return { archivedAt: first.archivedAt, workspaceArchived: { archived: false, reason: "workspace.archive_with_run is off" } };
+    if (keepWorkspace !== null) {
+      // auto_archive.keep_failed_workspace: a restartable failed run keeps its workspace until autoArchiveFailedWorkspaces archives it.
+      await this.store.mutate(runId, (current) => void engine.noteEvent(current, "workspace_kept", null, `workspace ${current.workspaceId} kept until ${keepWorkspace}: the run failed and can be restarted (auto_archive.keep_failed_workspace)`, nowIso())).catch(() => undefined);
+      return { archivedAt: first.archivedAt, workspaceArchived: { archived: false, reason: `kept until ${keepWorkspace}: the run failed and can be restarted` } };
+    }
+    const outcome: { archived: boolean; reason: string; retry?: boolean } = await this.archiveWorkspaceWithRun(run).catch((error: unknown) => ({ archived: false, reason: `could not check: ${errorText(error)}`, retry: true }));
+    await this.store
+      .mutate(runId, (current) => {
+        if (outcome.archived) {
+          current.workspaceArchive = "done";
+          engine.noteEvent(current, "workspace_archived", null, `workspace ${current.workspaceId} archived with the run (workspace.archive_with_run)`, nowIso());
+        } else {
+          engine.noteEvent(current, "workspace_kept", null, `workspace ${current.workspaceId} not archived with the run: ${outcome.reason}`, nowIso());
+          // auto_archive: a refusal that cannot clear is final; one that can (a busy agent) is asked again by retryAutoArchivedWorkspaces.
+          if (auto && outcome.retry === false) current.workspaceArchive = "skipped";
+        }
+      })
+      .catch((error) => console.error(`[playbooks] could not record the workspace archive of ${runId}:`, errorText(error)));
+    if (!outcome.archived) console.error(`[playbooks] workspace ${run.workspaceId} kept when archiving ${runId}: ${outcome.reason}`);
+    return { archivedAt: first.archivedAt, workspaceArchived: outcome };
+  }
+
+  /**
+   * `workspace.archive_with_run`: archives the run's workspace (and so every agent in it) when
+   * (a) no other run that is not archived uses it, (b) no agent in it runs or waits on a permission,
+   * (c) the run has ended (archiving already requires it), (d) it still exists, and (e) every visible
+   * agent in it carries a plugin label (a manager, step, gate or sidekick agent of a run), so a
+   * human's own agent is never archived. The run's worktree is a separate directory with its own
+   * cleanup (cleanupEndedWorktrees): archiving the workspace touches neither it nor its state.
+   */
+  private async archiveWorkspaceWithRun(run: Run, siblings: "unarchived" | "active" = "unarchived"): Promise<{ archived: boolean; reason: string; retry?: boolean }> {
+    /** `retry`: the refusal can clear by itself (a busy agent, another run still in it): the auto-archive sweeps ask again. Unsaved work, an agent that is not the run's and a vanished workspace stay refused. */
+    const skip = (reason: string, retry = false) => ({ archived: false, reason, retry });
+    if (!run.workspaceCreated) return skip("the run did not create its workspace (the project checkout or a workspace someone made is never archived)");
+    const others = this.store.list().filter((other) => other.id !== run.id && other.workspaceId === run.workspaceId && (siblings === "active" ? isActive(other) : !other.archivedAt));
+    if (others.length > 0) return skip(`run ${others[0]!.id} still uses it${siblings === "active" ? " and is active" : " and is not archived"}`, true);
+    const workspace = await this.workspaceOf(run.workspaceId);
+    if (!workspace) return skip("the workspace no longer exists or is already archived");
+    const listed = await this.api().agents.list({ filter: { projectKeys: [run.projectId] } });
+    const agents = listed.entries.map((entry) => entry.agent).filter((agent) => agent.workspaceId === run.workspaceId && !agent.archivedAt && !agent.internal);
+    const busy = agents.find((agent) => agent.status === "running" || agent.status === "initializing" || (agent.pendingPermissions?.length ?? 0) > 0);
+    if (busy) return skip(`agent ${busy.id} is running or waiting on a permission`, true);
+    // The run's own agents: a manager, step or gate agent (plugin labels), an agent a run recorded, and every agent a step created itself
+    // (a subagent, however deep: its parent chain ends at one of those). Nothing else is the run's.
+    const recorded = new Set(this.store.list().filter((other) => other.workspaceId === run.workspaceId).flatMap((other) => [other.managerAgentId, ...Object.values(other.steps).flatMap((step) => step.attempts.map((attempt) => attempt.agentId))]).filter(Boolean));
+    const labelled = (agent: (typeof agents)[number]) => agent.labels?.[MANAGER_LABEL] !== undefined || agent.labels?.[RUN_LABEL] !== undefined || agent.labels?.[STEP_LABEL] !== undefined || agent.labels?.[GATE_LABEL] !== undefined || recorded.has(agent.id);
+    const byId = new Map(agents.map((agent) => [agent.id, agent]));
+    const parentOf = (agent: (typeof agents)[number]) => (agent as { parentAgentId?: string | null }).parentAgentId ?? agent.labels?.["paseo.parent"] ?? null;
+    const own = (agent: (typeof agents)[number]): boolean => {
+      const seen = new Set<string>();
+      for (let current: (typeof agents)[number] | undefined = agent; current && !seen.has(current.id); current = byId.get(parentOf(current) ?? "")) {
+        if (labelled(current)) return true;
+        seen.add(current.id);
+      }
+      return false;
+    };
+    const foreign = agents.filter((agent) => !own(agent));
+    if (foreign.length > 0) return skip(`it holds agents that are not part of a run: ${foreign.map((agent) => agent.id).join(", ")}`);
+    const dir = workspace.workspaceDirectory;
+    if (dir && dir !== workspace.projectRootPath) {
+      const unsaved = await unsavedWork(dir).catch((error: unknown) => `could not check its git state: ${errorText(error)}`);
+      if (unsaved) return skip(unsaved);
+    }
+    // Leftover agents of the run (idle or finished: none is busy, checked above) are archived first, so they are not left listed
+    // however the workspace archive treats them. A failure here is not fatal: the workspace archive is still tried.
+    for (const agent of agents.filter((candidate) => candidate.labels?.[MANAGER_LABEL] === undefined)) {
+      await this.api().agents.ref(agent.id).archive().catch((error: unknown) => console.error(`[playbooks] could not archive leftover agent ${agent.id} of ${run.id}:`, errorText(error)));
+    }
+    try {
+      await this.archiveWorkspace(run.workspaceId);
+    } catch (error) {
+      return skip(`archive_workspace failed: ${errorText(error)}`, true);
+    }
+    return { archived: true, reason: "archived" };
+  }
+
+  /**
+   * `workspace.archive_after` (default 6h): the workspace of a run that completed or was canceled is archived that long after it
+   * ended, with the same safety checks as archiving the run (the run itself stays visible). A failed run only on an explicit archive.
+   * A refusal is written once in the history; a later archive of the run tries again.
+   */
+  private async archiveAgedWorkspaces(): Promise<void> {
+    const now = Date.now();
+    for (const candidate of this.store.list()) {
+      const after = candidate.playbook.workspace.archiveAfterMs;
+      if (after === null || candidate.workspaceArchive !== null || !candidate.workspaceCreated || candidate.status === "failed" || !isTerminal(candidate.status) || isActive(candidate)) continue;
+      if (now - Date.parse(candidate.updatedAt) < after) continue;
+      const outcome = await this.archiveWorkspaceWithRun(candidate, "active").catch((error: unknown) => ({ archived: false, reason: `could not check: ${errorText(error)}` }));
+      await this.store.mutate(candidate.id, (run) => {
+        run.workspaceArchive = outcome.archived ? "done" : "skipped";
+        if (outcome.archived) engine.noteEvent(run, "workspace_archived", null, `workspace ${run.workspaceId} archived ${Math.round(after / 60_000)} min after the run ended (workspace.archive_after)`, nowIso());
+        else engine.noteEvent(run, "workspace_kept", null, `workspace ${run.workspaceId} not archived after the run ended: ${outcome.reason}`, nowIso());
+      });
+      if (!outcome.archived) console.error(`[playbooks] workspace ${candidate.workspaceId} kept after ${candidate.id} ended: ${outcome.reason}`);
+    }
+  }
+
+  /** When each run was last looked at by `autoArchiveRuns` and not archived: the daemon is not asked about it again for AUTO_ARCHIVE_RETRY_MS. */
+  private readonly autoArchiveTried = new Map<string, number>();
+
+  /**
+   * `auto_archive` (ADR 2026-11-20-auto-archive-runs): archives a finished run, and its plugin-created manager agent, once
+   * `auto_archive.after` has passed since it ended. Candidates are chosen from memory (no daemon call); at most
+   * AUTO_ARCHIVE_PER_TICK are looked into per tick and a refusal waits AUTO_ARCHIVE_RETRY_MS, so the sweep stays cheap and
+   * never holds the tick for long. A run is left alone while it has an open gate, an open hand-off job, an after-task
+   * running, or its manager is in a turn. The workspace follows `workspace.archive_with_run` and its safety checks
+   * (unsaved or unpushed work keeps it); restart_run reopens the run and creates a manager when it is gone.
+   */
+  private async autoArchiveRuns(): Promise<void> {
+    const now = Date.now();
+    const runs = this.store.list();
+    for (const id of [...this.autoArchiveTried.keys()]) if (!this.store.get(id) || this.store.get(id)!.archivedAt) this.autoArchiveTried.delete(id);
+    const open = new Set(runs.flatMap((other) => other.jobs.filter((job) => job.status === "open").map((job) => job.fromRunId)));
+    let looked = 0;
+    for (const candidate of runs) {
+      if (looked >= AUTO_ARCHIVE_PER_TICK) break;
+      const { autoArchive } = candidate.playbook;
+      if (!autoArchive.enabled || candidate.archivedAt || !isTerminal(candidate.status) || isActive(candidate) || candidate.batch || isPipeline(candidate)) continue;
+      if (candidate.gates.some((gate) => gate.status === "pending") || open.has(candidate.id)) continue;
+      const ended = candidate.history.findLast((event) => event.type === "run_completed" || event.type === "run_failed" || event.type === "run_canceled")?.at ?? candidate.updatedAt;
+      if (now - Math.max(Date.parse(ended), Date.parse(candidate.updatedAt)) < autoArchive.afterMs) continue;
+      if (now - (this.autoArchiveTried.get(candidate.id) ?? 0) < AUTO_ARCHIVE_RETRY_MS) continue;
+      looked += 1;
+      this.autoArchiveTried.set(candidate.id, now);
+      try {
+        await this.autoArchiveRun(candidate);
+      } catch (error) {
+        console.error(`[playbooks] could not auto-archive ${candidate.id}:`, errorText(error));
+      }
+    }
+  }
+
+  /**
+   * `auto_archive.keep_failed_workspace` (ADR 2026-11-23-auto-archive-failed-run-workspaces): the workspace of a failed run that can
+   * be restarted was kept when the run was archived; this archives it once the keep period has passed since the failure, with the
+   * checks of `workspace.archive_with_run` (unsaved or unpushed work, a running agent, a human's agent, another active run in it keep
+   * it). A restarted run is not failed, so nothing is archived. A refusal that can clear (a busy agent, another active run) is asked again
+   * every AUTO_ARCHIVE_RETRY_MS for keep_failed_workspace more; one that cannot (unsaved work, a human's agent) is final and written once
+   * (ADR 2026-11-23-auto-archive-leftover-agents).
+   */
+  private async autoArchiveFailedWorkspaces(): Promise<void> {
+    const now = Date.now();
+    let looked = 0;
+    for (const candidate of this.store.list()) {
+      if (looked >= AUTO_ARCHIVE_PER_TICK) break;
+      const until = workspaceKeptUntil(candidate);
+      if (until === null || candidate.batch || isPipeline(candidate) || now < Date.parse(until)) continue;
+      if (now - (this.workspaceRetryTried.get(candidate.id) ?? 0) < AUTO_ARCHIVE_RETRY_MS) continue;
+      looked += 1;
+      this.workspaceRetryTried.set(candidate.id, now);
+      const outcome = await this.archiveWorkspaceWithRun(candidate, "active").catch((error: unknown) => ({ archived: false, reason: `could not check: ${errorText(error)}`, retry: true }));
+      await this.settleAutoWorkspace(candidate.id, outcome, until, "after the keep period", (run) => `archived ${Math.round(run.playbook.autoArchive.keepFailedWorkspaceMs / 60_000)} min after the run failed (auto_archive.keep_failed_workspace)`, (run) => run.status === "failed");
+    }
+  }
+
+  /** When `autoArchiveFailedWorkspaces` / `retryAutoArchivedWorkspaces` last asked about a run's workspace: not asked again for AUTO_ARCHIVE_RETRY_MS. */
+  private readonly workspaceRetryTried = new Map<string, number>();
+
+  /**
+   * Records the outcome of an auto_archive workspace attempt. A refusal that can clear by itself (`retry`: a busy agent, another run
+   * in it, the daemon failing) is asked again on a later sweep until `since` + keep_failed_workspace has passed (then it is final);
+   * one that cannot (unsaved work, an agent that is not the run's) is final at once. A refusal is written once per distinct reason.
+   */
+  private async settleAutoWorkspace(runId: string, outcome: { archived: boolean; reason: string; retry?: boolean }, since: string, when: string, archivedNote: (run: Run) => string, applies: (run: Run) => boolean): Promise<void> {
+    await this.store
+      .mutate(runId, (run) => {
+        if (!applies(run) || run.workspaceArchive !== null) return;
+        if (outcome.archived) {
+          run.workspaceArchive = "done";
+          engine.noteEvent(run, "workspace_archived", null, `workspace ${run.workspaceId} ${archivedNote(run)}`, nowIso());
+          return;
+        }
+        const giveUp = outcome.retry !== true || Date.now() >= Date.parse(since) + run.playbook.autoArchive.keepFailedWorkspaceMs;
+        if (giveUp) run.workspaceArchive = "skipped";
+        const text = `workspace ${run.workspaceId} not archived ${when}: ${outcome.reason}${giveUp ? "" : " (asked again on a later sweep)"}`;
+        if (run.history.findLast((event) => event.type === "workspace_kept")?.detail !== text) engine.noteEvent(run, "workspace_kept", null, text, nowIso());
+      })
+      .catch((error: unknown) => console.error(`[playbooks] could not record the workspace archive of ${runId}:`, errorText(error)));
+    if (!outcome.archived) console.error(`[playbooks] workspace of ${runId} kept: ${outcome.reason}`);
+  }
+
+  /**
+   * An auto-archived run whose workspace archive was refused for a reason that can clear (an agent still running or waiting on a
+   * permission, another run in it) is asked again every AUTO_ARCHIVE_RETRY_MS, for keep_failed_workspace after the run was archived;
+   * then the refusal is final. A failed run held by keep_failed_workspace is handled by `autoArchiveFailedWorkspaces`.
+   */
+  private async retryAutoArchivedWorkspaces(): Promise<void> {
+    const now = Date.now();
+    let looked = 0;
+    for (const candidate of this.store.list()) {
+      if (looked >= AUTO_ARCHIVE_PER_TICK) break;
+      if (!candidate.playbook.autoArchive.enabled || !candidate.playbook.workspace.archiveWithRun || !candidate.archivedAt || !candidate.workspaceCreated || candidate.workspaceArchive !== null) continue;
+      if (!isTerminal(candidate.status) || isActive(candidate) || candidate.batch || isPipeline(candidate) || workspaceKeptUntil(candidate) !== null) continue;
+      if (!candidate.history.some((event) => event.type === "run_auto_archived") || !candidate.history.some((event) => event.type === "workspace_kept" && event.at >= candidate.archivedAt!)) continue;
+      if (now - (this.workspaceRetryTried.get(candidate.id) ?? 0) < AUTO_ARCHIVE_RETRY_MS) continue;
+      looked += 1;
+      this.workspaceRetryTried.set(candidate.id, now);
+      const outcome = await this.archiveWorkspaceWithRun(candidate, "active").catch((error: unknown) => ({ archived: false, reason: `could not check: ${errorText(error)}`, retry: true }));
+      await this.settleAutoWorkspace(candidate.id, outcome, candidate.archivedAt, "after the run was archived", () => "archived on a later sweep (auto_archive)", () => true);
+    }
+  }
+
+  private async autoArchiveRun(candidate: Run): Promise<void> {
+    const managerId = isManagerless(candidate) ? null : candidate.managerAgentId || null;
+    if (managerId && this.busyManagers.has(managerId)) return;
+    const manager = managerId ? (await this.api().agents.ref(managerId).refresh().catch(() => null))?.agent ?? null : null;
+    if (manager && !manager.archivedAt && (manager.status === "running" || manager.status === "initializing" || manager.activeTurn || (manager.pendingPermissions?.length ?? 0) > 0)) return;
+    const { workspaceArchived } = await this.archiveRunAndWorkspace(candidate.id, workspaceKeptUntil(candidate), true);
+    // The manager goes only when the plugin made it (a restart_run takeOver may have made a human's agent the manager) and no other run uses it.
+    const shared = this.store.list().some((other) => other.id !== candidate.id && !other.archivedAt && other.managerAgentId === managerId);
+    let managerArchived = false;
+    if (managerId && manager && !manager.archivedAt && manager.labels?.[MANAGER_LABEL] !== undefined && !shared) {
+      managerArchived = await this.api().agents.ref(managerId).archive().then(() => true, (error: unknown) => {
+        console.error(`[playbooks] could not archive the manager of ${candidate.id}:`, errorText(error));
+        return false;
+      });
+    }
+    await this.store.mutate(candidate.id, (run) => engine.noteEvent(run, "run_auto_archived", null, `archived ${Math.round(candidate.playbook.autoArchive.afterMs / 60_000)} min after it ended (auto_archive)${managerArchived ? ", with its manager" : ""}`, nowIso())).catch(() => undefined);
+    const fresh = this.store.get(candidate.id) ?? candidate;
+    await this.bus
+      .emit("run.auto_archived", { ...runFieldsOf(fresh), managerArchived, workspaceArchived: workspaceArchived?.archived ?? false, workspaceReason: workspaceArchived && !workspaceArchived.archived ? workspaceArchived.reason : null }, { runId: candidate.id, source: "runs" })
+      .catch((error: unknown) => console.error("[playbooks] could not emit run.auto_archived:", errorText(error)));
   }
 
   /**
@@ -3228,10 +4945,10 @@ export class Runtime {
    * open in a pipeline (waiting or in a batch) is refused unless `force`: archiving hides it
    * while its result is still coming.
    */
-  async archiveRunByAgent(runId: string, force: boolean): Promise<{ run: Run; already: boolean }> {
+  async archiveRunByAgent(runId: string, force: boolean): Promise<{ run: Run; already: boolean; workspaceArchived: { archived: boolean; reason: string } | null }> {
     const existing = this.store.get(runId);
     if (!existing) throw new UserError(`unknown run "${runId}"`);
-    if (existing.archivedAt) return { run: existing, already: true };
+    if (existing.archivedAt) return { run: existing, already: true, workspaceArchived: null };
     if (!force) {
       const open = this.store.list().flatMap((candidate) => candidate.jobs.filter((job) => candidate.id !== runId && job.fromRunId === runId && job.status === "open").map((job) => ({ job, at: candidate })));
       const pipelineJobs = open.filter(({ at }) => !at.batch);
@@ -3240,8 +4957,8 @@ export class Runtime {
         throw new UserError(`run ${runId} has a job that is not settled yet (${where}): wait for it to settle (settle_job, or the batch ends), or pass force: true to archive anyway`);
       }
     }
-    await this.archiveRun(runId);
-    return { run: this.store.get(runId)!, already: false };
+    const { workspaceArchived } = await this.archiveRunAndWorkspace(runId);
+    return { run: this.store.get(runId)!, already: false, workspaceArchived };
   }
 
   /** Marks a finished run as seen by a human; an active run stays unseen (it can still change). */
@@ -3268,6 +4985,156 @@ export class Runtime {
       await this.deliver(runId);
     }
     return this.store.get(runId)!;
+  }
+
+  /** Whether the parent run of a child is exempt from quota limiting: the child is too. */
+  private parentExempt(parent: Run["parent"] | undefined): boolean {
+    return parent ? this.store.get(parent.runId)?.quotaExempt === true : false;
+  }
+
+  /** The sticky "children follow my exemption" flag a child of `parent` carries on, so a later change reaches its own children too. */
+  private inheritedExemptFlag(parent: Run["parent"] | undefined): { inheritChildExempt?: boolean } {
+    return parent && this.store.get(parent.runId)?.inheritChildExempt ? { inheritChildExempt: true } : {};
+  }
+
+  /** What a child of `parent` starts with when the parent applies its manual priority to children (empty otherwise). */
+  private inheritedPriority(parent: Run["parent"] | undefined): { priorityOverride?: number; inheritChildPriority?: boolean } {
+    const owner = parent ? this.store.get(parent.runId) : undefined;
+    return owner?.inheritChildPriority && owner.priorityOverride !== null ? { priorityOverride: owner.priorityOverride, inheritChildPriority: true } : {};
+  }
+
+  /** Every run below `run` (children, their children...), each once; a cycle or a chain deeper than 20 stops there. */
+  private descendantsOf(run: Run): Run[] {
+    const all = this.store.list();
+    const seen = new Set<string>([run.id]);
+    const out: Run[] = [];
+    let level = [run.id];
+    for (let depth = 0; depth < 20 && level.length > 0; depth++) {
+      const next: string[] = [];
+      for (const candidate of all) {
+        if (candidate.parent && level.includes(candidate.parent.runId) && !seen.has(candidate.id)) {
+          seen.add(candidate.id);
+          out.push(candidate);
+          next.push(candidate.id);
+        }
+      }
+      level = next;
+    }
+    return out;
+  }
+
+  /**
+   * Sets (or, with null, clears) the manual quota priority of a run (ADR 2026-11-23-run-quota-priority-override). `applyToChildren`
+   * sets the sticky flag: true copies the priority onto every descendant now and onto the children the run starts later, false stops
+   * inheriting (children keep theirs); undefined keeps the flag, and a run whose flag is on passes every change down. The pace plan is
+   * looked at again at once. Throws on an unknown or archived run or a priority outside the playbook's range.
+   */
+  async setRunPriority(runId: string, priority: number | null, applyToChildren: boolean | undefined, by: string): Promise<{ run: Run; from: number | null; to: number | null; changed: boolean; cascaded: number }> {
+    const existing = this.store.get(runId);
+    if (!existing) throw new UserError(`unknown run "${runId}"`);
+    if (existing.archivedAt) throw new UserError(`run ${runId} is archived`);
+    try {
+      engine.checkPriority(priority);
+    } catch (error) {
+      throw new UserError(errorText(error));
+    }
+    const note = `by ${by}`;
+    const result = await this.store.mutate(runId, (current) => engine.setRunPriority(current, priority, applyToChildren, nowIso(), note));
+    let run = this.store.get(runId)!;
+    let cascaded = 0;
+    if (run.inheritChildPriority) {
+      for (const child of this.descendantsOf(run)) {
+        const done = await this.store.mutate(child.id, (current) => {
+          const out = engine.setRunPriority(current, priority, true, nowIso(), `from parent ${runId}`);
+          return out.changed;
+        });
+        if (done) cascaded += 1;
+      }
+    }
+    run = this.store.get(runId)!;
+    if (result.changed || cascaded > 0) {
+      await this.bus.emit("run.priority_changed", { ...runFieldsOf(run), from: result.from, to: priority, inheritChildren: run.inheritChildPriority, cascaded, by }, { runId, source: "runs" }).catch((error: unknown) => console.error("[playbooks] could not emit run.priority_changed:", errorText(error)));
+      this.kickLimits();
+    }
+    return { run, from: result.from, to: priority, changed: result.changed || cascaded > 0, cascaded };
+  }
+
+  /**
+   * Exempts a run from quota limiting, or puts it back under the limits (ADR 2026-11-23-run-quota-exempt-toggle). Exempt: any quota,
+   * headroom, pace or cap hold is lifted at once and the ready steps start without waiting for the 15 s tick; the run keeps reserving its
+   * cost. Not exempt: the limits apply again from its next step (a running step is never interrupted). `applyToChildren` sets the sticky
+   * `inheritChildExempt` flag like the priority's: true copies the state onto every active descendant now, false stops following,
+   * undefined keeps the flag (while on, every change is passed down again). Throws on an unknown, archived or finished run.
+   */
+  async setRunQuotaExempt(runId: string, exempt: boolean, applyToChildren: boolean | undefined, by: string): Promise<{ run: Run; from: boolean; to: boolean; changed: boolean; cascaded: number }> {
+    const existing = this.store.get(runId);
+    if (!existing) throw new UserError(`unknown run "${runId}"`);
+    if (existing.archivedAt) throw new UserError(`run ${runId} is archived`);
+    if (!isActive(existing)) throw new UserError(`run ${runId} is finished: its quota exemption cannot change`);
+    const note = `by ${by}`;
+    const result = await this.store.mutate(runId, (current) => engine.setRunExempt(current, exempt, applyToChildren, nowIso(), note));
+    let run = this.store.get(runId)!;
+    const touched = [runId];
+    let cascaded = 0;
+    if (run.inheritChildExempt) {
+      for (const child of this.descendantsOf(run)) {
+        if (!isActive(child) || child.archivedAt) continue;
+        const done = await this.store.mutate(child.id, (current) => engine.setRunExempt(current, exempt, true, nowIso(), `from parent ${runId}`).changed);
+        if (done) {
+          cascaded += 1;
+          touched.push(child.id);
+        }
+      }
+    }
+    run = this.store.get(runId)!;
+    if (result.changed || cascaded > 0) {
+      await this.bus.emit("run.quota_exempt_changed", { ...runFieldsOf(run), from: result.from, to: exempt, inheritChildren: run.inheritChildExempt, cascaded, by }, { runId, source: "runs" }).catch((error: unknown) => console.error("[playbooks] could not emit run.quota_exempt_changed:", errorText(error)));
+      // Released at once: the exempt runs' holds are lifted (the same path as a step start) and the ready steps start now. The others' pace plan is read again.
+      if (exempt) for (const id of touched) await this.rateCheck(this.store.get(id)!).catch((error: unknown) => console.error(`[playbooks] could not release the hold of exempt run ${id}:`, errorText(error)));
+      void this.tick().catch((error) => console.error("[playbooks] tick after a quota exemption failed:", errorText(error)));
+      this.kickLimits();
+    }
+    return { run, from: result.from, to: exempt, changed: result.changed || cascaded > 0, cascaded };
+  }
+
+  /**
+   * `dismiss_finding` (ADR 2026-11-23-dismiss-finding): records on the run that a review finding of a PR is dismissed, with the rationale.
+   * The guardrails (severity and category required, no P1, no security/auth/secrets/IAM/migration) are enforced here. Idempotent per PR
+   * and signature. Throws on an unknown or archived run.
+   */
+  async dismissFinding(runId: string, input: { pr: string; file: string; text: string; severity: string; category: string; rationale: string }, by: string): Promise<{ run: Run; entry: DismissedFinding; changed: boolean }> {
+    const existing = this.store.get(runId);
+    if (!existing) throw new UserError(`unknown run "${runId}"`);
+    if (existing.archivedAt) throw new UserError(`run ${runId} is archived`);
+    const pr = normalizePr(input.pr);
+    const file = normalizeFindingFile(input.file);
+    if (!pr) throw new UserError("pr is required");
+    if (!file) throw new UserError("file is required");
+    if (!normalizeFindingText(input.text)) throw new UserError("the finding text is empty once normalised: pass the finding as the reviewer wrote it");
+    if (input.rationale.trim().length < MIN_RATIONALE) throw new UserError(`rationale is required (at least ${MIN_RATIONALE} characters): say why the finding does not need a change`);
+    const refusal = dismissRefusal(input.severity, input.category);
+    if (refusal) throw new UserError(`not dismissed: ${refusal}. Leave it to a human (ask, or open a gate).`);
+    const entry = { pr, signature: findingSignature(file, input.text), file, text: input.text.trim().slice(0, 1000), severity: input.severity.trim(), category: input.category.trim(), rationale: input.rationale.trim(), by };
+    const result = await this.store.mutate(runId, (current) => engine.dismissFinding(current, entry, nowIso()));
+    const run = this.store.get(runId)!;
+    if (result.changed) {
+      await this.bus.emit("finding.dismissed", { ...runFieldsOf(run), pr, signature: entry.signature, file, severity: entry.severity, category: entry.category, rationale: entry.rationale, by }, { runId, source: "runs" }).catch((error: unknown) => console.error("[playbooks] could not emit finding.dismissed:", errorText(error)));
+    }
+    return { run, entry: result.entry, changed: result.changed };
+  }
+
+  /** `list_dismissed_findings`: the findings dismissed for a PR across every run (the oldest record of a signature wins), newest first. */
+  dismissedFindings(pr: string): DismissedFinding[] {
+    const key = normalizePr(pr);
+    const seen = new Map<string, DismissedFinding>();
+    for (const run of this.store.list()) {
+      for (const entry of run.dismissedFindings ?? []) {
+        if (entry.pr !== key) continue;
+        const known = seen.get(entry.signature);
+        if (!known || entry.at < known.at) seen.set(entry.signature, entry);
+      }
+    }
+    return [...seen.values()].sort((a, b) => b.at.localeCompare(a.at));
   }
 
   /**
@@ -3361,7 +5228,7 @@ export class Runtime {
     const agent = await this.api()
       .workspaces.ref(run.workspaceId)
       .agents.create({
-        config: { ...config, systemPrompt: stepSystemPrompt(run.playbook, step, role, run) },
+        config: withCodexQuestionGuidance({ ...config, systemPrompt: stepSystemPrompt(run.playbook, step, role, run) }),
         ...(run.managerAgentId ? { parent: run.managerAgentId } : {}),
         title: `${run.playbook.title} · ${role.title} #${attempt.n}`,
         labels: { [RUN_LABEL]: run.id, [STEP_LABEL]: stepId, "playbooks/attempt": String(attempt.n) },
@@ -3422,7 +5289,8 @@ export class Runtime {
     takeOver?: { id: string; workspaceId: string | null },
     workspaceId?: string,
     model?: ModelChoice,
-  ): Promise<{ run: Run; newManager: boolean }> {
+    refresh?: { reason: string },
+  ): Promise<{ run: Run; newManager: boolean; refreshed?: RefreshResult }> {
     const run = this.store.get(runId);
     if (!run) throw new UserError(`unknown run "${runId}"`);
     if (model) {
@@ -3470,6 +5338,8 @@ export class Runtime {
         throw new UserError(`"${playbookId}" allows ${limit} active run(s) in this project; held by: ${holders.filter((id) => !id.startsWith(run.id)).join(", ")}. Try again once one ends.`);
       }
     }
+    // refresh: the scripts and definition are re-read first; when that fails nothing was restarted.
+    const refreshed = refresh ? await this.refreshScripts(runId, refresh.reason, by ?? "restart_run") : undefined;
     const managerless = isManagerless(run);
     // A run with no manager (manager.mode: none) is restarted by the plugin: no manager is woken, created or taken over.
     if (managerless) takeOver = undefined;
@@ -3508,7 +5378,7 @@ export class Runtime {
       await this.enqueue(runId, lines);
       await this.deliver(runId);
     }
-    return { run: this.store.get(runId)!, newManager: replacement !== null || (takeOver !== undefined && takeOver.id !== run.managerAgentId) };
+    return { run: this.store.get(runId)!, newManager: replacement !== null || (takeOver !== undefined && takeOver.id !== run.managerAgentId), ...(refreshed ? { refreshed } : {}) };
   }
 
   /** The workspace from the shared lookup (one cached list for every id), or null when a fresh list does not have it: safe to act on as "gone". Rejects when the daemon cannot be asked, as `ref().refresh()` did. */
@@ -3561,6 +5431,112 @@ export class Runtime {
       .catch((error: unknown) => {
         throw new UserError(`could not create a new Playbook Manager in the run's workspace: ${errorText(error)}`);
       });
+  }
+
+  /** Read-only quota proof: never infer quota from a generic failed/canceled turn. */
+  private async managerQuota(agentId: string, outcome?: string) {
+    const handle = this.api().agents.ref(agentId);
+    const snapshot = await handle.refresh();
+    if (!snapshot || snapshot.agent.archivedAt) throw new UserError("manager is missing or archived");
+    const agent = snapshot.agent;
+    if (agent.status === "running" || agent.status === "initializing" || agent.activeTurn || agent.pendingPermissions?.length) {
+      throw new UserError("manager is active or has an open question/permission; recovery refused");
+    }
+    const page = await handle.timeline.refetch({ direction: "tail", limit: 30 });
+    // Only the latest turn's final assistant/error item is evidence. Older quota errors
+    // in the same page must not turn a later ordinary failure into a quota exit.
+    const entries = page.entries as unknown as Array<{ item?: Record<string, unknown> }>;
+    let reason = "";
+    let error = false;
+    for (const { item } of [...entries].reverse()) {
+      if (!item || typeof item.type !== "string") continue;
+      if (item.type === "user_message") break;
+      if (item.type === "assistant_message" || /error|fail/i.test(item.type)) {
+        error = item.type !== "assistant_message";
+        reason = error ? failureText([{ item }]) : typeof item.text === "string" ? item.text : "";
+        break;
+      }
+    }
+    if (!(error && outcome !== "completed" ? isQuotaError(reason) : isQuotaMessage(reason))) return null;
+    return { agent, reason };
+  }
+
+  /** A manager-only CAS handoff. Creation is unprompted until the binding is durable. */
+  async recoverManager(runId: string, expectedManagerId: string, reason: string, target?: string, outcome?: string, auto = false) {
+    return this.managerOperation(runId, async () => {
+      this.recoveringManagers.add(expectedManagerId);
+      let result;
+      let retargeted = false;
+      try {
+        const settings = await this.managerRecovery(await this.store.get(runId)?.playbook);
+        result = await this.store.mutate(runId, async (run) => {
+          if (run.managerAgentId !== expectedManagerId) {
+            const prior = run.managerRecoveries.find((entry) => entry.from === expectedManagerId && entry.to === run.managerAgentId);
+            if (prior && (!target || target === prior.target)) return { changed: false, ...prior };
+            throw new UserError("manager changed: expectedManagerId does not match; recovery refused");
+          }
+          if (!isActive(run) || run.archivedAt || isPipeline(run) || isManagerless(run) || run.batch) throw new UserError("recovery requires an active, unarchived playbook run with a manager");
+          if (isPaused(run)) throw new UserError("run is paused; recovery refused");
+          if (run.gates.some((gate) => gate.status === "pending" && (gate.kind === "manager_question" || gate.kind === "permission"))) {
+            throw new UserError("an open question/permission must keep its original agent; recovery refused");
+          }
+          const proof = await this.managerQuota(expectedManagerId, outcome);
+          if (!proof) throw new UserError("manager has no confirmed provider quota exit; recovery refused");
+          if (!proof.agent.provider || !proof.agent.model) throw new UserError("manager provider/model is unknown; recovery refused");
+          if (this.runsOfManager(expectedManagerId).filter(isActive).length !== 1) throw new UserError("manager owns multiple active runs; recovery refused");
+          const chain = this.managerTargets(run.playbook, settings.fallback);
+          if (target && !chain.some((candidate) => `${candidate.provider}/${candidate.model}` === target)) {
+            throw new UserError("model is not in the run's configured manager fallback chain; recovery refused");
+          }
+          const exhausted = `${proof.agent.provider}/${proof.agent.model}`;
+          if (!auto) engine.markTarget(run, exhausted, nowIso());
+          else if (await this.usageShowsHeadroom(run.playbook, proof.agent.provider, proof.agent.model)) run.exhausted = run.exhausted.filter((entry) => entry.target !== exhausted);
+          else if (!run.exhausted.some((entry) => entry.target === exhausted)) engine.markTarget(run, exhausted, nowIso());
+          run.managerQuotaBlockedId = expectedManagerId;
+          const skips = await this.managerSkips(run.playbook, engine.activeExhausted(run), settings.fallback);
+          const candidates = chain.filter((candidate) => candidate.model && !skips.includes(`${candidate.provider}/${candidate.model}`));
+          const chosen = target ? candidates.find((candidate) => `${candidate.provider}/${candidate.model}` === target) : candidates[0];
+          retargeted = chosen !== undefined && settings.fallback !== null && chosen.provider === settings.fallback.provider && chosen.model === settings.fallback.model && !this.managerTargets(run.playbook).some((candidate) => candidate.provider === chosen.provider && candidate.model === chosen.model);
+          // Commit the quota block even if there is no available fallback: no futile wake-up loop.
+          if (!chosen) return { changed: false, blocked: true as const, from: expectedManagerId, to: expectedManagerId, target: exhausted, thinking: null, reason: "no configured fallback is available", at: nowIso() };
+          const config: AgentConfig = { provider: `${chosen.provider}/${chosen.model}` };
+          if (chosen.target.mode) config.modeId = chosen.target.mode;
+          if (chosen.target.thinking) config.thinkingOptionId = chosen.target.thinking;
+          preapprove(config, chosen.provider, MANAGER_TOOL_NAMES);
+          const replacement = await this.api().workspaces.ref(run.workspaceId).agents.create({ config: withCodexQuestionGuidance(config), title: `Playbook Manager · ${run.playbook.title}`, labels: { [MANAGER_LABEL]: "true" } }).catch((error: unknown) => ({ error }));
+          if ("error" in replacement) return { changed: false, blocked: true as const, from: expectedManagerId, to: expectedManagerId, target: exhausted, thinking: null, reason: `replacement creation failed: ${errorText(replacement.error)}`, at: nowIso() };
+          // A human may have started the old manager while creation was in flight.
+          const stillIdle = await this.managerQuota(expectedManagerId, outcome).catch(() => null);
+          if (!stillIdle || stillIdle.agent.provider !== proof.agent.provider || stillIdle.agent.model !== proof.agent.model) {
+            // The unused replacement has never been prompted and owns no run/children.
+            await this.api().agents.ref(replacement.id).archive().catch(() => undefined);
+            return { changed: false, blocked: true as const, from: expectedManagerId, to: expectedManagerId, target: exhausted, thinking: null, reason: "manager changed or became active during recovery; recovery refused", at: nowIso() };
+          }
+          const record = { from: expectedManagerId, to: replacement.id, target: config.provider!, thinking: config.thinkingOptionId ?? null, reason: reason.trim() || proof.reason, at: nowIso() };
+          engine.replaceManager(run, replacement.id, record.reason, record.at);
+          run.managerRecoveries.push(record);
+          run.managerQuotaBlockedId = null;
+          run.managerRecoveryPrompt = `${managerTakeover(run, [], "after its previous manager hit provider quota")}\nRead get_run with view full before acting. Preserve all existing attempts, reports, outputs, local commits, jobs and gates. Do not restart steps or decide a human/role gate. Respect blockers in reports/lastMessage: a blocked or unimplemented report is not success just to fit an outcome schema. Do not retry blocked work until its documented prerequisites and required checks pass.\nRecovery reason: ${record.reason}\nCurrent state: ${JSON.stringify({ status: run.status, steps: Object.fromEntries(Object.entries(run.steps).map(([id, state]) => [id, state.status])), gates: run.gates, queue: run.inbox })}`;
+          if (auto) engine.noteEvent(run, "manager_recovered", null, `the manager was blocked by its provider's quota; the plugin replaced it by itself with ${record.target}${retargeted ? " (manager_recovery.fallback)" : ""}`, record.at);
+          return { changed: true, ...record };
+        });
+      } finally {
+        this.recoveringManagers.delete(expectedManagerId);
+      }
+      if (auto && result.changed) {
+        const fresh = this.store.get(runId);
+        if (fresh) await this.bus.emit("run.manager_recovered", { ...runFieldsOf(fresh), fromManagerId: expectedManagerId, managerId: result.to, target: result.target, retargeted }, { runId, source: "runs" }).catch((error: unknown) => console.error("[playbooks] could not emit run.manager_recovered:", errorText(error)));
+      }
+      if (!("blocked" in result)) await this.bus.rebindOwner(expectedManagerId, result.to);
+      if (result.changed) {
+        this.busyManagers.delete(expectedManagerId);
+        this.wokenManagers.delete(expectedManagerId);
+        this.gateManagers.delete(expectedManagerId);
+      }
+      // Never archive the old manager: Paseo cascades archival to its children.
+      if (!("blocked" in result)) await this.deliverManager(runId);
+      return { ...result, takeoverPending: this.store.get(runId)!.managerRecoveryPrompt !== null };
+    });
   }
 
   /**
@@ -3680,7 +5656,7 @@ export class Runtime {
     }
     const baseline = run.worktree?.workspaceSnapshot;
     if (baseline) {
-      const detail = snapshotDiff(baseline, await checkoutSnapshot(run.workspaceDir));
+      const detail = await checkoutViolationSince(run.workspaceDir, baseline);
       if (detail) return { kind: "isolation", detail };
     }
     const wt = run.worktree;
@@ -3888,7 +5864,7 @@ export class Runtime {
       agent = await this.api()
         .workspaces.ref(run.workspaceId)
         .agents.create({
-          config: { ...config, systemPrompt: stepSystemPrompt(run.playbook, step, role, probe) },
+          config: withCodexQuestionGuidance({ ...config, systemPrompt: stepSystemPrompt(run.playbook, step, role, probe) }),
           parent: run.managerAgentId,
           title: `${run.playbook.title} · ${role.title} #${attempt.n}`,
           labels: { [RUN_LABEL]: run.id, [STEP_LABEL]: stepId, "playbooks/attempt": String(attempt.n) },
@@ -3976,10 +5952,37 @@ export class Runtime {
    * (those still running are reloaded when their turn ends). Off with `reload_stale_sessions: false`.
    */
   private async reloadStaleSessions(): Promise<void> {
+    const started = Date.now();
+    const loopDelay = monitorEventLoopDelay({ resolution: 10 });
+    loopDelay.enable();
     const listed = await this.api().agents.list({});
-    for (const { agent } of listed.entries) {
-      if (agent.archivedAt || agent.status !== "idle") continue;
-      await this.sessions.reloadIfStale(this.api(), agent.id, { known: agent.labels?.[STEP_LABEL] !== undefined || agent.labels?.[GATE_LABEL] !== undefined || this.isRunAgent(agent.id) });
+    let reloaded = 0;
+    let gone = 0;
+    let busy = 0;
+    const failed = new Map<string, number>();
+    const candidates = listed.entries.map(({ agent }) => agent).filter((agent) => !agent.archivedAt && agent.status === "idle");
+    // A running agent is reloaded when its turn ends (onTurnEnded). A few reloads at a time, with a
+    // yield between two: each one makes the daemon call back (session-open hook) and must not starve hooks and RPCs.
+    let next = 0;
+    const worker = async () => {
+      while (next < candidates.length) {
+        const agent = candidates[next++]!;
+        const outcome = await this.sessions.tryReload(this.api(), agent.id, { quiet: true, known: agent.labels?.[STEP_LABEL] !== undefined || agent.labels?.[GATE_LABEL] !== undefined || this.isRunAgent(agent.id) });
+        if (outcome.kind === "reloaded") reloaded++;
+        else if (outcome.kind === "gone") gone++;
+        else if (outcome.kind === "busy") busy++;
+        else if (outcome.kind === "failed") failed.set(outcome.reason, (failed.get(outcome.reason) ?? 0) + 1);
+        await new Promise<void>((resolve) => setTimeout(resolve, this.options.reloadPauseMs ?? 20));
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.options.reloadConcurrency ?? RELOAD_CONCURRENCY, candidates.length) }, worker));
+    loopDelay.disable();
+    const maxLoopDelayMs = Math.round(loopDelay.max / 1e6);
+    const stale = new Set(this.sessions.staleIds());
+    const running = listed.entries.filter(({ agent }) => !agent.archivedAt && agent.status !== "idle" && stale.has(agent.id)).length;
+    const failures = [...failed].map(([reason, count]) => `${count}× ${reason}`).join("; ");
+    if (reloaded + gone + busy + running + failed.size > 0) {
+      console.log(`[playbooks] session reload after the plugin update: ${reloaded} reloaded, ${gone} skipped because their working directory is gone, ${running + busy} deferred (mid-turn: reloaded when the turn ends, or retried), ${[...failed.values()].reduce((a, b) => a + b, 0)} failed${failures ? ` (${failures}); retrying` : ""}; took ${((Date.now() - started) / 1000).toFixed(1)}s, max event-loop delay ${maxLoopDelayMs}ms`);
     }
   }
 
@@ -4000,6 +6003,21 @@ export class Runtime {
       await this.handOff(agentId, handoff, false);
       return;
     }
+    const managerRun = this.activeRunOfManager(agentId);
+    if (managerRun && outcome !== "canceled") {
+      const quota = await this.managerQuota(agentId, outcome).catch(() => undefined);
+      if (quota) {
+        this.busyManagers.delete(agentId);
+        await this.recoverManager(managerRun.id, agentId, "provider quota", undefined, outcome).catch((error) =>
+          console.error(`[playbooks] manager recovery of ${managerRun.id}:`, errorText(error)));
+        return;
+      }
+      if (quota === null && outcome === "completed" && managerRun.managerQuotaBlockedId === agentId) {
+        await this.store.mutate(managerRun.id, (run) => {
+          if (run.managerAgentId === agentId) run.managerQuotaBlockedId = null;
+        });
+      }
+    }
     await this.onManagerTurnEnded(agentId);
     await this.askGatesInChat().catch((error) => console.error("[playbooks] gate question failed:", errorText(error)));
     await this.cleanupEndedWorktrees().catch((error) => console.error("[playbooks] worktree cleanup failed:", errorText(error)));
@@ -4007,9 +6025,9 @@ export class Runtime {
   }
 
   /** Where the tokens went (see shared/analytics.ts), over the runs on disk. */
-  async analytics(options: { days?: number | undefined; playbook?: string | undefined; projectId?: string | undefined; limit?: number | undefined } = {}): Promise<Analytics> {
+  async analytics(options: { days?: number | undefined; playbook?: string | undefined; projectId?: string | undefined; timeZone?: string | undefined; limit?: number | undefined } = {}): Promise<Analytics> {
     const since = options.days ? new Date(Date.now() - options.days * 86_400_000).toISOString() : null;
-    return analyze(this.store.list(), { since, playbook: options.playbook ?? null, projectId: options.projectId ?? null, agents: await this.usageLedger.list(), ...(options.limit ? { limit: options.limit } : {}) });
+    return analyze(this.store.list(), { since, playbook: options.playbook ?? null, projectId: options.projectId ?? null, agents: await this.usageLedger.list(), timeZone: options.timeZone ?? null, ...(options.limit ? { limit: options.limit } : {}) });
   }
 
   /**
@@ -4057,6 +6075,7 @@ export class Runtime {
     this.recentArchives = [...this.recentArchives.filter((entry) => at - entry.at < 5000), { id: agentId, at }];
     this.pendingHandoffs.delete(agentId);
     await this.bus.dropOwner(agentId);
+    await this.onPermissionResolved(agentId, null, "the agent was archived").catch((error) => console.error("[playbooks] permission gate close failed:", errorText(error)));
     const decider = this.deciderOf(agentId);
     if (decider) {
       this.stoppedDeciders.add(agentId);
@@ -4125,6 +6144,7 @@ export class Runtime {
       if (isActive(run)) await this.cancelRun(run.id, "worktree archived", null).catch(() => undefined);
       const wt = this.store.get(run.id)?.worktree;
       if (wt && wt.state !== "removed") await this.dropWorktree(run.id, wt, await this.repoOf(run, wt), true).catch((error: unknown) => console.error(`[playbooks] could not remove the worktree of ${run.id}:`, errorText(error)));
+      await this.dropRunScripts(run.id);
       await this.store.delete(run.id);
     }
     this.reservations.delete(workspaceId);
@@ -4317,22 +6337,50 @@ export class Runtime {
 
   /** Agent config of a new Playbook Manager for this playbook. */
   /** The manager's targets (its tier, primary first) with their resolved provider and model. */
-  private managerTargets(playbook: Playbook) {
+  private managerTargets(playbook: Playbook, recoveryFallback: ManagerRecoveryConfig["fallback"] = null) {
     const targets: AgentSettings[] = [playbook.manager, ...(playbook.manager.fallback ?? [])];
-    return targets.map((target) => {
+    const own = targets.map((target) => {
       const provider = target.provider ?? DEFAULT_PROVIDER;
       return { target, provider, model: target.model ?? (provider === DEFAULT_PROVIDER ? DEFAULT_MODEL : undefined) };
     });
+    const seen = new Set(own.map((candidate) => `${candidate.provider}/${candidate.model}`));
+    const extra = (playbook.fallback ?? []).filter((entry) => !seen.has(entry) && seen.add(entry)).map((entry) => {
+      const [provider, model] = splitTarget(entry);
+      return { target: inheritTarget({ ...own[0]!.target, provider: own[0]!.provider }, provider, model), provider, model };
+    });
+    const all = [...own, ...extra];
+    // `manager_recovery.fallback` (opt-in): the last resort of a recovery, after the manager's own chain.
+    if (recoveryFallback && !all.some((candidate) => candidate.provider === recoveryFallback.provider && candidate.model === recoveryFallback.model)) {
+      all.push({ target: inheritTarget({ ...own[0]!.target, provider: own[0]!.provider }, recoveryFallback.provider, recoveryFallback.model), provider: recoveryFallback.provider, model: recoveryFallback.model });
+    }
+    return all;
+  }
+
+  /** `manager_recovery` in effect for a playbook: its own fields, then the user config, then the defaults (retry on, no fallback). */
+  private async managerRecovery(playbook: Playbook | undefined): Promise<ManagerRecoveryConfig> {
+    const user = await readManagerRecoveryConfig().catch(() => ({}) as Partial<ManagerRecoveryConfig>);
+    return {
+      retry: playbook?.managerRecovery?.retry ?? user.retry ?? DEFAULT_MANAGER_RECOVERY.retry,
+      fallback: playbook?.managerRecovery?.fallback ?? user.fallback ?? DEFAULT_MANAGER_RECOVERY.fallback,
+    };
+  }
+
+  /** Whether the provider's usage reading is available and shows no window of `provider`/`model` at the playbook's threshold. */
+  private async usageShowsHeadroom(playbook: Playbook, provider: string, model: string | undefined): Promise<boolean> {
+    if (!playbook.usageCheck) return false;
+    const snapshot = await this.usage.read().catch(() => null);
+    if (!snapshot || !snapshot.providers.some((entry) => entry.providerId === provider && (entry.status === undefined || entry.status === "available"))) return false;
+    return usageBlock(snapshot, provider, model, playbook.usageThreshold) === null;
   }
 
   /** `exhausted` plus the manager targets whose provider's usage is at the threshold: what a new manager skips. */
-  private async managerSkips(playbook: Playbook, exhausted: string[] = []): Promise<string[]> {
-    const blocks = await this.usageBlocks(playbook, this.managerTargets(playbook));
+  private async managerSkips(playbook: Playbook, exhausted: string[] = [], recoveryFallback: ManagerRecoveryConfig["fallback"] = null): Promise<string[]> {
+    const blocks = await this.usageBlocks(playbook, this.managerTargets(playbook, recoveryFallback));
     return [...exhausted, ...blocks.keys()];
   }
 
   private managerConfig(playbook: Playbook, exhausted: string[] = []): AgentConfig {
-    // A multi-entry tier: the first target not out of tokens (nor at the usage threshold) at creation (the manager never switches mid-run).
+    // A multi-entry tier: the first target not out of tokens (nor at the usage threshold) at creation (recovery uses the same configured chain).
     const resolved = this.managerTargets(playbook);
     const { target, provider, model } = resolved.find((candidate) => candidate.model && !exhausted.includes(`${candidate.provider}/${candidate.model}`)) ?? resolved[0]!;
     if (!model) throw new UserError(`no model for the manager on provider "${provider}"; set manager.model in defaults/main.yaml`);
@@ -4340,7 +6388,7 @@ export class Runtime {
     if (target.mode) config.modeId = target.mode;
     if (target.thinking) config.thinkingOptionId = target.thinking;
     preapprove(config, provider, MANAGER_TOOL_NAMES);
-    return config;
+    return withCodexQuestionGuidance(config);
   }
 
   /**
@@ -4352,7 +6400,7 @@ export class Runtime {
     return (await this.sidekickRegistry.findByAgent(agentId)) !== null;
   }
 
-  async startPlaybookInWorkspace(caller: { id: string; workspaceId: string | null }, input: { playbook: string; inputs: Record<string, VarValue>; workspaceId: string | undefined; newWorkspace: boolean; autoStart?: boolean; workspaceName?: string | undefined }) {
+  async startPlaybookInWorkspace(caller: { id: string; workspaceId: string | null }, input: { playbook: string; inputs: Record<string, VarValue>; workspaceId: string | undefined; newWorkspace: boolean; autoStart?: boolean; workspaceName?: string | undefined; priority?: number | undefined; quotaExempt?: boolean | undefined }) {
     const isSidekick = await this.isSidekick(caller.id);
     if (input.workspaceName && !input.newWorkspace) throw new UserError("workspaceName names the new workspace: pass it with newWorkspace");
     // Without workspaceId a Sidekick branches the new workspace off its own (hidden) one, which is the project's root checkout.
@@ -4367,7 +6415,7 @@ export class Runtime {
     const callerProject = (await this.lookupWorkspace(caller.workspaceId))?.projectId;
     if (!callerProject) throw new UserError("cannot check that workspace against the caller's project: the caller's own workspace is not listed (list_workspaces)");
     if (workspace.projectId !== callerProject) throw new UserError("that workspace belongs to another project");
-    const started = await this.startFromPanel({ workspaceId: workspace.id, playbook: input.playbook, inputs: input.inputs, force: false, sameWorkspace: !input.newWorkspace, autoStart: input.autoStart !== false, workspaceName: input.workspaceName });
+    const started = await this.startFromPanel({ workspaceId: workspace.id, playbook: input.playbook, inputs: input.inputs, force: false, sameWorkspace: !input.newWorkspace, autoStart: input.autoStart !== false, workspaceName: input.workspaceName, priority: input.priority, quotaExempt: input.quotaExempt });
     if (started.status === "duplicate") throw new UserError(`${started.message} Not started again.`);
     return started;
   }
@@ -4383,6 +6431,10 @@ export class Runtime {
     autoStart?: boolean | undefined;
     /** Title of the new workspace (only when one is created); empty: the default title. */
     workspaceName?: string | undefined;
+    /** Rate-limit priority of the run (overrides the playbook's); unset: the playbook's. */
+    priority?: number | undefined;
+    /** Not subject to quota limiting (`start_playbook` `quota.exempt`). */
+    quotaExempt?: boolean | undefined;
     /** A fan-out step starting a child run: its id (reserved before the workspace exists) and its parent link. */
     child?: { runId: string; parent: NonNullable<Run["parent"]> } | undefined;
   }) {
@@ -4418,7 +6470,7 @@ export class Runtime {
     if (input.sameWorkspace && playbook.managerMode === "none") {
       const busy = this.workspaceConflict(workspace.id, playbook.isolation.mode === "worktree");
       if (busy) throw new UserError(`this workspace already has an active run (${busy.id}); use "Start in a new workspace"${playbook.isolation.mode === "worktree" ? "" : ", or give the playbook `isolation: worktree` so runs can share a workspace"}`);
-      const run = await this.startPlaybook({ id: "", workspaceId: workspace.id, cwd: workspaceDir }, playbook.id, resolved.inputs, { playbook });
+      const run = await this.startPlaybook({ id: "", workspaceId: workspace.id, cwd: workspaceDir }, playbook.id, resolved.inputs, { playbook, ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.quotaExempt ? { quotaExempt: true } : {}) });
       return { status: "started" as const, workspaceId: workspace.id, managerAgentId: "", runId: run.id, queued: false };
     }
     if (input.sameWorkspace) {
@@ -4426,7 +6478,7 @@ export class Runtime {
       if (busy) throw new UserError(`this workspace already has an active run (${busy.id}); use "Start in a new workspace"${playbook.isolation.mode === "worktree" ? "" : ", or give the playbook `isolation: worktree` so runs can share a workspace"}`);
       // The new agent creates the run itself with start_playbook, which takes this reserved id.
       const runId = `run_${shortId()}`;
-      this.addReservation(workspace.id, { runId, branch: null, playbook, inputs: resolved.inputs });
+      this.addReservation(workspace.id, { runId, branch: null, playbook, inputs: resolved.inputs, ...(input.priority !== undefined ? { priority: input.priority } : {}), ...(input.quotaExempt ? { quotaExempt: true } : {}) });
       const manager = await this.api().workspaces.ref(workspace.id).agents.create({
         config: this.managerConfig(playbook, await this.managerSkips(playbook)),
         title: `Playbook Manager · ${playbook.title}`,
@@ -4435,7 +6487,7 @@ export class Runtime {
       });
       return { status: "started" as const, workspaceId: workspace.id, managerAgentId: manager.id, runId, queued: false };
     }
-    return this.startInNewWorkspace(workspaceDir, playbook, resolved.inputs, input.workspaceName, input.child);
+    return this.startInNewWorkspace(workspaceDir, playbook, resolved.inputs, input.workspaceName, input.child, input.priority, input.quotaExempt);
   }
 
 
@@ -4449,7 +6501,7 @@ export class Runtime {
     return this.withProject(workspaceId, async (project) => {
       const pending = this.sidekickOpening.get(project.projectId);
       if (pending) return pending;
-      const creation = this.ensureSidekick(project).finally(() => this.sidekickOpening.delete(project.projectId));
+      const creation = this.serialSidekick(project.projectId, () => this.ensureSidekick(project)).finally(() => this.sidekickOpening.delete(project.projectId));
       this.sidekickOpening.set(project.projectId, creation);
       return creation;
     });
@@ -4462,23 +6514,38 @@ export class Runtime {
    */
   restartSidekick(workspaceId: string): Promise<{ projectId: string; workspaceId: string; agentId: string; created: boolean }> {
     return this.withProject(workspaceId, async (project) => {
-      const pending = this.sidekickOpening.get(project.projectId);
-      if (pending) await pending.catch(() => undefined);
-      const restart = (async () => {
+      const restart = this.serialSidekick(project.projectId, async () => {
         const known = await this.sidekickRegistry.read(project.projectId);
         if (!known) return this.ensureSidekick(project);
-        const load = await loadSidekick(project.root);
+        const load = await loadSidekick(project.root, { projectId: project.projectId });
         if (!load.configured) throw new UserError(`this project has no Sidekick: add a sidekick/ folder to its playbooks folder (see "Create the Sidekick files")`);
         if (!load.config) throw new UserError(`the Sidekick files have errors:\n${load.errors.join("\n")}`);
-        this.sidekickRolling.delete(known.agentId);
-        this.sidekickAsked.delete(known.agentId);
-        this.sidekickHeld.delete(known.agentId);
+        this.forgetSidekick(known.agentId);
         await this.api().agents.ref(known.agentId).archive().catch(() => undefined);
         return this.launchSidekick(project, load, known, known.handoff);
-      })().finally(() => this.sidekickOpening.delete(project.projectId));
+      }).finally(() => this.sidekickOpening.delete(project.projectId));
       this.sidekickOpening.set(project.projectId, restart);
       return restart;
     });
+  }
+
+  /** Runs a Sidekick creation, restart or replacement after the ones before it for the same project. */
+  private serialSidekick<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    const next = (this.sidekickChains.get(projectId) ?? Promise.resolve()).catch(() => undefined).then(fn);
+    const tail = next.catch(() => undefined);
+    this.sidekickChains.set(projectId, tail);
+    void tail.then(() => this.sidekickChains.get(projectId) === tail && this.sidekickChains.delete(projectId));
+    return next;
+  }
+
+  /** What the plugin remembers about a Sidekick agent in memory, dropped when the agent is replaced. */
+  private forgetSidekick(agentId: string): void {
+    this.sidekickCompactNext.delete(agentId);
+    this.sidekickCompacting.delete(agentId);
+    this.sidekickCompactedAt.delete(agentId);
+    this.sidekickSwept.delete(agentId);
+    this.sidekickHeld.delete(agentId);
+    this.sidekickHeldAgents.delete(agentId);
   }
 
   /** The workspace's project: id, label and root directory. */
@@ -4510,30 +6577,33 @@ export class Runtime {
   /** For each project (given by one of its workspaces): its Sidekick config, agent and active runs. */
   async sidekickProjects(workspaces: Array<{ projectId: string; workspaceId: string }>) {
     const registry = await this.sidekickRegistry.all();
-    const projects = [];
-    for (const { projectId, workspaceId } of workspaces) {
-      const project = await this.projectOf(workspaceId).catch(() => null);
-      if (!project) continue;
-      const load = await loadSidekick(project.root);
-      const record = registry[projectId];
-      const agent = record ? await this.api().agents.ref(record.agentId).refresh().catch(() => null) : null;
-      const open = this.store.list().filter((run) => run.projectId === projectId && !run.archivedAt);
-      projects.push({
-        projectId,
-        workspaceId,
-        label: project.label,
-        configured: load.configured,
-        errors: load.errors,
-        agentId: agent && !agent.agent.archivedAt ? record!.agentId : null,
-        activeRuns: open.filter((run) => !isTerminal(run.status)).length,
-        needYou: open.reduce((count, run) => count + run.gates.filter(waitsForHuman).length, 0),
-      });
-    }
-    return projects;
+    // Independent per project (a workspace lookup, a read of its files, an agent refresh): all at once, in the input's order.
+    const open = this.store.list().filter((run) => !run.archivedAt);
+    const found = await Promise.all(
+      workspaces.map(async ({ projectId, workspaceId }) => {
+        const project = await this.projectOf(workspaceId).catch(() => null);
+        if (!project) return null;
+        const record = registry[projectId];
+        const [load, agent] = await Promise.all([loadSidekick(project.root, { projectId }), record ? this.api().agents.ref(record.agentId).refresh().catch(() => null) : null]);
+        const mine = open.filter((run) => run.projectId === projectId);
+        return {
+          projectId,
+          workspaceId,
+          label: project.label,
+          configured: load.configured,
+          errors: load.errors,
+          agentId: agent && !agent.agent.archivedAt ? record!.agentId : null,
+          activeRuns: mine.filter((run) => !isTerminal(run.status)).length,
+          compacting: Boolean(agent && !agent.agent.archivedAt && this.sidekickCompacting.has(record!.agentId)),
+          needYou: mine.reduce((count, run) => count + run.gates.filter(needsReview).length, 0),
+        };
+      }),
+    );
+    return found.filter((project) => project !== null);
   }
 
   private async ensureSidekick(project: { projectId: string; label: string; root: string }) {
-    const load = await loadSidekick(project.root);
+    const load = await loadSidekick(project.root, { projectId: project.projectId });
     if (!load.configured) throw new UserError(`this project has no Sidekick: add a sidekick/ folder to its playbooks folder (see "Create the Sidekick files")`);
     if (!load.config) throw new UserError(`the Sidekick files have errors:\n${load.errors.join("\n")}`);
     const known = await this.sidekickRegistry.read(project.projectId);
@@ -4544,15 +6614,70 @@ export class Runtime {
     return this.launchSidekick(project, load, known, known?.handoff);
   }
 
+  /** Targets (`provider/model`) of the Sidekick's agents found out of tokens, with the time they come back (ms). In memory: a restart forgets them. */
+  private readonly sidekickExhausted = new Map<string, number>();
+
+  /**
+   * The chain of a Sidekick agent (or its subagents): the written target, the rest of its tier, then `providers.fallback`.
+   * `available` are the ones not marked out of tokens and not at their provider's usage threshold; same rules as a role's chain.
+   */
+  private async sidekickCandidates(primary: AgentTarget, fallback: AgentTarget[] | undefined, providers: SidekickProviders | undefined) {
+    const own = [primary, ...(fallback ?? [])].map((target) => {
+      const provider = target.provider ?? DEFAULT_PROVIDER;
+      return { target, provider, model: target.model ?? (provider === DEFAULT_PROVIDER ? DEFAULT_MODEL : undefined) };
+    });
+    const seen = new Set(own.map((candidate) => `${candidate.provider}/${candidate.model}`));
+    const extra = (providers?.fallback ?? [])
+      .filter((entry) => !seen.has(entry) && seen.add(entry))
+      .map((entry) => {
+        const [provider, model] = splitTarget(entry);
+        return { target: inheritTarget({ ...own[0]!.target, provider: own[0]!.provider }, provider, model), provider, model: model as string | undefined };
+      });
+    const all = [...own, ...extra];
+    const blocks = providers ? await this.usageBlocks({ usageCheck: providers.usageCheck, usageThreshold: providers.usageThreshold }, all) : new Map<string, UsageBlock>();
+    const now = Date.now();
+    const available = all.filter((candidate) => candidate.model && !((this.sidekickExhausted.get(`${candidate.provider}/${candidate.model}`) ?? 0) > now) && !blocks.has(`${candidate.provider}/${candidate.model}`));
+    return { all, available };
+  }
+
+  /** The first available target of a chain; the primary when every one is out (it is tried anyway, as a step's is). */
+  private async sidekickTarget(primary: AgentTarget, fallback: AgentTarget[] | undefined, providers: SidekickProviders | undefined) {
+    const { all, available } = await this.sidekickCandidates(primary, fallback, providers);
+    return available[0] ?? all[0]!;
+  }
+
+  /**
+   * A Sidekick's turn ended on its provider's out-of-tokens notice: that target is marked out for `providers.exhausted_for`,
+   * and when another target of its chain is available the agent is replaced by a new one on it (same hand-off, as after a
+   * failed compaction). True for a recognized quota ending, including when no target remains (it stays visible without a retry).
+   */
+  private async failOverSidekick(own: { projectId: string; record: { workspaceId: string; agentId: string; handoff?: string | undefined } }, config: SidekickConfig | null, outcome: string): Promise<boolean> {
+    if (!config || (outcome !== "failed" && outcome !== "completed")) return false;
+    const chain = (config.fallback?.length ?? 0) > 0 || (config.providers?.fallback.length ?? 0) > 0;
+    if (!chain) return false;
+    const agent = (await this.api().agents.ref(own.record.agentId).refresh().catch(() => null))?.agent;
+    const page = agent ? await this.api().agents.ref(own.record.agentId).timeline.refetch({ direction: "tail", limit: 30 }).catch(() => null) : null;
+    if (!agent || !page) return false;
+    const reason = outcome === "failed" ? failureText(page.entries as never) : lastAssistantText(page.entries as never);
+    if (!(outcome === "failed" ? isQuotaError(reason) : isQuotaMessage(reason))) return false;
+    const current = agent.model ? `${agent.provider}/${agent.model}` : agent.provider;
+    this.sidekickExhausted.set(current, Date.now() + (config.providers?.exhaustedForMs ?? DEFAULT_EXHAUSTED_FOR_MS));
+    const { available } = await this.sidekickCandidates({ provider: config.provider, model: config.model, mode: config.mode, thinking: config.thinking }, config.fallback, config.providers);
+    if (available.length === 0) return true; // Recognized quota ending: leave it visible, including when compaction failed.
+    await this.replaceSidekick(own.projectId, own.record, `${current} is out of tokens; moving to ${available[0]!.provider}/${available[0]!.model}`);
+    await this.bus.flush();
+    return true;
+  }
+
   /** Creates the Sidekick agent (in its hidden workspace, made if it is gone), saves it, and subscribes it to its events. */
   private async launchSidekick(project: { projectId: string; label: string; root: string }, load: Awaited<ReturnType<typeof loadSidekick>>, known: { workspaceId: string } | null, handoff: string | undefined) {
     const settings = load.config!;
-    const provider = settings.provider ?? DEFAULT_PROVIDER;
-    const model = settings.model ?? (provider === DEFAULT_PROVIDER ? DEFAULT_MODEL : undefined);
+    // The tier's first available target (a provider out of tokens, or at its usage threshold, is passed over); without a tier, the one written.
+    const { target, provider, model } = await this.sidekickTarget({ provider: settings.provider, model: settings.model, mode: settings.mode, thinking: settings.thinking }, settings.fallback, settings.providers);
     if (!model) throw new UserError(`no model for the Sidekick on provider "${provider}"; set sidekick.model in sidekick/sidekick.yaml`);
     const config: AgentConfig = { provider: `${provider}/${model}` };
-    if (settings.mode) config.modeId = settings.mode;
-    if (settings.thinking) config.thinkingOptionId = settings.thinking;
+    if (target.mode) config.modeId = target.mode;
+    if (target.thinking) config.thinkingOptionId = target.thinking;
     preapprove(config, provider, SIDEKICK_PLUGIN_TOOLS);
     if (config.options) {
       config.options.allowedTools.push(...SIDEKICK_PASEO_TOOLS.map((tool) => `mcp__paseo__${tool}`));
@@ -4564,47 +6689,266 @@ export class Runtime {
       ? this.api().workspaces.ref(workspaceId)
       : await this.createWorkspace({ title: sidekickTitle(project.label), source: { kind: "directory", path: project.root }, background: true });
     for (const warning of load.warnings) console.warn(`[playbooks] ${warning}`);
-    const subagent = { ...DEFAULT_SIDEKICK_SUBAGENT, ...(settings.mode ? { mode: settings.mode } : {}), ...settings.subagents };
+    const subs = settings.subagents;
+    const subChain = settings.providers || subs?.fallback ? await this.sidekickCandidates({ provider: subs?.provider ?? DEFAULT_SIDEKICK_SUBAGENT.provider, model: subs?.model ?? (subs?.provider ? undefined : DEFAULT_SIDEKICK_SUBAGENT.model), ...(subs?.mode ? { mode: subs.mode } : {}), ...(subs?.thinking ? { thinking: subs.thinking } : {}) }, subs?.fallback, settings.providers) : null;
+    const subPick = subChain?.available[0] ?? subChain?.all[0] ?? null;
+    const subagent = { ...DEFAULT_SIDEKICK_SUBAGENT, ...(!subPick && settings.mode ? { mode: settings.mode } : {}), ...pickAgentSettings(subPick && subPick.model ? { provider: subPick.provider, model: subPick.model, ...(subPick.target.mode ? { mode: subPick.target.mode } : {}), ...(subPick.target.thinking ? { thinking: subPick.target.thinking } : {}) } : subs) };
+    const subFallback = subChain && subPick ? subChain.all.slice(subChain.all.indexOf(subPick) + 1).filter((candidate) => candidate.model).map((candidate) => ({ provider: candidate.provider, model: candidate.model!, ...(candidate.target.mode ? { mode: candidate.target.mode } : {}), ...(candidate.target.thinking ? { thinking: candidate.target.thinking } : {}) })) : [];
     const agent = await workspace.agents.create({
       config,
       title: sidekickTitle(project.label),
       labels: { [SIDEKICK_LABEL]: "true", [SIDEKICK_PROJECT_LABEL]: project.projectId },
-      prompt: `${sidekickPrompt({ projectId: project.projectId, label: project.label, root: project.root, watch: settings.watch, subagent, ...(settings.runs ? { runs: settings.runs } : {}) }, load.instructions)}\n\n${sidekickKickoff(handoff)}`,
+      prompt: `${sidekickPrompt({ projectId: project.projectId, label: project.label, root: project.root, watch: settings.watch, subagent, ...(subFallback.length > 0 ? { subagentFallback: subFallback } : {}), ...(settings.agentRules?.length ? { agentRules: settings.agentRules } : {}), subagentWorkspace: this.subagentArchiveSetting(settings), ...(settings.runs ? { runs: settings.runs } : {}) }, load.instructions)}\n\n${sidekickKickoff(handoff)}`,
     });
-    const record = { workspaceId: workspaceId ?? workspace.id, agentId: agent.id };
+    const record = { workspaceId: workspaceId ?? workspace.id, agentId: agent.id, ...(handoff ? { handoff } : {}) };
     await this.sidekickRegistry.write(project.projectId, record);
     await this.subscribeEvents(agent.id, settings.watch, { projectId: project.projectId }, "idle").catch((error) =>
       console.error("[playbooks] could not subscribe the Sidekick:", errorText(error)),
     );
-    return { projectId: project.projectId, ...record, created: true };
+    // Whatever the path that got here, the new agent is the project's only live Sidekick.
+    await this.archiveOtherSidekicks(project.projectId, agent.id);
+    return { projectId: project.projectId, workspaceId: record.workspaceId, agentId: record.agentId, created: true };
   }
 
-  /** `sidekick_handoff`: saves the Sidekick's ledger; with `restart`, it is replaced by a new session when its turn ends. */
+  /** Archives every live Sidekick agent of the project but `keep` (found by labels, not by the registry). Returns the ones archived. */
+  private async archiveOtherSidekicks(projectId: string, keep: string): Promise<string[]> {
+    const listed = await this.api().agents.list({}).catch(() => null);
+    if (!listed) return [];
+    const extra = listed.entries.map(({ agent }) => agent).filter((agent) => agent.labels?.[SIDEKICK_LABEL] !== undefined && agent.labels?.[SIDEKICK_PROJECT_LABEL] === projectId && !agent.archivedAt && agent.id !== keep);
+    const archived: string[] = [];
+    for (const agent of extra) {
+      try {
+        await this.api().agents.ref(agent.id).archive();
+        this.forgetSidekick(agent.id);
+        archived.push(agent.id);
+        console.warn(`[playbooks] a second live Sidekick of project ${projectId} (${agent.id}) was archived; the project keeps ${keep}`);
+      } catch (error) {
+        console.error(`[playbooks] could not archive the duplicate Sidekick ${agent.id}:`, errorText(error));
+      }
+    }
+    return archived;
+  }
+
+  /**
+   * After a start or a reload: a project with several live Sidekicks (a replacement that was cut short, an old plugin) keeps
+   * one, the one its record names if it is alive, else the newest, and the others are archived.
+   */
+  private async reconcileSidekicks(): Promise<void> {
+    const listed = await this.api().agents.list({});
+    const live = listed.entries.map(({ agent }) => agent).filter((agent) => agent.labels?.[SIDEKICK_LABEL] !== undefined && agent.labels?.[SIDEKICK_PROJECT_LABEL] !== undefined && !agent.archivedAt);
+    const byProject = new Map<string, typeof live>();
+    for (const agent of live) byProject.set(agent.labels![SIDEKICK_PROJECT_LABEL]!, [...(byProject.get(agent.labels![SIDEKICK_PROJECT_LABEL]!) ?? []), agent]);
+    for (const [projectId, agents] of byProject) {
+      if (agents.length < 2) continue;
+      await this.serialSidekick(projectId, async () => {
+        const record = await this.sidekickRegistry.read(projectId);
+        const newest = [...agents].sort((a, b) => String((b as { createdAt?: string }).createdAt ?? "").localeCompare(String((a as { createdAt?: string }).createdAt ?? "")))[0]!;
+        const keep = agents.find((agent) => agent.id === record?.agentId) ?? newest;
+        if (record && record.agentId !== keep.id) await this.sidekickRegistry.write(projectId, { ...record, agentId: keep.id });
+        await this.archiveOtherSidekicks(projectId, keep.id);
+      }).catch((error) => console.error(`[playbooks] could not clean up the Sidekicks of project ${projectId}:`, errorText(error)));
+    }
+  }
+
+  /**
+   * `resume_gate`: an agent that talks to the human (the Sidekick, a coordinator) relays the human's own answer to an open
+   * gate, a human-decided one included, and the run resumes as after a panel click (same path, decidedVia "panel").
+   * Refused for an agent that belongs to a run (its manager, a step or role agent, a gate chat, anything they spawned): a
+   * run never answers its own human gate. A Sidekick is held to its project. `gates: { on_behalf: deny }` turns it off.
+   */
+  async resumeGateOnBehalf(agent: { id: string; title: string | null; parentAgentId: string | null }, input: { runId: string; gateId: string; choice: string; comment: string }): Promise<{ gate: Gate; run: Run }> {
+    const run = this.store.get(input.runId);
+    if (!run) throw new UserError(`unknown run "${input.runId}"`);
+    if (await this.belongsToRun(agent)) throw new UserError("resume_gate is for agents outside the runs: a manager, a step or gate agent (or anything a run started) cannot answer a human gate. Ask the human, who decides in the panel or through the agent they talk to.");
+    if ((await gatesOnBehalfSetting(run.workspaceDir)) === "deny") throw new UserError("answering a gate on behalf of the human is turned off here (gates: { on_behalf: deny } in defaults/main.yaml): the human decides in the panel");
+    const sidekick = await this.sidekickRegistry.findByAgent(agent.id);
+    if (sidekick && run.projectId !== sidekick.projectId) throw new UserError(`run "${input.runId}" is not a run of this Sidekick's project`);
+    const comment = input.comment.trim();
+    if (!comment) throw new UserError("comment is empty: it must carry the human's answer, word for word. Ask them with your interactive question tool first.");
+    const gate = run.gates.find((candidate) => candidate.id === input.gateId);
+    if (!gate) throw new UserError(`no gate "${input.gateId}" in run ${run.id} (list_gates shows the open ones)`);
+    if (gate.status !== "pending") throw new UserError(`gate ${gate.id} is not open: it was already decided (${gate.status}${gate.decidedVia ? ` via ${gate.decidedVia}` : ""})`);
+    // The engine refuses a choice the gate does not have, and a comment a choice requires.
+    const result = await this.decideGate(run.id, gate.id, { decision: input.choice, comment, by: `agent ${agent.title?.trim() || agent.id} on behalf of the human`, via: "panel", now: nowIso() });
+    if (result.alreadyDecided) throw new UserError(`gate ${gate.id} is not open: it was just decided (${result.gate.status} via ${result.gate.decidedVia ?? "?"})`);
+    return { gate: result.gate, run: this.store.get(run.id)! };
+  }
+
+  /**
+   * Defers an open human gate to Waiting (ADR 2026-11-20-deferred-gates): the human's reason and what it waits for are
+   * persisted on the gate. The gate stays open and decidable by the same rules; only its Needs you classification changes.
+   * A tracked condition must name a run (and gate) of the same project that exists now.
+   */
+  async deferGate(runId: string, gateId: string, input: { reason: string; condition: GateWaitCondition; remindAt?: string | null }, by: string, actor?: string): Promise<Gate> {
+    const run = this.store.get(runId);
+    if (!run) throw new UserError(`unknown run "${runId}"`);
+    const condition = input.condition;
+    if (condition.kind === "run_ended" || condition.kind === "gate_decided") {
+      const other = this.store.get(condition.runId);
+      if (!other || other.projectId !== run.projectId) throw new UserError(`run "${condition.runId}" is not a run of this project: only runs of the same project can be tracked`);
+      if (condition.kind === "gate_decided" && !other.gates.some((gate) => gate.id === condition.gateId)) throw new UserError(`no gate "${condition.gateId}" in run ${other.id} (list_gates shows the open ones)`);
+    }
+    const gate = await this.store.mutate(runId, (current) => {
+      try {
+        return engine.deferGate(current, gateId, { ...input, by }, nowIso());
+      } catch (error) {
+        if (error instanceof engine.EngineError) throw new UserError(error.message);
+        throw error;
+      }
+    });
+    const fresh = this.store.get(runId)!;
+    const deferral = gate.deferral!;
+    await this.bus.emit(
+      "gate.deferred",
+      { ...runFieldsOf(fresh), gateId: gate.id, stepId: gate.stepId, kind: gate.kind, reason: deferral.reason, waitsFor: describeCondition(deferral), tracked: isTracked(deferral.condition), deferredBy: by },
+      { runId, source: "runs", ...(actor ? { actors: [actor] } : {}) },
+    );
+    return gate;
+  }
+
+  /** Brings a deferred gate back to Needs you by hand (the panel, or the Sidekick for the human). Idempotent: false when it was not deferred. */
+  async returnGate(runId: string, gateId: string, by: string, note: string | null, returnedBy: string, actor?: string): Promise<boolean> {
+    if (!this.store.get(runId)) throw new UserError(`unknown run "${runId}"`);
+    const done = await this.store.mutate(runId, (current) => engine.returnGate(current, gateId, returnedBy, note ? `${by}: ${note}` : by, nowIso()));
+    if (done) await this.emitReturned(runId, gateId, returnedBy, note ? `${by}: ${note}` : by, returnedBy !== "human" && returnedBy !== "agent", actor);
+    return done;
+  }
+
+  private async emitReturned(runId: string, gateId: string, returnedBy: string, note: string | null, automatic: boolean, actor?: string): Promise<void> {
+    const run = this.store.get(runId);
+    const gate = run?.gates.find((candidate) => candidate.id === gateId);
+    if (!run || !gate?.deferral) return;
+    await this.bus.emit(
+      "gate.returned",
+      { ...gatePayload(gateListing(run, gate, Date.now())), reason: gate.deferral.reason, returnedBy, returnNote: note, automatic },
+      { runId, source: "runs", ...(actor ? { actors: [actor] } : {}) },
+    );
+  }
+
+  /**
+   * One pass over the deferred gates, from the event scan: a gate whose reminder date or tracked condition came is returned to
+   * review and announced (gate.returned, which the Sidekick watches by default). Reads persisted run state only, never chat, so
+   * it works across a restart and cannot be fooled by wording. Conditions of "manual" are never checked: they are brought back by hand.
+   */
+  private async deferralPass(now: number): Promise<void> {
+    const iso = new Date(now).toISOString();
+    for (const run of this.store.list()) {
+      if (run.archivedAt) continue;
+      for (const gate of run.gates) {
+        if (!isDeferred(gate) || !gate.deferral) continue;
+        const { condition, remindAt } = gate.deferral;
+        let why: { by: string; note: string } | null = null;
+        if (condition.kind === "date" && Date.parse(condition.at) <= now) why = { by: "date", note: `the date ${condition.at} came` };
+        else if (remindAt && Date.parse(remindAt) <= now) why = { by: "reminder", note: `the reminder date ${remindAt} came; the condition was not tracked or has not happened` };
+        else if (condition.kind === "run_ended") {
+          const other = this.store.get(condition.runId);
+          if (!other) why = { by: "run_ended", note: `run ${condition.runId} no longer exists` };
+          else if (isTerminal(other.status)) why = { by: "run_ended", note: `run ${other.id} ${other.status}` };
+        } else if (condition.kind === "gate_decided") {
+          const target = this.store.get(condition.runId)?.gates.find((candidate) => candidate.id === condition.gateId);
+          if (!target) why = { by: "gate_decided", note: `gate ${condition.gateId} of run ${condition.runId} no longer exists` };
+          else if (target.status !== "pending") why = { by: "gate_decided", note: `gate ${target.id} of run ${condition.runId} was decided: ${target.status}` };
+        }
+        if (!why) continue;
+        const { by, note } = why;
+        const done = await this.store.mutate(run.id, (current) => engine.returnGate(current, gate.id, by, note, iso));
+        if (done) await this.emitReturned(run.id, gate.id, by, note, true);
+      }
+    }
+  }
+
+  /** The agent side of defer/return: the same rules as resume_gate (outside the runs, project-scoped, on_behalf not denied). */
+  private async outsideAgentRun(agent: { id: string; title: string | null; parentAgentId: string | null }, runId: string, what: string): Promise<{ run: Run; by: string }> {
+    const run = this.store.get(runId);
+    if (!run) throw new UserError(`unknown run "${runId}"`);
+    if (await this.belongsToRun(agent)) throw new UserError(`${what} is for agents outside the runs: a run's own manager, step or gate agent cannot set its gates aside. The human does it in the panel, or through the agent they talk to.`);
+    if ((await gatesOnBehalfSetting(run.workspaceDir)) === "deny") throw new UserError(`${what} on behalf of the human is turned off here (gates: { on_behalf: deny } in defaults/main.yaml): the human does it in the panel`);
+    const sidekick = await this.sidekickRegistry.findByAgent(agent.id);
+    if (sidekick && run.projectId !== sidekick.projectId) throw new UserError(`run "${runId}" is not a run of this Sidekick's project`);
+    return { run, by: `agent ${agent.title?.trim() || agent.id} on behalf of the human` };
+  }
+
+  async deferGateOnBehalf(agent: { id: string; title: string | null; parentAgentId: string | null }, input: { runId: string; gateId: string; reason: string; condition: GateWaitCondition; remindAt?: string | null; initiative?: "human" | "agent" | undefined }): Promise<Gate> {
+    const { by: onBehalf } = await this.outsideAgentRun(agent, input.runId, "defer_gate");
+    // A deferral the agent chose is recorded as the agent's own, never as the human's wish.
+    const by = input.initiative === "agent" ? `agent ${agent.title?.trim() || agent.id} on its own judgment` : onBehalf;
+    return this.deferGate(input.runId, input.gateId, input, by, agent.id);
+  }
+
+  async returnGateOnBehalf(agent: { id: string; title: string | null; parentAgentId: string | null }, input: { runId: string; gateId: string; note?: string | undefined }): Promise<boolean> {
+    const { by } = await this.outsideAgentRun(agent, input.runId, "return_gate");
+    return this.returnGate(input.runId, input.gateId, by, input.note?.trim() || null, "agent", agent.id);
+  }
+
+  /** True for an agent a run owns (manager, step, role decider, gate chat) or that one of them started, up to ten generations up. */
+  private async belongsToRun(agent: { id: string; parentAgentId: string | null }): Promise<boolean> {
+    const owned = (id: string) => this.store.list().some((run) => run.managerAgentId === id || run.gates.some((gate) => gate.deciderAgentId === id || gate.chatAgentId === id)) || this.stepRunOf(id) !== null;
+    let current: { id: string; parentAgentId: string | null } | null = agent;
+    for (let depth = 0; current && depth < 10; depth++) {
+      if (owned(current.id)) return true;
+      if (!current.parentAgentId) return false;
+      const parent: string = current.parentAgentId;
+      const snapshot = (await this.api().agents.ref(parent).refresh().catch(() => null))?.agent as { parentAgentId?: string | null } | undefined;
+      current = { id: parent, parentAgentId: snapshot?.parentAgentId ?? null };
+    }
+    return false;
+  }
+
+  /** `sidekick_handoff`: saves the Sidekick's ledger; with `restart`, its conversation is compacted when its turn ends (the same agent: no new one). */
   async sidekickHandoff(agentId: string, summary: string, restart: boolean): Promise<string> {
     const found = await this.sidekickRegistry.findByAgent(agentId);
     if (!found) throw new UserError("only a Sidekick can hand off");
     await this.sidekickRegistry.write(found.projectId, { ...found.record, handoff: summary });
-    if (!restart) return "Saved. The next session of the Sidekick starts from it.";
-    this.sidekickRolling.add(agentId);
-    return "Saved. End your turn now: the plugin starts a new session that continues from it.";
+    if (!restart) return "Saved. The plugin keeps it through a compaction of your conversation and gives it back to you after.";
+    this.sidekickCompactNext.add(agentId);
+    return "Saved. End your turn now: the plugin compacts your conversation (you stay the same agent) and gives you the ledger back.";
   }
 
-  /** Replaces a Sidekick by a new agent that starts from its saved hand-off; the old one is archived (its subscriptions end with it). */
-  private async rollSidekick(projectId: string, record: { workspaceId: string; agentId: string; handoff?: string | undefined }): Promise<void> {
-    this.sidekickRolling.delete(record.agentId);
-    this.sidekickAsked.delete(record.agentId);
-    this.sidekickSwept.delete(record.agentId);
-    const project = { ...(await this.projectOf(record.workspaceId)), projectId };
-    const load = await loadSidekick(project.root);
-    if (!load.config) return;
-    await this.api().agents.ref(record.agentId).archive();
-    await this.launchSidekick(project, load, record, record.handoff);
+  /**
+   * The safety net: replaces a Sidekick by a new agent that starts from its saved hand-off. The old agent is archived
+   * first, and only when that worked is the new one created, all under the project's lock: never two live Sidekicks.
+   */
+  private replaceSidekick(projectId: string, record: { workspaceId: string; agentId: string; handoff?: string | undefined }, why: string): Promise<unknown> {
+    return this.serialSidekick(projectId, async () => {
+      const current = await this.sidekickRegistry.read(projectId);
+      // Already replaced by someone else (a restart, a concurrent trigger): nothing to do.
+      if (!current || current.agentId !== record.agentId) return;
+      this.forgetSidekick(record.agentId);
+      const project = { ...(await this.projectOf(record.workspaceId)), projectId };
+      const load = await loadSidekick(project.root, { projectId });
+      if (!load.config) return;
+      console.warn(`[playbooks] Sidekick ${record.agentId} of project ${projectId} is replaced by a new agent: ${why}`);
+      await this.api().agents.ref(record.agentId).archive();
+      await this.launchSidekick(project, load, current, current.handoff);
+    });
+  }
+
+  /**
+   * Sends `/compact` to an idle Sidekick (like the managers': a message the provider runs as a command), with its saved
+   * ledger in the instructions. Returns true when the compaction started or the agent was replaced; false when there is
+   * nothing to do. When the send fails (no compaction for this provider) the agent is replaced instead, safely.
+   */
+  private async compactSidekick(projectId: string, record: { workspaceId: string; agentId: string; handoff?: string | undefined }, used: number): Promise<boolean> {
+    const agentId = record.agentId;
+    this.sidekickCompacting.add(agentId);
+    this.busyManagers.add(agentId);
+    try {
+      await this.api().agents.ref(agentId).send(sidekickCompactCommand(record.handoff));
+      console.log(`[playbooks] Sidekick ${agentId} of project ${projectId} is compacting its conversation (${used} tokens)`);
+      return true;
+    } catch (error) {
+      this.sidekickCompacting.delete(agentId);
+      this.busyManagers.delete(agentId);
+      console.error(`[playbooks] could not compact Sidekick ${agentId}:`, errorText(error));
+      await this.replaceSidekick(projectId, record, "compaction is not available");
+      return true;
+    }
   }
 
   /**
    * A Sidekick's own turn ended, or a subagent of one did. Subagents' finish notices wait until the
    * Sidekick is idle (so they never cut into a question to the human); a Sidekick past its context
-   * threshold is asked to hand off, then restarted.
+   * threshold is compacted (the same agent), and replaced only as a safety net (see replaceSidekick).
    */
   private async onSidekickTurnEnded(agentId: string, parentAgentId: string | null, outcome: string): Promise<boolean> {
     if (parentAgentId) {
@@ -4612,38 +6956,50 @@ export class Runtime {
       if (!parent) return false;
       const notice = `[playbooks] Subagent ${agentId.slice(0, 8)} finished its turn (${outcome}); read its report with get_agent_activity (limit 1).`;
       const sidekick = await this.api().agents.ref(parentAgentId).refresh().catch(() => null);
-      if (sidekick?.agent.status === "idle") await this.api().agents.ref(parentAgentId).send(notice);
-      else this.sidekickHeld.set(parentAgentId, [...(this.sidekickHeld.get(parentAgentId) ?? []), notice]);
+      if (sidekick?.agent.status === "idle") {
+        await this.api().agents.ref(parentAgentId).send(notice);
+        await this.scheduleSubagentArchive(agentId, parent.projectId, parent.record).catch((error) => console.error("[playbooks] could not schedule the subagent workspace archive:", errorText(error)));
+      } else {
+        this.sidekickHeld.set(parentAgentId, [...(this.sidekickHeld.get(parentAgentId) ?? []), notice]);
+        this.sidekickHeldAgents.set(parentAgentId, [...(this.sidekickHeldAgents.get(parentAgentId) ?? []), agentId]);
+      }
       return true;
     }
     const own = await this.sidekickRegistry.findByAgent(agentId);
     if (!own) return false;
     // Its turn is over: not busy any more (an end-of-turn send below starts a new one), and held event notices can go out.
     this.busyManagers.delete(agentId);
-    if (this.sidekickRolling.has(agentId)) {
-      await this.rollSidekick(own.projectId, own.record);
-      await this.bus.flush();
-      return true;
-    }
     const project = await this.projectOf(own.record.workspaceId).catch(() => null);
-    const limit = (project ? (await loadSidekick(project.root)).config?.restartAboveTokens : undefined) ?? DEFAULT_SIDEKICK_RESTART_TOKENS;
+    const sidekickConfig = project ? (await loadSidekick(project.root, { projectId: own.projectId })).config : null;
+    if (outcome !== "canceled" && (await this.failOverSidekick(own, sidekickConfig, outcome))) return true;
+    const limits = sidekickLimits(sidekickConfig);
+    // A zero (or missing) reading is the one right after a compaction: not a size.
     const used = (await this.api().agents.ref(agentId).refresh().catch(() => null))?.agent.lastUsage?.contextWindowUsedTokens ?? 0;
-    const parts = this.sidekickHeld.get(agentId) ?? [];
-    this.sidekickHeld.delete(agentId);
-    if (used > limit) {
-      // Asked once; if it still has not handed off after its next turn, restart it from the last saved ledger.
-      if (this.sidekickAsked.has(agentId)) {
-        await this.rollSidekick(own.projectId, own.record);
+    let afterCompaction = false;
+    if (this.sidekickCompacting.delete(agentId)) {
+      // The turn that just ended is the compaction.
+      if (outcome === "failed" || used > limits.hard) {
+        await this.replaceSidekick(own.projectId, own.record, outcome === "failed" ? "its compaction failed" : `its context is still ${used} tokens after the compaction (hard limit ${limits.hard})`);
         await this.bus.flush();
         return true;
       }
-      this.sidekickAsked.add(agentId);
-      parts.push(sidekickHandoffRequest(used));
+      if (used > limits.compact) this.sidekickCompactedAt.set(agentId, used);
+      else this.sidekickCompactedAt.delete(agentId);
+      this.sidekickSwept.delete(agentId);
+      afterCompaction = outcome === "completed";
+    } else if (outcome === "completed" && (this.sidekickCompactNext.delete(agentId) || used > Math.max(limits.compact, (this.sidekickCompactedAt.get(agentId) ?? 0) * 1.25))) {
+      // Idle and past the threshold: compact this same agent; held notices wait for the end of the compaction.
+      if (await this.compactSidekick(own.projectId, own.record, used)) return true;
     }
+    const parts = this.sidekickHeld.get(agentId) ?? [];
+    const toldAbout = this.sidekickHeldAgents.get(agentId) ?? [];
+    this.sidekickHeld.delete(agentId);
+    this.sidekickHeldAgents.delete(agentId);
+    if (afterCompaction) parts.unshift(sidekickCompactedNote((await this.sidekickRegistry.read(own.projectId))?.handoff));
     // End-of-turn sweep: open gates waiting for a human that this Sidekick was not yet told about.
     const swept = this.sidekickSwept.get(agentId) ?? new Set<string>();
     this.sidekickSwept.set(agentId, swept);
-    const open = this.store.list().filter((run) => run.projectId === own.projectId && !run.archivedAt).flatMap((run) => run.gates.filter(waitsForHuman).map((gate) => ({ runId: run.id, gate })));
+    const open = this.store.list().filter((run) => run.projectId === own.projectId && !run.archivedAt).flatMap((run) => run.gates.filter(needsReview).map((gate) => ({ runId: run.id, gate })));
     const fresh = open.filter(({ runId, gate }) => !swept.has(`${runId}:${gate.id}`));
     for (const key of [...swept]) if (!open.some(({ runId, gate }) => `${runId}:${gate.id}` === key)) swept.delete(key);
     if (fresh.length > 0) {
@@ -4658,25 +7014,132 @@ export class Runtime {
         this.busyManagers.delete(agentId);
         throw error;
       }
+      for (const subagentId of toldAbout) await this.scheduleSubagentArchive(subagentId, own.projectId, own.record).catch((error) => console.error("[playbooks] could not schedule the subagent workspace archive:", errorText(error)));
     } else await this.bus.flush();
     return true;
   }
 
+  // ---------------------------------------------------------------- Sidekick subagent workspaces
+
+  /** `sidekick.subagents.archive_workspace` and `archive_after`, with their defaults (on, 10 minutes). */
+  private subagentArchiveSetting(config: { subagents?: { archiveWorkspace?: boolean; archiveAfterMs?: number } } | null | undefined): { archive: boolean; afterMs: number } {
+    return { archive: config?.subagents?.archiveWorkspace ?? true, afterMs: config?.subagents?.archiveAfterMs ?? this.options.subagentArchiveAfterMs ?? DEFAULT_SUBAGENT_ARCHIVE_AFTER_MS };
+  }
+
+  /**
+   * A Sidekick was told that its subagent finished: its hidden workspace is archived after the grace period, unless
+   * the project's `sidekick.subagents.archive_workspace` is false. The due time is saved, so a restart keeps it, and a
+   * new finish of the same subagent moves it back. Only a subagent of a Sidekick gets here (its parent is the Sidekick).
+   */
+  private async scheduleSubagentArchive(subagentId: string, projectId: string, record: { workspaceId: string }): Promise<void> {
+    const project = await this.projectOf(record.workspaceId).catch(() => null);
+    const setting = this.subagentArchiveSetting(project ? (await loadSidekick(project.root, { projectId })).config : null);
+    if (!setting.archive) return;
+    const subagent = (await this.api().agents.ref(subagentId).refresh().catch(() => null))?.agent;
+    if (!subagent?.workspaceId || subagent.archivedAt) return;
+    const entry = { agentId: subagentId, workspaceId: subagent.workspaceId, projectId, dueAt: Date.now() + setting.afterMs };
+    await this.subagentArchives.upsert(entry);
+    this.armSubagentArchive(entry);
+  }
+
+  private armSubagentArchive(entry: { agentId: string; dueAt: number }): void {
+    const previous = this.subagentArchiveTimers.get(entry.agentId);
+    if (previous) clearTimeout(previous);
+    const timer = setTimeout(() => {
+      this.subagentArchiveTimers.delete(entry.agentId);
+      void this.archiveSubagentWorkspace(entry.agentId).catch((error) => console.error(`[playbooks] subagent workspace archive of ${entry.agentId} failed:`, errorText(error)));
+    }, Math.min(Math.max(0, entry.dueAt - Date.now()), 2 ** 31 - 1));
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.subagentArchiveTimers.set(entry.agentId, timer);
+  }
+
+  /** After a restart: the saved archives are armed again with the time left (the ones overdue run at once); nothing runs earlier than saved. */
+  private async rearmSubagentArchives(): Promise<void> {
+    for (const entry of await this.subagentArchives.all()) this.armSubagentArchive(entry);
+  }
+
+  /**
+   * The grace period of a Sidekick subagent is over: archives the subagent and its workspace when every guard
+   * holds (`subagentWorkspaceRefusal`: a hidden Paseo worktree made for it, never a checkout of the project or a
+   * run's workspace; nothing else in it; nothing running; no uncommitted changes; no unpushed commits).
+   * Otherwise the workspace is kept and the reason is logged. The entry is gone either way: a new finish of the subagent starts a new grace.
+   */
+  async archiveSubagentWorkspace(subagentId: string): Promise<{ archived: boolean; reason: string }> {
+    const entry = (await this.subagentArchives.all()).find((candidate) => candidate.agentId === subagentId);
+    if (!entry) return { archived: false, reason: "nothing pending" };
+    this.subagentArchiveTimers.delete(subagentId);
+    const outcome = await this.trySubagentArchive(entry).catch((error: unknown) => ({ archived: false, reason: `could not check: ${errorText(error)}` }));
+    await this.subagentArchives.remove(subagentId);
+    if (outcome.archived) console.log(`[playbooks] workspace ${entry.workspaceId} of Sidekick subagent ${subagentId} archived (sidekick.subagents.archive_workspace)`);
+    else console.error(`[playbooks] workspace ${entry.workspaceId} of Sidekick subagent ${subagentId} kept: ${outcome.reason}`);
+    return outcome;
+  }
+
+  private async trySubagentArchive(entry: { agentId: string; workspaceId: string; projectId: string }): Promise<{ archived: boolean; reason: string }> {
+    const keep = (reason: string) => ({ archived: false, reason });
+    const sidekick = await this.sidekickRegistry.read(entry.projectId);
+    if (!sidekick) return keep("the project has no Sidekick any more");
+    const project = await this.projectOf(sidekick.workspaceId).catch(() => null);
+    if (!project) return keep("the Sidekick's workspace is gone, so the project root is unknown");
+    if (!this.subagentArchiveSetting((await loadSidekick(project.root, { projectId: entry.projectId })).config).archive) return keep("sidekick.subagents.archive_workspace is off");
+    const subagent = (await this.api().agents.ref(entry.agentId).refresh().catch(() => null))?.agent;
+    if (subagent && (subagent as { parentAgentId?: string | null }).parentAgentId !== sidekick.agentId) return keep("the agent is not a subagent of the project's Sidekick");
+    if (subagent && subagent.workspaceId !== entry.workspaceId) return keep("the agent is not in the recorded workspace any more");
+    const workspace = await this.workspaceOf(entry.workspaceId);
+    if (!workspace) return keep("the workspace no longer exists or is already archived");
+    const listed = await this.api().agents.list({ filter: { projectKeys: [entry.projectId] } });
+    const otherAgents = listed.entries.map((item) => item.agent).filter((agent) => agent.workspaceId === entry.workspaceId && agent.id !== entry.agentId && !agent.archivedAt && !agent.internal).map((agent) => agent.id);
+    const directory = workspace.workspaceDirectory ?? null;
+    const refusal = subagentWorkspaceRefusal({
+      workspace: { id: workspace.id, kind: workspace.workspaceKind, background: workspace.background ?? null, worktreeSlug: workspace.worktreeSlug ?? null, directory },
+      sidekickWorkspaceId: sidekick.workspaceId,
+      projectRoot: project.root,
+      runWorkspaceIds: this.store.list().map((run) => run.workspaceId),
+      otherAgents,
+      agent: subagent ? { status: subagent.status, pendingPermissions: subagent.pendingPermissions?.length ?? 0 } : { status: "idle", pendingPermissions: 0 },
+      dirty: directory && existsSync(directory) ? await dirtyPaths(directory, []).catch(() => null) : [],
+      unpushed: directory && existsSync(directory) ? await unpushedCommits(directory) : [],
+    });
+    if (refusal) return keep(refusal);
+    if (subagent && !subagent.archivedAt) await this.api().agents.ref(entry.agentId).archive().catch((error) => console.error(`[playbooks] could not archive subagent ${entry.agentId}:`, errorText(error)));
+    await this.archiveWorkspace(entry.workspaceId);
+    return { archived: true, reason: "archived" };
+  }
+
   /** A new workspace branched off this one's current ref, with a new Playbook Manager that starts the run there. */
-  private async startInNewWorkspace(workspaceDir: string, playbook: Playbook, inputs: Record<string, VarValue>, workspaceName?: string, child?: { runId: string; parent: NonNullable<Run["parent"]> }) {
+  /**
+   * A new workspace branches off the root checkout's local branch, which may be behind origin (a script the playbook
+   * references is then missing). Right after creation it is fast-forwarded to `origin/<branch>`. Best effort: when that is
+   * impossible (offline, diverged) the run starts as it is and a note is logged.
+   */
+  private async freshenNewWorkspace(workspaceId: string, rootDir: string, branch: string | null | undefined): Promise<void> {
+    if (!branch) return;
+    try {
+      const dir = (await this.lookupWorkspace(workspaceId))?.workspaceDirectory;
+      if (!dir || dir === rootDir) return;
+      const result = await freshenCheckout(dir, branch);
+      if (result.note) console.warn(`[playbooks] new workspace ${workspaceId} stays on the root checkout's ${branch}: ${result.note}`);
+      else if (result.updated) console.log(`[playbooks] new workspace ${workspaceId} fast-forwarded to origin/${branch}`);
+    } catch (error) {
+      console.warn(`[playbooks] could not bring new workspace ${workspaceId} up to date:`, errorText(error));
+    }
+  }
+
+  private async startInNewWorkspace(workspaceDir: string, playbook: Playbook, inputs: Record<string, VarValue>, workspaceName?: string, child?: { runId: string; parent: NonNullable<Run["parent"]> }, priority?: number, quotaExempt?: boolean) {
     const runId = child?.runId ?? `run_${shortId()}`;
     const id = runId.replace(/^run_/, "");
     const branch = worktreeBranch(playbook.id, id);
     const base = (await currentRef(workspaceDir)) ?? undefined;
     const created = await this.createWorkspace({
-      title: workspaceTitle(playbook.title, inputs, workspaceName),
+      title: workspaceTitle(playbook.title, inputs, workspaceName, playbook.workspace.title),
       source: { kind: "worktree", cwd: workspaceDir, action: "branch-off", branchName: branch, ...(base ? { refName: base } : {}) },
     });
-    this.addReservation(created.id, { runId, branch, playbook, inputs, created: true, ...(child ? { parent: child.parent } : {}) });
+    this.addReservation(created.id, { runId, branch, playbook, inputs, created: true, ...(child ? { parent: child.parent } : {}), ...(priority !== undefined ? { priority } : {}), ...(quotaExempt ? { quotaExempt: true } : {}) });
+    await this.freshenNewWorkspace(created.id, workspaceDir, base ?? (await defaultBranch(workspaceDir)));
     if (playbook.managerMode === "none") {
       // No manager agent: the plugin creates the run itself, from the reservation, and drives it.
       try {
-        const run = await this.startPlaybook({ id: "", workspaceId: created.id, cwd: workspaceDir }, playbook.id, inputs, { playbook });
+        const run = await this.startPlaybook({ id: "", workspaceId: created.id, cwd: workspaceDir }, playbook.id, inputs, { playbook, ...(priority !== undefined ? { priority } : {}), ...(quotaExempt ? { quotaExempt: true } : {}) });
         return { status: "started" as const, workspaceId: created.id, managerAgentId: "", runId: run.id };
       } catch (error) {
         this.reservations.delete(created.id);
@@ -4696,7 +7159,7 @@ export class Runtime {
    * start_playbook with `newWorkspace`: the run gets its own workspace and its own Playbook
    * Manager, so any manager can start one, a batch's included (rework for an ejected job).
    */
-  async startPlaybookElsewhere(manager: { cwd: string; workspaceId: string | null }, playbookId: string, inputs: Record<string, unknown>, workspaceName?: string) {
+  async startPlaybookElsewhere(manager: { cwd: string; workspaceId: string | null }, playbookId: string, inputs: Record<string, unknown>, workspaceName?: string, priority?: number, quotaExempt?: boolean) {
     let workspaceDir = manager.cwd;
     let projectId: string | null = null;
     if (manager.workspaceId) {
@@ -4717,7 +7180,7 @@ export class Runtime {
     const resolved = engine.resolveRunInputs(playbook, inputs);
     if (!resolved.ok) throw new UserError(resolved.errors.join("; "));
     if (projectId) this.checkConcurrency(playbook, projectId);
-    return this.startInNewWorkspace(workspaceDir, playbook, resolved.inputs, workspaceName);
+    return this.startInNewWorkspace(workspaceDir, playbook, resolved.inputs, workspaceName, undefined, priority, quotaExempt);
   }
 
   /** Whether the playbook, as the workspace has it, declares `isolation: { mode: worktree }` (false when the workspace or playbook is missing or invalid). */

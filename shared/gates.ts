@@ -27,6 +27,32 @@ export const ADMISSION_CHOICES: GateChoice[] = [
   { id: "admit", label: "Admit anyway", comment: "optional", color: "warning" },
 ];
 
+/** The choices of a `permission` gate (an agent's tool permission request, `permissions.on_request: escalate`). */
+export const PERMISSION_CHOICES: GateChoice[] = [
+  { id: "allow", label: "Allow", comment: "none" },
+  { id: "deny", label: "Deny", comment: "optional", color: "danger" },
+];
+
+/**
+ * The choices of a `manager_question` gate (the manager's open question): one button per option, plus "Something else" (a typed answer);
+ * a question without options takes a typed answer; a request the panel cannot answer (several questions, multi-select) has none.
+ */
+export function managerQuestionChoices(question: Gate["question"]): GateChoice[] {
+  if (!question || !question.answerable) return [];
+  if (question.options.length === 0) return [{ id: "answered", label: "Send answer", comment: "required" }];
+  return [
+    ...question.options.map((option, index) => ({ id: `option-${index + 1}`, label: option.label, comment: "none" as const })),
+    { id: "other", label: "Something else", comment: "required" as const },
+  ];
+}
+
+/** The answer a `manager_question` choice gives the manager: the option's label, or the typed text. */
+export function managerQuestionAnswer(question: NonNullable<Gate["question"]>, choiceId: string, comment: string | null): string {
+  if (choiceId === "other" || choiceId === "answered") return (comment ?? "").trim();
+  const index = Number(choiceId.replace(/^option-/, "")) - 1;
+  return question.options[index]?.label ?? "";
+}
+
 /** The single choice of an `ask` gate without `choices`: the answer, required, becomes the feedback of the step it goes back to. */
 export const ASK_CHOICES: GateChoice[] = [{ id: "answered", label: "Send answer", comment: "required" }];
 
@@ -51,6 +77,8 @@ export function askTransitionOf(gate: Gate, step: Pick<Step, "on"> | undefined):
 export function choicesOfGate(gate: Gate, step: Pick<Step, "on" | "choices"> | undefined): GateChoice[] {
   if (gate.kind === "loop_limit") return LOOP_LIMIT_CHOICES;
   if (gate.kind === "admission") return ADMISSION_CHOICES;
+  if (gate.kind === "permission") return PERMISSION_CHOICES;
+  if (gate.kind === "manager_question") return managerQuestionChoices(gate.question);
   if (gate.kind === "ask") {
     const transition = askTransitionOf(gate, step);
     return transition ? askChoices(transition) : ASK_CHOICES;
@@ -68,6 +96,36 @@ export function choicesOfGate(gate: Gate, step: Pick<Step, "on" | "choices"> | u
  */
 export function waitsForHuman(gate: Gate): boolean {
   return gate.status === "pending" && !(gate.decider?.by === "role" && gate.escalated === null);
+}
+
+/** An open gate a human set aside with a reason and a waiting condition (Waiting, not Needs you). It can still be decided. */
+export function isDeferred(gate: Gate): boolean {
+  return gate.status === "pending" && gate.deferral != null && gate.deferral.returnedAt == null;
+}
+
+/** An open gate a human is asked to decide now: counted in Needs you. */
+export function needsReview(gate: Gate): boolean {
+  return waitsForHuman(gate) && !isDeferred(gate);
+}
+
+/** The gates of Waiting: open, awaiting a human, deferred. */
+export function isWaiting(gate: Gate): boolean {
+  return waitsForHuman(gate) && isDeferred(gate);
+}
+
+/** Whether the plugin itself tracks a condition (it returns the gate to review on its own). */
+export function isTracked(condition: NonNullable<Gate["deferral"]>["condition"]): boolean {
+  return condition.kind !== "manual";
+}
+
+export function describeCondition(deferral: NonNullable<Gate["deferral"]>): string {
+  const c = deferral.condition;
+  const base =
+    c.kind === "manual" ? `Manual: nothing tracks this${c.note ? ` (${c.note})` : ""}; bring it back yourself` :
+    c.kind === "date" ? `Tracked: back to review at ${c.at}` :
+    c.kind === "run_ended" ? `Tracked: back when run ${c.runId} ends` :
+    `Tracked: back when gate ${c.gateId} of run ${c.runId} is decided`;
+  return deferral.remindAt && c.kind !== "date" ? `${base}; reminder ${deferral.remindAt}` : base;
 }
 
 export function askHumanText(gate: Gate, choices: GateChoice[]): string {

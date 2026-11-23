@@ -16,5 +16,41 @@ agent:
 manager:
   mode: default                # the manager never edits files
   compact: { above_tokens: 150000 }   # never | on_step | on_gate_decided | { above_tokens: N }
+  # nudge: { enabled: true, after: 3m, max_interval: 30m }   # prompt an idle manager that leaves a reported step waiting (defaults shown)
 # isolation: worktree          # every run works in its own git worktree, so runs can share a workspace
 # reload_stale_sessions: false   # default true: after a plugin update, reload idle agents' sessions that hold the old tools
+# permissions: { on_request: authorize }   # what the plugin does when a run agent raises a tool permission request: authorize (default) | escalate (a gate) | deny
+# quota_limit: { priority: 0 }   # who goes first when quota headroom is short (see quota_limits): higher first, ties oldest first; a playbook may set its own, start_playbook may override per run
+# quota_limits: { quota: { usable_percent: 90 } }   # pace this folder's runs against provider quota at 90% (also in the user config)
+# closed_hours: { timezone: Europe/Paris, slots: [{ days: weekend, from: "00:00", to: "24:00" }, { days: weekdays, slots: [{ from: "00:00", to: "08:00" }, { from: "20:00", to: "24:00" }] }] }   # not counted by the quota allowance, and the warden pauses its clocks (also in the user config)
+# The warden: one periodic, deterministic pass over the active runs (no LLM, no message to an agent). OFF by default.
+warden: { enabled: false }
+# warden:                      # defaults shown; set enabled: true to turn it on
+#   enabled: false
+#   interval: 15m              # how often a run is looked at
+#   cooldown: 1h               # a finding that is still true is reported again after this
+#   checks:                    # action: report | none (stale_definition also: refresh_scripts, isolated runs only)
+#     stale_definition: { action: report }   # the run is pinned to an older definition than origin/<base>
+#     manager_blocked: { action: report }    # its manager is gone, or idle while a gate it holds is open
+#     loops: { above: 5, action: report }    # a goto edge fired more than this
+#     slow: { action: report }               # a running step is slower than its baseline
+#     gate_open: { after: 30m, action: report }
+#     stalled: { after: 30m, action: report } # an active run with nothing running, ready or queued and no open gate
+#     held: { after: 2h, action: report }     # an active run held for quota (not paused by a human) longer than this
+# warden:                      # PR checks (defaults only; each check is off unless its block is set; needs a Sidekick and the gh CLI)
+#   enabled: true
+#   pr_checks:
+#     fix_step: fix                                              # the step that fixes a run's PR: named in proposals
+#     review_bot: { author: some-bot, receipt: "^Reviewed", retrigger: "comment `/review` on PR {pr}" }
+#     no_reviewer: { required: [alice, bob] }                    # none requested or reviewed
+#     conflicting: {}
+#     review_stale: { after: 30m }                               # needs review_bot
+#     required_checks: { names: [build, lint], dispatch: "your-dispatch-command {name} --ref {branch} --sha {sha}" }
+#     # ... or also the checks the base branch's ruleset requires, with a workflow per check ({workflow} {repo} in dispatch):
+#     # required_checks: { names: [], from_ruleset: true, workflows: { build: ci.yml }, dispatch: "your-dispatch-command {workflow} --repo {repo} --sha {sha}" }
+#     review_findings: {}                                        # needs review_bot and fix_step
+#     # review_findings: { marker: { pattern: "findings: (\\w+)", truthy: "^(true|[1-9]\\d*)$" } }   # the bot's own marker instead of CHANGES_REQUESTED
+#     unowned: {}
+#     draft_idle: { after: 7d }
+#     repos: { names: [your-org/app, your-org/infra], from_runs: true }   # scan several repositories (default: the project root's)
+#     failed_run: { playbooks: [release, handoff], within: 24h }          # a failed run or step of these playbooks, sent with the step and error

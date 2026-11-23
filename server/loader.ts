@@ -25,12 +25,16 @@ import type {
   VarValue,
   When,
 } from "../shared/types";
-import { AgentSettingsSchema, DEFAULT_EXHAUSTED_FOR_MS, DEFAULT_MANAGER_COMPACT, DEFAULT_MANAGER_MODE, ManagerCompactSchema, ManagerModeSchema, type ManagerMode, type Isolation, type WakeOn, VarTypeSchema, VarValueSchema } from "../shared/types";
+import { AgentSettingsSchema, type AgentTarget, DEFAULT_EXHAUSTED_FOR_MS, DEFAULT_MANAGER_COMPACT, DEFAULT_MANAGER_MODE, DEFAULT_MANAGER_NUDGE, DEFAULT_PERMISSION_POLICY, DEFAULT_WARDEN, WARDEN_ACTIONS, type WardenConfig, type WardenPrConfig, type ManagerNudge, ManagerCompactSchema, ManagerModeSchema, type ManagerMode, type Isolation, type WakeOn, VarTypeSchema, VarValueSchema } from "../shared/types";
 import { BusError, checkTypes, FilterValueSchema } from "./bus";
 import { JOB_TYPES } from "./job-events";
 import { OVERSIGHT_TYPES } from "./oversight-events";
-import { readProjectDefault, readProjectProfiles } from "./config";
+import { noteDeprecatedKey, quotaLimitsLayerOf, readProjectDefault, readProjectProfiles, type QuotaLimitsLayer } from "./config";
+import { dayNumbers, parseClock, validTimezone, type ClosedHours } from "./closed-hours";
 import { bareId, DEFAULT_REPO, qualified } from "../shared/repos";
+import { MAX_SUBAGENT_ARCHIVE_AFTER_MS } from "./sidekick-archive";
+import { branchNameProblem } from "./branch-name";
+import { workspaceTitleRefs } from "../shared/workspace-name";
 import { coerceValue, parseDuration, replaceRefs, singleRef, templateRefs, typeCompatible } from "../shared/vars";
 
 /** Folders searched for playbooks, relative to the workspace. Each folder is self-contained. */
@@ -119,7 +123,13 @@ const RawTransitionSchema = z.union([
     decider: RawDeciderSchema.optional(),
   }),
   /** `decider`: who decides the loop-limit gate `max_loops` opens. */
-  z.object({ goto: z.string(), max_loops: z.number().int().positive().optional(), decider: RawDeciderSchema.optional() }),
+  z.object({
+    goto: z.string(),
+    max_loops: z.number().int().positive().optional(),
+    decider: RawDeciderSchema.optional(),
+    /** How long after the outcome the target starts, such as `2m` (parsed like `timeout`). Unset = at once. */
+    delay: z.string().optional(),
+  }),
 ]);
 
 /**
@@ -283,6 +293,16 @@ const RawFanoutStepSchema = z
             debounce: z.string().optional(),
           })
           .strict(),
+        /** Keep the pool open, waiting, when a pass says items remain but are blocked (instead of ending the step). */
+        idle: z
+          .object({
+            /** The pass playbook's output that says so: `true` = blocked items remain, wait. */
+            output: z.string().min(1),
+            /** While waiting, re-plan this often (a blocker may have landed). Default 10m. An added item re-plans at once. */
+            poll: z.string().optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .optional(),
@@ -430,8 +450,52 @@ const RawWorkspaceSchema = z
     archive: z.enum(["never", "on_end"]).optional(),
     /** Keep the workspace of a failed run (or one that lost its manager) for inspection. Default true. */
     keep_failed: z.boolean().optional(),
+    /** Archive the run's own Paseo workspace (with its agents) when the run is archived, if nothing is lost. Default true. */
+    archive_with_run: z.boolean().optional(),
+    /** Archive the workspace of a run that completed or was canceled this long after it ended (a duration such as 6h), or `never`. Default 6h. */
+    /** Title of the workspace a run creates for itself: text with `{input}` placeholders filled from the run's inputs, e.g. `Ship {ticket}`. Without it: `<playbook title>: <first input>`. */
+    title: z.string().min(1).optional(),
+    archive_after: z.string().refine((value) => value === "never" || parseDuration(value) !== null, { message: "archive_after must be a duration such as 6h or 30m, or never" }).optional(),
   })
   .strict();
+
+/** `auto_archive`: the plugin archives a finished run and its idle manager after a grace period (ADR 2026-11-20-auto-archive-runs). Off unless `enabled: true`. */
+const RawAutoArchiveSchema = z
+  .object({
+    /** `true` turns it on. Default false: a finished run stays in the list until archive_run. */
+    enabled: z.boolean().optional(),
+    /** Grace period after the run ended (a duration such as 30m or 2h). Default 30m. */
+    after: z.string().refine((value) => parseDuration(value) !== null, { message: "auto_archive.after must be a duration such as 30m or 2h" }).optional(),
+    /** How long the workspace of a failed run that can be restarted is kept (a duration such as 24h), counted from the failure; its agents are archived after `after` as usual. Default 24h. */
+    keep_failed_workspace: z.string().refine((value) => parseDuration(value) !== null, { message: "auto_archive.keep_failed_workspace must be a duration such as 24h or 2d" }).optional(),
+  })
+  .strict();
+
+export const DEFAULT_AUTO_ARCHIVE_AFTER_MS = 30 * 60_000;
+export const DEFAULT_KEEP_FAILED_WORKSPACE_MS = 24 * 3_600_000;
+
+export const DEFAULT_WORKSPACE_ARCHIVE_AFTER_MS = 6 * 3_600_000;
+
+/** `workspace.archive_after`: unset gives the default, `never` turns it off; a bad value was refused at load. */
+function archiveAfterMs(raw: string | undefined): number | null {
+  if (raw === undefined) return DEFAULT_WORKSPACE_ARCHIVE_AFTER_MS;
+  if (raw === "never") return null;
+  return parseDuration(raw) ?? DEFAULT_WORKSPACE_ARCHIVE_AFTER_MS;
+}
+
+/** What happens when an agent of a run raises a tool permission request. Same shape in a playbook and in `defaults/main.yaml`. */
+const RawPermissionsSchema = z
+  .object({
+    /** `authorize` (default): the plugin allows it on the human's behalf (a run agent in Bypass mode would have been authorized). `escalate`: a gate asks the human. `deny`: the agent is told to pick another way. */
+    on_request: z.enum(["authorize", "escalate", "deny"]).optional(),
+  })
+  .strict();
+
+/** A git branch name (`isolation.base`, `singleton.branch`): valid per `git check-ref-format --branch`, never starting with `-` (git would read it as an option). */
+const RawBranchNameSchema = z.string().min(1).superRefine((value, ctx) => {
+  const problem = branchNameProblem(value);
+  if (problem) ctx.addIssue({ code: "custom", message: `"${value}" is not a valid branch name: it ${problem}` });
+});
 
 /** Where a run's agents work: `worktree` (or `{ mode: worktree }`) gives the run a private git worktree. */
 const RawIsolationSchema = z.union([
@@ -443,7 +507,7 @@ const RawIsolationSchema = z.union([
       /** Submodules linked into the worktree: `none` (default; agents init what they need), `all`, or a list of paths. */
       submodules: z.union([z.enum(["none", "all"]), z.array(z.string().min(1))]).optional(),
       /** Branch the worktree starts from (its fresh origin copy). Default: the project's default branch. */
-      base: z.string().min(1).optional(),
+      base: RawBranchNameSchema.optional(),
       /** `false` (default): a step whose branch deletes a submodule entry (gitlink) fails; `true` turns that guard off. */
       allow_gitlink_removal: z.boolean().optional(),
     })
@@ -465,6 +529,16 @@ function resolveIsolation(own: RawIsolation | undefined, fallback: RawIsolation 
   return { mode: merged.mode ?? "none", submodules: merged.submodules ?? "none", base: merged.base ?? null, allowGitlinkRemoval: merged.allow_gitlink_removal ?? false };
 }
 
+/** `manager_recovery`: what the plugin does by itself when a run's manager is blocked by its provider's quota (ADR 2026-11-23-manager-auto-recovery-and-fresh-workspaces). */
+const RawManagerRecoverySchema = z
+  .object({
+    /** Retry recovery by itself, on a timer, once the provider's quota reading shows headroom again. Default true. */
+    retry: z.boolean().optional(),
+    /** Opt-in: when retrying, re-assign the manager to this provider/model (it need not be in the manager's tier). Default none. */
+    fallback: z.object({ provider: z.string().min(1), model: z.string().min(1) }).strict().optional(),
+  })
+  .strict();
+
 const RawSlowWarningSchema = z
   .object({
     /** How many of the latest completed runs of a step make its baseline (at least 3). Default 10. */
@@ -473,6 +547,297 @@ const RawSlowWarningSchema = z
     factor: z.number().gt(1).optional(),
   })
   .strict();
+
+/** `manager: { nudge }`: the watchdog for a reported step the manager has not acted on. */
+const RawManagerNudgeSchema = z
+  .object({
+    /** `false` turns the watchdog off. Default true. */
+    enabled: z.boolean().optional(),
+    /** How long a step waits, reported, before the manager is prompted (`3m`); also the first interval of the backoff. */
+    after: z.string().optional(),
+    /** The longest interval between two prompts (`30m`). Default 30m. */
+    max_interval: z.string().optional(),
+  })
+  .strict();
+type RawManagerNudge = z.infer<typeof RawManagerNudgeSchema>;
+
+/** The block as partial milliseconds; a bad value is reported through `fail`. */
+function resolveManagerNudge(raw: RawManagerNudge | undefined, where: string, fail: (message: string) => void): Partial<ManagerNudge> {
+  const out: Partial<ManagerNudge> = {};
+  if (!raw) return out;
+  if (raw.enabled !== undefined) out.enabled = raw.enabled;
+  for (const [key, field] of [["after", "afterMs"], ["max_interval", "maxIntervalMs"]] as const) {
+    if (raw[key] === undefined) continue;
+    const ms = parseDuration(raw[key]);
+    if (ms === null) fail(`${where}.${key}: expected a duration such as 3m or 1h`);
+    else out[field] = ms;
+  }
+  return out;
+}
+
+/** `quota_limit` (was `rate_limit`, still accepted): how the playbook's runs queue for quota (ADR 2026-11-20-dynamic-rate-limits, ADR 2026-11-23-quota-limits-in-defaults). */
+const RawRateLimitSchema = z
+  .object({
+    /** Which held run goes first when headroom returns: higher first, ties oldest first. A whole number, default 0; `start_playbook` may override it per run. */
+    priority: z.number().int().min(-1000).max(1000).optional(),
+    /** Removed (ADR 2026-11-21-remove-rate-limit-estimate): costs come only from measured history. Kept in the schema only to refuse it with a clear message. */
+    estimate: z.unknown().refine((value) => value === undefined, "`quota_limit.estimate` (formerly `rate_limit.estimate`) was removed: the cost of a playbook comes only from its measured history (a playbook with no history is not paced until its first measure); delete the field").optional(),
+  })
+  .strict();
+
+/** `closed_hours` (ADR 2026-11-23-closed-hours-shared; first `quota_limits.quota.closed_hours`, ADR 2026-11-23-quota-closed-hours, still accepted). */
+const RawClosedHoursSchema = z
+  .object({
+    /** An IANA timezone (`Europe/Paris`); default the plugin host's timezone. */
+    timezone: z.string().refine(validTimezone, { message: "closed_hours.timezone must be an IANA timezone such as Europe/Paris" }).optional(),
+    /**
+     * The closed slots: each a set of days with either one flat `from`-`to` time of the day, or a nested `slots` list of several `{ from, to }`
+     * ranges (never both). Overlapping and adjacent ranges are merged; a range does not wrap past midnight (write two).
+     */
+    slots: z
+      .array(
+        z
+          .object({
+            /** A day name (`monday`, `mon`), a list of them, or `weekdays` / `weekend` / `everyday`. */
+            days: z.union([z.string(), z.array(z.string()).min(1)]),
+            /** `HH:MM`, 24-hour clock (flat form; not with a nested `slots`). */
+            from: z.string().optional(),
+            /** `HH:MM`, after `from`; `24:00` is the end of the day (flat form; not with a nested `slots`). */
+            to: z.string().optional(),
+            /** Nested form: several time ranges of the day group. */
+            slots: z.array(z.object({ from: z.string(), to: z.string() }).strict()).optional(),
+          })
+          .strict()
+          .superRefine((slot, ctx) => {
+            for (const name of typeof slot.days === "string" ? [slot.days] : slot.days) {
+              if (dayNumbers(name) === null) ctx.addIssue({ code: "custom", path: ["days"], message: `unknown day "${name}": use monday..sunday (or mon..sun), weekdays, weekend or everyday` });
+            }
+            const flat = slot.from !== undefined || slot.to !== undefined;
+            if (slot.slots !== undefined && flat) {
+              ctx.addIssue({ code: "custom", path: ["slots"], message: "a slot uses either `from` + `to`, or a nested `slots` list of { from, to } ranges, not both" });
+              return;
+            }
+            if (slot.slots !== undefined && slot.slots.length === 0) {
+              ctx.addIssue({ code: "custom", path: ["slots"], message: "the nested `slots` list is empty: give at least one { from, to } range" });
+              return;
+            }
+            if (slot.slots === undefined && (slot.from === undefined || slot.to === undefined)) {
+              ctx.addIssue({ code: "custom", path: [], message: "a slot needs `from` and `to`, or a nested `slots` list of { from, to } ranges" });
+              return;
+            }
+            const ranges = slot.slots ?? [{ from: slot.from!, to: slot.to! }];
+            ranges.forEach((range, index) => {
+              const at = (key: string) => (slot.slots === undefined ? [key] : ["slots", index, key]);
+              const from = parseClock(range.from);
+              const to = parseClock(range.to);
+              if (from === null) ctx.addIssue({ code: "custom", path: at("from"), message: `"${range.from}" is not a time: write HH:MM (24-hour clock)` });
+              if (to === null) ctx.addIssue({ code: "custom", path: at("to"), message: `"${range.to}" is not a time: write HH:MM (24-hour clock, 24:00 for the end of the day)` });
+              if (from !== null && to !== null && from >= to) ctx.addIssue({ code: "custom", path: at("to"), message: `\`to\` (${range.to}) must be after \`from\` (${range.from}); a range does not wrap past midnight: write two ranges` });
+            });
+          }),
+      )
+      .min(1),
+  })
+  .strict();
+
+/** `quota_limits` (was `rate_limits`, still accepted): the quota pacing and the hard caps (ADR 2026-11-23-quota-limits-in-defaults). Repository defaults only. */
+const RawQuotaLimitsSchema = z
+  .object({
+    /** Optional hard cap: most steps running at once across all projects (a whole number above 0). */
+    steps: z.number().int().min(1).optional(),
+    /** Optional hard cap: most runs admitted at once across all projects (a whole number above 0). */
+    playbooks: z.number().int().min(1).optional(),
+    quota: z
+      .object({
+        /** Pace work against each provider's usage. Turned on by `usable_percent` alone; `false` turns it off. */
+        pacing: z.boolean().optional(),
+        /** Percentage of a usage window the playbooks may use (above 0, at most 100). Default 97. */
+        usable_percent: z.number().gt(0).max(100).optional(),
+        /** Deprecated: write `closed_hours` at the top of the defaults. Still read (the top-level one wins). */
+        closed_hours: RawClosedHoursSchema.optional(),
+        /** A usage reading younger than this is used as is (`5m`). */
+        refresh_interval: z.string().refine((value) => parseDuration(value) !== null, { message: "quota_limits.quota.refresh_interval must be a duration such as 5m" }).optional(),
+        /** A reading older than this is unusable (`30m`). */
+        max_age: z.string().refine((value) => parseDuration(value) !== null, { message: "quota_limits.quota.max_age must be a duration such as 30m" }).optional(),
+      })
+      .strict()
+      .optional(),
+    /** Removed (ADR 2026-11-21-remove-rate-limit-mode); still ignored with a note. */
+    mode: z.unknown().optional(),
+  })
+  .strict();
+
+/** `warden`: the periodic checks over the active runs (ADR 2026-11-18-warden). Off unless `enabled: true`. */
+const RawWardenSchema = z
+  .object({
+    /** `true` turns the warden on. Default false: with no block, nothing runs. */
+    enabled: z.boolean().optional(),
+    /** How often a run is looked at (`15m`). */
+    interval: z.string().optional(),
+    /** How long a finding that is still true waits before it is reported again (`1h`). */
+    cooldown: z.string().optional(),
+    checks: z
+      .object({
+        /** A run pinned to an older definition than origin/<base> for longer than `after` (default 12h): `report` | `refresh_scripts` (isolated runs only) | `none`. */
+        stale_definition: z.object({ after: z.string().optional(), action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+        /** A manager gone or idle while its run has an open gate it holds: `report` | `none`. */
+        manager_blocked: z.object({ action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+        /** A goto edge fired more than `above` times (default 5): `report` | `none`. */
+        loops: z.object({ above: z.number().int().min(1).optional(), action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+        /** A running step slower than its baseline (the slow-step warning): `report` | `none`. */
+        slow: z.object({ action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+        /** A gate open longer than `after` (default 30m): `report` | `none`. */
+        gate_open: z.object({ after: z.string().optional(), action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+        /** An active run with no running, ready or queued step and no open gate for longer than `after` (default 30m): `report` | `none`. */
+        stalled: z.object({ after: z.string().optional(), action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+        /** An active run held for quota (not paused by a human) for longer than `after` (default 2h): `report` | `none`. */
+        held: z.object({ after: z.string().optional(), action: z.enum(WARDEN_ACTIONS).optional() }).strict().optional(),
+      })
+      .strict()
+      .optional(),
+    /**
+     * Checks over the project's open pull requests (ADR 2026-11-20-warden-pr-checks), `defaults/main.yaml` only. A check is
+     * on only when its block is set; logins, patterns and commands are yours, none is built in.
+     */
+    pr_checks: z
+      .object({
+        /** The step of a run that fixes its PR: named in proposals; a running one means a fix is under way. */
+        fix_step: z.string().optional(),
+        /** The automated reviewer: `author` login, `receipt` regex a receipt comment or review body matches, `retrigger` text proposed to re-run it. */
+        review_bot: z.object({ author: z.string(), receipt: z.string(), retrigger: z.string().optional() }).strict().optional(),
+        /** An open PR where none of these logins is requested or has reviewed. */
+        no_reviewer: z.object({ required: z.array(z.string()).min(1) }).strict().optional(),
+        /** A PR GitHub reports as conflicting. */
+        conflicting: z.object({}).strict().optional(),
+        /** The reviewer's last receipt is older than the PR head by more than `after` (needs review_bot). */
+        review_stale: z.object({ after: z.string() }).strict().optional(),
+        /** Checks or workflows in `names` that have not run on the head commit; `dispatch` is a command template ({sha} {branch} {pr} {name}). */
+        required_checks: z
+          .object({
+            names: z.array(z.string()).optional(),
+            /** Also the checks the base branch's ruleset requires (`gh api repos/<repo>/rules/branches/<base>`); an API error skips it, logged. */
+            from_ruleset: z.boolean().optional(),
+            /** Check name -> workflow, named in the proposal and as `{workflow}` in `dispatch`. */
+            workflows: z.record(z.string(), z.string()).optional(),
+            dispatch: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        /** The reviewer's latest review requests changes and no fix_step is running (needs review_bot and fix_step); or, with `marker`, its latest comment or review carries a truthy marker. */
+        review_findings: z
+          .object({
+            /** `pattern`: a regex with one capture group, matched against the review bot's comments and reviews; `truthy`: a regex the captured text matches when findings are open (default `^(true|yes|[1-9]\d*)$`). */
+            marker: z.object({ pattern: z.string(), truthy: z.string().optional() }).strict().optional(),
+          })
+          .strict()
+          .optional(),
+        /** The repositories to scan with `gh pr list --repo`: `names` (`owner/repo`) and/or `from_runs` (the repos the project's runs have PR URLs of). Unset: the project root's repository. */
+        repos: z.object({ names: z.array(z.string()).optional(), from_runs: z.boolean().optional() }).strict().optional(),
+        /** A run of one of these playbooks (ids) that failed or has a failed step within `within` (default 24h): proposed to the Sidekick with the step and the error. */
+        failed_run: z.object({ playbooks: z.array(z.string()).min(1), within: z.string().optional() }).strict().optional(),
+        /** An open PR that no run owns. */
+        unowned: z.object({}).strict().optional(),
+        /** A draft PR not updated for `after` (`7d`, `48h`). */
+        draft_idle: z.object({ after: z.string() }).strict().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+type RawWarden = z.infer<typeof RawWardenSchema>;
+
+/** The warden block over a base config, field by field; a bad value is reported through `fail`. */
+/** `30m`, `48h` or `7d` in ms; null when it is none of them. */
+function parseLongDuration(text: string): number | null {
+  const days = /^(\d+)\s*d$/.exec(text.trim());
+  return days ? Number(days[1]) * 86_400_000 || null : parseDuration(text);
+}
+
+/** `warden.pr_checks` resolved (repo-wide defaults only); null when no check is configured. A bad value is reported through `fail`. */
+export function resolveWardenPr(raw: RawWarden["pr_checks"], where: string, fail: (message: string) => void): WardenPrConfig | null {
+  if (!raw) return null;
+  const duration = (value: string | undefined, key: string): number | null => {
+    if (value === undefined) return null;
+    const ms = parseLongDuration(value);
+    if (ms === null) fail(`${where}.${key}: expected a duration such as 30m, 48h or 7d`);
+    return ms;
+  };
+  if (raw.review_bot) {
+    try {
+      new RegExp(raw.review_bot.receipt);
+    } catch {
+      fail(`${where}.review_bot.receipt: not a valid regular expression`);
+    }
+  }
+  const marker = raw.review_findings?.marker;
+  if (marker) {
+    try {
+      const groups = new RegExp(`${marker.pattern}|`).exec("")!.length - 1;
+      if (groups < 1) fail(`${where}.review_findings.marker.pattern: needs one capture group around the value`);
+    } catch {
+      fail(`${where}.review_findings.marker.pattern: not a valid regular expression`);
+    }
+    try {
+      new RegExp(marker.truthy ?? "");
+    } catch {
+      fail(`${where}.review_findings.marker.truthy: not a valid regular expression`);
+    }
+  }
+  if (raw.required_checks && !raw.required_checks.from_ruleset && (raw.required_checks.names ?? []).length === 0) fail(`${where}.required_checks: set names, from_ruleset: true, or both`);
+  if (raw.repos && (raw.repos.names ?? []).length === 0 && !raw.repos.from_runs) fail(`${where}.repos: set names, from_runs: true, or both`);
+  for (const name of raw.repos?.names ?? []) if (!/^[\w.-]+\/[\w.-]+$/.test(name)) fail(`${where}.repos.names: "${name}" is not owner/repo`);
+  if ((raw.review_stale || raw.review_findings) && !raw.review_bot) fail(`${where}: review_stale and review_findings need review_bot`);
+  if (raw.review_findings && !raw.fix_step) fail(`${where}.review_findings: needs fix_step (the step whose running means a fix is under way)`);
+  const reviewStale = raw.review_stale ? duration(raw.review_stale.after, "review_stale.after") : null;
+  const draftIdle = raw.draft_idle ? duration(raw.draft_idle.after, "draft_idle.after") : null;
+  const failedWithin = raw.failed_run ? (raw.failed_run.within === undefined ? 86_400_000 : duration(raw.failed_run.within, "failed_run.within")) : null;
+  const config: WardenPrConfig = {
+    fixStep: raw.fix_step ?? null,
+    reviewBot: raw.review_bot ? { author: raw.review_bot.author, receipt: raw.review_bot.receipt, retrigger: raw.review_bot.retrigger ?? null } : null,
+    noReviewer: raw.no_reviewer ? { required: raw.no_reviewer.required } : null,
+    conflicting: raw.conflicting ? {} : null,
+    reviewStale: reviewStale === null ? null : { afterMs: reviewStale },
+    requiredChecks: raw.required_checks ? { names: raw.required_checks.names ?? [], fromRuleset: raw.required_checks.from_ruleset === true, workflows: raw.required_checks.workflows ?? {}, dispatch: raw.required_checks.dispatch ?? null } : null,
+    reviewFindings: raw.review_findings ? { marker: marker ? { pattern: marker.pattern, truthy: marker.truthy ?? "^(true|yes|[1-9]\\d*)$" } : null } : null,
+    unowned: raw.unowned ? {} : null,
+    draftIdle: draftIdle === null ? null : { afterMs: draftIdle },
+    repos: raw.repos ? { names: raw.repos.names ?? [], fromRuns: raw.repos.from_runs === true } : null,
+    failedRuns: raw.failed_run && failedWithin !== null ? { playbooks: raw.failed_run.playbooks, withinMs: failedWithin } : null,
+  };
+  return Object.entries(config).some(([key, value]) => key !== "fixStep" && key !== "reviewBot" && key !== "repos" && value !== null) ? config : null;
+}
+
+function resolveWarden(raw: RawWarden | undefined, base: WardenConfig, where: string, fail: (message: string) => void): WardenConfig {
+  const out: WardenConfig = structuredClone(base);
+  if (!raw) return out;
+  if (raw.enabled !== undefined) out.enabled = raw.enabled;
+  const duration = (value: string | undefined, key: string): number | undefined => {
+    if (value === undefined) return undefined;
+    const ms = parseDuration(value);
+    if (ms === null || ms <= 0) fail(`${where}.${key}: expected a duration such as 15m or 1h`);
+    return ms !== null && ms > 0 ? ms : undefined;
+  };
+  out.intervalMs = duration(raw.interval, "interval") ?? out.intervalMs;
+  out.cooldownMs = duration(raw.cooldown, "cooldown") ?? out.cooldownMs;
+  const checks = raw.checks;
+  if (!checks) return out;
+  for (const [name, check] of Object.entries(checks)) {
+    if (check?.action === "refresh_scripts" && name !== "stale_definition") fail(`${where}.checks.${name}.action: \`refresh_scripts\` only applies to stale_definition (use report or none)`);
+  }
+  if (checks.stale_definition?.action) out.checks.staleDefinition.action = checks.stale_definition.action;
+  out.checks.staleDefinition.afterMs = duration(checks.stale_definition?.after, "checks.stale_definition.after") ?? out.checks.staleDefinition.afterMs;
+  if (checks.manager_blocked?.action) out.checks.managerBlocked.action = checks.manager_blocked.action;
+  if (checks.loops?.action) out.checks.loops.action = checks.loops.action;
+  if (checks.loops?.above !== undefined) out.checks.loops.above = checks.loops.above;
+  if (checks.slow?.action) out.checks.slow.action = checks.slow.action;
+  if (checks.gate_open?.action) out.checks.gateOpen.action = checks.gate_open.action;
+  out.checks.gateOpen.afterMs = duration(checks.gate_open?.after, "checks.gate_open.after") ?? out.checks.gateOpen.afterMs;
+  if (checks.stalled?.action) out.checks.stalled.action = checks.stalled.action;
+  out.checks.stalled.afterMs = duration(checks.stalled?.after, "checks.stalled.after") ?? out.checks.stalled.afterMs;
+  if (checks.held?.action) out.checks.held.action = checks.held.action;
+  out.checks.held.afterMs = duration(checks.held?.after, "checks.held.after") ?? out.checks.held.afterMs;
+  return out;
+}
 
 const RawPlaybookSchema = z.object({
     title: z.string().optional(),
@@ -487,13 +852,17 @@ const RawPlaybookSchema = z.object({
         prompt: z.string().optional(),
         /** When the plugin compacts the manager's context. */
         compact: ManagerCompactSchema.optional(),
+        /** The watchdog for a reported step the manager has not acted on. */
+        nudge: RawManagerNudgeSchema.optional(),
         /** `always_on` (default): a Playbook Manager agent drives the run. `none`: no manager, the plugin drives it. */
         mode: z.string().optional(),
       })
       .strict()
       .optional(),
     workspace: RawWorkspaceSchema.optional(),
+    auto_archive: RawAutoArchiveSchema.optional(),
     isolation: RawIsolationSchema.optional(),
+    permissions: RawPermissionsSchema.optional(),
     inputs: z.record(z.string(), RawVarDefSchema.nullable()).optional(),
     outputs: z.record(z.string(), RawOutputSchema.nullable()).optional(),
     /** Removed: playbooks compose only as sub-playbook steps. Kept here to refuse it clearly. */
@@ -506,7 +875,7 @@ const RawPlaybookSchema = z.object({
         z
           .object({
             /** Branch its workspace branches off; default: the project's default branch. */
-            branch: z.string().min(1).optional(),
+            branch: RawBranchNameSchema.optional(),
             /** Removed in favour of stages; read only to refuse it. */
             concurrency: z.unknown().optional(),
           })
@@ -516,6 +885,19 @@ const RawPlaybookSchema = z.object({
     /** How the playbook can end, for a parent that uses it as a sub-playbook. The first is a normal finish. */
     /** Slow-step warning: a step slower than `factor` times the mean of its last `runs` completed runs gets a warning. Defaults 10 and 2. */
     slow_warning: RawSlowWarningSchema.optional(),
+    /** What the plugin does by itself when the manager is blocked by its provider's quota; see RawManagerRecoverySchema. */
+    manager_recovery: RawManagerRecoverySchema.optional(),
+    /** The warden's periodic checks; see RawWardenSchema. Off unless `enabled: true`. */
+    warden: RawWardenSchema.optional(),
+    /** Queue priority of the playbook's runs when quota limiting holds work; see RawRateLimitSchema. */
+    quota_limit: RawRateLimitSchema.optional(),
+    /** Deprecated name of `quota_limit`. */
+    rate_limit: RawRateLimitSchema.optional(),
+    /** Not a playbook field: read here only to refuse it. */
+    closed_hours: z.unknown().refine((value) => value === undefined, "`closed_hours` is not set in a playbook: put it in `defaults/main.yaml` (or the user config)").optional(),
+    quota_limits: z.unknown().refine((value) => value === undefined, "`quota_limits` is not set in a playbook: put it in `defaults/main.yaml` (or the user config); a playbook only has `quota_limit: { priority }`").optional(),
+    /** House rules added to the prompt of every agent of the playbook, after the repository's `agent_rules` (a list of short strings; checked by `parseAgentRules`). */
+    agent_rules: z.unknown().optional(),
     outcomes: z.array(z.string()).min(1).optional(),
     steps: z.array(RawStepSchema).min(1),
     /** Tasks run once the main graph ends (completed or failed); they never change the run's status. */
@@ -533,9 +915,11 @@ const RawDefaultsSchema = z.object({
     tiers: z.record(z.string(), RawTierSchema).optional(),
     agent: RawAgentSchema.optional(),
     /** `lifecycle` is the repo-wide default of a playbook's `manager.mode` (here `mode` is the manager agent's own permission mode). */
-    manager: RawAgentSchema.extend({ compact: ManagerCompactSchema.optional(), lifecycle: z.string().optional() }).optional(),
+    manager: RawAgentSchema.extend({ compact: ManagerCompactSchema.optional(), nudge: RawManagerNudgeSchema.optional(), lifecycle: z.string().optional() }).optional(),
     workspace: RawWorkspaceSchema.optional(),
+    auto_archive: RawAutoArchiveSchema.optional(),
     isolation: RawIsolationSchema.optional(),
+    permissions: RawPermissionsSchema.optional(),
     /** Provider failover (a tier listing several targets). */
     providers: z
       .object({
@@ -560,10 +944,34 @@ const RawDefaultsSchema = z.object({
       })
       .strict()
       .optional(),
+    /** Who may answer a gate for the human. */
+    gates: z
+      .object({
+        /** `allow` (default): an agent outside the runs (the Sidekick, a coordinator) may answer a human gate with `resume_gate`, with the human's own answer. `deny`: only the human, in the panel. */
+        on_behalf: z.enum(["allow", "deny"]).optional(),
+      })
+      .strict()
+      .optional(),
+    /** House rules added to the prompt of every agent of every playbook of the folder (a list of short strings; checked by `parseAgentRules`). */
+    agent_rules: z.unknown().optional(),
     /** Reload agent sessions that hold the tools of an older plugin generation once idle. Default true. */
     reload_stale_sessions: z.boolean().optional(),
     /** Slow-step warning: a step slower than `factor` times the mean of its last `runs` completed runs gets a warning. Defaults 10 and 2. */
     slow_warning: RawSlowWarningSchema.optional(),
+    /** What the plugin does by itself when the manager is blocked by its provider's quota; see RawManagerRecoverySchema. */
+    manager_recovery: RawManagerRecoverySchema.optional(),
+    /** The warden's periodic checks (repo-wide default; a playbook may override field by field). Off unless `enabled: true`. */
+    warden: RawWardenSchema.optional(),
+    /** Queue priority of every playbook's runs when rate limiting holds work (a playbook may override it). */
+    quota_limit: RawRateLimitSchema.optional(),
+    /** Deprecated name of `quota_limit`. */
+    rate_limit: RawRateLimitSchema.optional(),
+    /** Slots of the week that do not count for the quota allowance nor for the warden's time thresholds (ADR 2026-11-23-closed-hours-shared). */
+    closed_hours: RawClosedHoursSchema.optional(),
+    /** The quota pacing and hard caps, for the runs of this folder (the user config's `quota_limits` is under it; see ADR 2026-11-23-quota-limits-in-defaults). */
+    quota_limits: RawQuotaLimitsSchema.optional(),
+    /** Deprecated name of `quota_limits`. */
+    rate_limits: RawQuotaLimitsSchema.optional(),
     timeout: z.string().optional(),
     /** Default `manage` of every step. */
     manage: RawManageSchema.optional(),
@@ -581,7 +989,7 @@ const RawDefaultsSchema = z.object({
     silence: z.unknown().optional(),
     archive_agents: z.unknown().optional(),
   });
-type RawDefaults = Omit<z.infer<typeof RawDefaultsSchema>, "tiers"> & { tiers?: Tiers; managerCompact?: ManagerCompact; managerMode?: ManagerMode };
+type RawDefaults = Omit<z.infer<typeof RawDefaultsSchema>, "tiers"> & { tiers?: Tiers; managerCompact?: ManagerCompact; managerNudge?: Partial<ManagerNudge>; wardenConfig?: WardenConfig; wardenPr?: WardenPrConfig | null; managerMode?: ManagerMode; agentRules?: string[]; quotaLimits?: QuotaLimitsLayer };
 
 function formatZodError(file: string, error: z.ZodError): string[] {
   return error.issues.map((issue) => {
@@ -729,16 +1137,24 @@ async function loadDefaults(root: string, relDir: string): Promise<{ defaults: R
   }
   const fail = (message: string) => errors.push(`${rel}: ${message}`);
   const defaults: RawDefaults = { ...parsed.data, tiers };
+  const quotaLimits = quotaLimitsLayerOf({ quota_limits: parsed.data.quota_limits, rate_limits: parsed.data.rate_limits, closed_hours: parsed.data.closed_hours });
+  if (quotaLimits) defaults.quotaLimits = quotaLimits;
+  if (parsed.data.rate_limit !== undefined) noteDeprecatedKey("rate_limit", "quota_limit");
   if (parsed.data.agent) defaults.agent = resolveAgent(parsed.data.agent, tiers, "agent", fail);
   if (parsed.data.manager) {
-    const { compact, lifecycle, ...settings } = parsed.data.manager;
+    const { compact, nudge, lifecycle, ...settings } = parsed.data.manager;
     defaults.manager = resolveAgent(settings, tiers, "manager", fail);
+    if (nudge !== undefined) defaults.managerNudge = resolveManagerNudge(nudge, "manager.nudge", fail);
     if (compact !== undefined) defaults.managerCompact = compact;
     if (lifecycle !== undefined) {
       const mode = parseManagerMode(lifecycle);
       if (typeof mode === "string" && ManagerModeSchema.safeParse(mode).success) defaults.managerMode = mode as ManagerMode;
       else fail(`manager.lifecycle: ${mode}`);
     }
+  }
+  if (parsed.data.warden !== undefined) {
+    defaults.wardenConfig = resolveWarden(parsed.data.warden, DEFAULT_WARDEN, "warden", fail);
+    defaults.wardenPr = resolveWardenPr(parsed.data.warden.pr_checks, "warden.pr_checks", fail);
   }
   if (parsed.data.timeout && parseDuration(parsed.data.timeout) === null) {
     errors.push(`${rel}: timeout: expected a duration such as 30m or 2h`);
@@ -758,7 +1174,37 @@ async function loadDefaults(root: string, relDir: string): Promise<{ defaults: R
   if (parsed.data.role?.silence && parseSilence(parsed.data.role.silence) === null) {
     errors.push(`${rel}: role.silence: expected a duration such as 30m, or off`);
   }
+  const rules = parseAgentRules(parsed.data.agent_rules);
+  for (const message of rules.errors) errors.push(`${rel}: ${message}`);
+  defaults.agentRules = rules.rules;
   return { defaults, errors };
+}
+
+/** Most rules of one `agent_rules` list, and the longest rule (characters). */
+export const MAX_AGENT_RULES = 20;
+export const MAX_AGENT_RULE_LENGTH = 500;
+
+/** A written `agent_rules`: a list of at most 20 non-empty strings of at most 500 characters. Trimmed, each once. */
+export function parseAgentRules(value: unknown): { rules: string[]; errors: string[] } {
+  if (value === undefined || value === null) return { rules: [], errors: [] };
+  if (!Array.isArray(value)) return { rules: [], errors: ["agent_rules: expected a list of strings (`agent_rules: [\"prefer simple, separate shell commands\"]`)"] };
+  const errors: string[] = [];
+  if (value.length > MAX_AGENT_RULES) errors.push(`agent_rules: ${value.length} rules, at most ${MAX_AGENT_RULES} (they go in every agent's prompt: keep the few that matter)`);
+  const rules: string[] = [];
+  value.forEach((entry, index) => {
+    if (typeof entry !== "string") errors.push(`agent_rules.${index}: expected a string`);
+    else if (entry.trim() === "") errors.push(`agent_rules.${index}: empty rule`);
+    else if (entry.trim().length > MAX_AGENT_RULE_LENGTH) errors.push(`agent_rules.${index}: ${entry.trim().length} characters, at most ${MAX_AGENT_RULE_LENGTH}`);
+    else if (!rules.includes(entry.trim())) rules.push(entry.trim());
+  });
+  return { rules, errors };
+}
+
+/** The rules of a playbook: the repository's, this playbook's, then its sub-playbooks', each once. */
+function mergeAgentRules(repo: string[], own: string[], subs: Playbook[]): string[] {
+  const list = [...repo];
+  for (const rule of [...own, ...subs.flatMap((sub) => sub.agentRules)]) if (!list.includes(rule)) list.push(rule);
+  return list;
 }
 
 /**
@@ -826,6 +1272,8 @@ const RawSidekickSchema = z
   .object({
     sidekick: z
       .object({
+        /** A tier of the profile's `defaults/main.yaml` (its fallback chain included); provider/model/mode/thinking here override a single-entry tier. */
+        tier: z.string().min(1).optional(),
         provider: z.string().optional(),
         model: z.string().optional(),
         mode: z.string().optional(),
@@ -833,8 +1281,22 @@ const RawSidekickSchema = z
         /** Event types (or globs such as `gate.*`) it is subscribed to, for this project's runs. */
         watch: z.array(z.string().min(1)).min(1).optional(),
         /** Provider and model of the subagents the Sidekick creates (default: claude / claude-sonnet-5-5). */
-        subagents: z.object({ provider: z.string().min(1).optional(), model: z.string().min(1).optional(), mode: z.unknown().optional() }).strict().optional(),
-        session: z.object({ restart_above_tokens: z.number().int().positive().optional() }).strict().optional(),
+        subagents: z
+          .object({
+            /** A tier of the profile's `defaults/main.yaml`; the subagents start on its first available target and move down its chain. */
+            tier: z.string().min(1).optional(),
+            provider: z.string().min(1).optional(),
+            model: z.string().min(1).optional(),
+            mode: z.unknown().optional(),
+            /** Archive the hidden workspace of a subagent (and the subagent) once it finished and the Sidekick was told (default true). */
+            archive_workspace: z.boolean().optional(),
+            /** Grace period before that archive, such as 10m (default 10m, at most 24h): the Sidekick can still read the report. */
+            archive_after: z.string().optional(),
+          })
+          .strict()
+          .optional(),
+        /** `compact_above_tokens` (default 300000; `restart_above_tokens` is its older name) compacts the agent; `hard_limit_tokens` (default 1.5x that) replaces it by a new one when compaction fails or leaves it above. */
+        session: z.object({ restart_above_tokens: z.number().int().positive().optional(), compact_above_tokens: z.number().int().positive().optional(), hard_limit_tokens: z.number().int().positive().optional() }).strict().optional(),
         /** Rules for the runs the Sidekick starts. Enforced by its prompt only. */
         runs: z
           .object({
@@ -852,26 +1314,59 @@ const RawSidekickSchema = z
   .strict();
 
 /** Event types a Sidekick watches when `sidekick.watch` is not set. */
-export const DEFAULT_SIDEKICK_WATCH = ["gate.escalated", "run.failed", "run.manager_lost"];
+export const DEFAULT_SIDEKICK_WATCH = ["gate.escalated", "gate.returned", "run.failed", "run.manager_lost", "step.waiting_manager_stuck", "manager.question_pending", "run.held", "run.released"];
+
+/** What the Sidekick's start needs from the defaults of the repository that holds it: the failover settings of `providers`. */
+export interface SidekickProviders {
+  /** `providers.fallback`: `provider/model` targets after the tier's own chain. */
+  fallback: string[];
+  exhaustedForMs: number;
+  usageCheck: boolean;
+  usageThreshold: number;
+}
 
 export interface SidekickConfig {
   provider?: string;
   model?: string;
   mode?: string;
   thinking?: string;
+  /** The tier it was written with, if any (the provider and model above are its first target). */
+  tier?: string;
+  /** The targets tried, in order, after provider/model when that provider is out of tokens (the rest of a multi-entry tier). */
+  fallback?: AgentTarget[];
+  /** Failover settings of the profile's defaults; set when the Sidekick is in a profile or uses a tier. */
+  providers?: SidekickProviders;
+  /** The profile's `agent_rules`, added to the Sidekick's prompt and passed on to its subagents; absent when there are none. */
+  agentRules?: string[];
   watch: string[];
   /** Context size above which the Sidekick is restarted with a hand-off; default 300000. */
   restartAboveTokens?: number;
-  subagents?: { provider?: string; model?: string; mode?: string };
+  compactAboveTokens?: number;
+  hardLimitTokens?: number;
+  subagents?: SidekickSubagents;
   /** `sidekick.runs`: rules for the runs it starts; unset means unlimited and no confirmation. */
   runs?: { maxConcurrent?: number; confirmBulk?: boolean };
 }
 
+export interface SidekickSubagents {
+  provider?: string;
+  model?: string;
+  mode?: string;
+  thinking?: string;
+  tier?: string;
+  /** Targets after provider/model, for when that provider is out of tokens (the rest of a multi-entry tier). */
+  fallback?: AgentTarget[];
+  archiveWorkspace?: boolean;
+  archiveAfterMs?: number;
+}
+
 export interface SidekickLoad {
-  /** A `sidekick/` folder exists in a playbooks folder. Without it the project has no Sidekick. */
+  /** A `sidekick/` folder exists in a profile of the project or in a playbooks folder. Without it the project has no Sidekick. */
   configured: boolean;
-  /** Folder of the Sidekick, relative to the workspace (`.paseo/plugins/playbooks/sidekick`). */
+  /** Folder of the Sidekick, relative to the workspace (`.paseo/plugins/playbooks/sidekick`, or `.../profiles/<id>/sidekick`). */
   dir: string | null;
+  /** The profile whose `sidekick/` was read (its defaults apply); null for the playbooks folder itself. */
+  profile: string | null;
   config: SidekickConfig | null;
   /** `sidekick/instructions.md`, trimmed; null when there is none. */
   instructions: string | null;
@@ -880,23 +1375,52 @@ export interface SidekickLoad {
   warnings: string[];
 }
 
-const NO_SIDEKICK: SidekickLoad = { configured: false, dir: null, config: null, instructions: null, errors: [], warnings: [] };
+const NO_SIDEKICK: SidekickLoad = { configured: false, dir: null, profile: null, config: null, instructions: null, errors: [], warnings: [] };
 
 /** A Paseo agent mode id (`default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`, a provider's own). */
 const MODE_ID = /^[A-Za-z][A-Za-z0-9_:.-]*$/;
 
+export interface SidekickLoadOptions {
+  /** The project whose active profiles (user config) are searched for a `sidekick/`. */
+  projectId?: string;
+  /** Profiles to search instead of the project's setting. */
+  activeProfiles?: string[];
+}
+
 /**
- * The Sidekick of a project: `sidekick/sidekick.yaml` and `sidekick/instructions.md` in the first playbooks
- * folder that has a `sidekick/` directory. A directory, so it never takes the id of a playbook (`sidekick.yaml`
- * in the folder itself is a playbook and coexists with it).
+ * The Sidekick of a project: `sidekick/sidekick.yaml` and `sidekick/instructions.md`. Looked for in the project's ACTIVE
+ * profiles first (`profiles/<id>/sidekick/`, ids sorted alphabetically: the first wins, the others are named in a warning), then in the
+ * first playbooks folder that has a `sidekick/` directory (the legacy location, read as before). The profile that holds
+ * it supplies its tiers, `agent_rules` and `providers`. A directory, so it never takes the id of a playbook.
  */
-export async function loadSidekick(workspaceDir: string): Promise<SidekickLoad> {
-  for (const relDir of PLAYBOOKS_DIRS) {
-    const dir = path.join(workspaceDir, relDir, "sidekick");
-    if ((await listFolder(dir)) === null) continue;
+export async function loadSidekick(workspaceDir: string, options: SidekickLoadOptions = {}): Promise<SidekickLoad> {
+  const profilesRel = `${PLAYBOOKS_DIRS[0]}/${PROFILES_DIR}`;
+  const requested = options.activeProfiles ?? (options.projectId ? await readProjectProfiles(options.projectId) : []);
+  const inProfiles: string[] = [];
+  for (const { name, root } of (await scanProfiles(workspaceDir)).found) {
+    if (requested.includes(name) && (await listFolder(path.join(root, "sidekick"))) !== null) inProfiles.push(name);
+  }
+  const legacy: string[] = [];
+  for (const relDir of PLAYBOOKS_DIRS) if ((await listFolder(path.join(workspaceDir, relDir, "sidekick"))) !== null) legacy.push(relDir);
+  const notes: string[] = [];
+  if (inProfiles.length > 0) {
+    const [first, ...others] = inProfiles;
+    if (others.length > 0) notes.push(`${profilesRel}/${first}/sidekick is the project's Sidekick: the active profiles ${others.map((name) => `\`${name}\``).join(", ")} also have a sidekick/ folder, which is ignored (turn those profiles off, or remove the folder)`);
+    if (legacy.length > 0) notes.push(`${legacy[0]}/sidekick is ignored: the active profile \`${first}\` has its own sidekick/ folder`);
+    return readSidekickDir(`${profilesRel}/${first}`, path.join(workspaceDir, profilesRel, first!), first!, notes);
+  }
+  if (legacy.length > 0) return readSidekickDir(legacy[0]!, path.join(workspaceDir, legacy[0]!), null, notes);
+  return NO_SIDEKICK;
+}
+
+/** Reads `<repoRel>/sidekick/` of one repository (a profile, or a playbooks folder); `profile` is the profile id or null. */
+async function readSidekickDir(repoRel: string, repoRoot: string, profile: string | null, notes: string[]): Promise<SidekickLoad> {
+  const relDir = repoRel;
+  const dir = path.join(repoRoot, "sidekick");
+  {
     const rel = `${relDir}/sidekick`;
     const errors: string[] = [];
-    const warnings: string[] = [];
+    const warnings: string[] = [...notes];
     let config: SidekickConfig = { watch: DEFAULT_SIDEKICK_WATCH };
     if ((await readText(path.join(dir, "sidekick.yaml"))) !== null) {
       const raw = await readYaml(path.join(dir, "sidekick.yaml"), `${rel}/sidekick.yaml`);
@@ -905,27 +1429,73 @@ export async function loadSidekick(workspaceDir: string): Promise<SidekickLoad> 
         const parsed = RawSidekickSchema.safeParse(raw.value);
         if (!parsed.success) errors.push(...formatZodError(`${rel}/sidekick.yaml`, parsed.error));
         else {
-          const { watch, session, runs, subagents: rawSubagents, ...settings } = parsed.data.sidekick ?? {};
-          let subagents: { provider?: string; model?: string; mode?: string } | undefined;
+          const { watch, session, runs, subagents: rawSubagents, tier: ownTier, ...settings } = parsed.data.sidekick ?? {};
+          const usesTier = ownTier !== undefined || rawSubagents?.tier !== undefined;
+          // The defaults of the repository that holds the Sidekick: a profile's always (rules, providers), the playbooks folder's only for its tiers.
+          const loadedDefaults = profile !== null || usesTier ? await loadDefaults(repoRoot, relDir) : null;
+          if (loadedDefaults && (profile !== null || usesTier)) errors.push(...loadedDefaults.errors);
+          const tiers = loadedDefaults?.defaults.tiers ?? {};
+          const fail = (message: string) => errors.push(`${rel}/sidekick.yaml: ${message}`);
+          const own = resolveAgent({ ...(ownTier !== undefined ? { tier: ownTier } : {}), ...settings }, tiers, "sidekick", fail) ?? {};
+          const { fallback: ownFallback, ...ownFields } = own;
+          let subagents: SidekickSubagents | undefined;
           if (rawSubagents) {
-            const { mode, ...rest } = rawSubagents;
-            subagents = rest;
+            const { mode, archive_workspace, archive_after, tier: subTier, provider: subProvider, model: subModel, ...restSub } = rawSubagents;
+            void restSub;
+            const resolved = resolveAgent({ ...(subTier !== undefined ? { tier: subTier } : {}), ...(subProvider !== undefined ? { provider: subProvider } : {}), ...(subModel !== undefined ? { model: subModel } : {}), ...(typeof mode === "string" && MODE_ID.test(mode) ? { mode } : {}) }, tiers, "sidekick.subagents", fail) ?? {};
+            const { fallback: subFallback, mode: tierMode, ...subFields } = resolved;
+            subagents = { ...subFields };
+            if (subTier !== undefined) subagents.tier = subTier;
+            if (subFallback && subFallback.length > 0) subagents.fallback = subFallback;
+            if (tierMode !== undefined) subagents.mode = tierMode;
+            if (archive_workspace !== undefined) subagents.archiveWorkspace = archive_workspace;
+            if (archive_after !== undefined) {
+              const ms = parseDuration(archive_after);
+              if (ms === null || ms > MAX_SUBAGENT_ARCHIVE_AFTER_MS) errors.push(`${rel}/sidekick.yaml: sidekick.subagents.archive_after must be a duration such as 30s, 10m or 2h, at most 24h (got "${archive_after}")`);
+              else subagents.archiveAfterMs = ms;
+            }
             if (mode !== undefined) {
               if (typeof mode === "string" && MODE_ID.test(mode)) subagents.mode = mode;
               else warnings.push(`${rel}/sidekick.yaml: sidekick.subagents.mode must be a mode id such as default, acceptEdits, plan, auto or bypassPermissions; ignored`);
             }
           }
+          const providers = loadedDefaults?.defaults.providers;
           config = {
-            ...Object.fromEntries(Object.entries(settings).filter(([, value]) => value !== undefined)),
+            ...Object.fromEntries(Object.entries(ownFields).filter(([, value]) => value !== undefined)),
+            ...(ownTier !== undefined ? { tier: ownTier } : {}),
+            ...(ownFallback && ownFallback.length > 0 ? { fallback: ownFallback } : {}),
+            ...(loadedDefaults && (profile !== null || usesTier)
+              ? {
+                  providers: {
+                    fallback: providers?.fallback ?? [],
+                    exhaustedForMs: (providers?.exhausted_for ? parseDuration(providers.exhausted_for) : null) ?? DEFAULT_EXHAUSTED_FOR_MS,
+                    usageCheck: providers?.usage?.check ?? true,
+                    usageThreshold: providers?.usage?.threshold ?? 100,
+                  },
+                }
+              : {}),
+            ...(profile !== null && (loadedDefaults?.defaults.agentRules ?? []).length > 0 ? { agentRules: loadedDefaults!.defaults.agentRules! } : {}),
             watch: watch ?? DEFAULT_SIDEKICK_WATCH,
-            ...(subagents && (subagents.provider || subagents.model || subagents.mode) ? { subagents: Object.fromEntries(Object.entries(subagents).filter(([, value]) => value !== undefined)) } : {}),
+            ...(subagents && Object.keys(subagents).length > 0 ? { subagents: Object.fromEntries(Object.entries(subagents).filter(([, value]) => value !== undefined)) } : {}),
             ...(session?.restart_above_tokens ? { restartAboveTokens: session.restart_above_tokens } : {}),
+            ...(session?.compact_above_tokens ? { compactAboveTokens: session.compact_above_tokens } : {}),
+            ...(session?.hard_limit_tokens ? { hardLimitTokens: session.hard_limit_tokens } : {}),
             ...(runs && (runs.max_concurrent !== undefined || runs.confirm_bulk !== undefined)
               ? { runs: { ...(runs.max_concurrent !== undefined ? { maxConcurrent: runs.max_concurrent } : {}), ...(runs.confirm_bulk !== undefined ? { confirmBulk: runs.confirm_bulk } : {}) } }
               : {}),
           };
         }
       }
+    } else if (profile !== null) {
+      // No sidekick.yaml, but the profile's defaults still apply (rules, providers).
+      const loadedDefaults = await loadDefaults(repoRoot, relDir);
+      errors.push(...loadedDefaults.errors);
+      const providers = loadedDefaults.defaults.providers;
+      config = {
+        ...config,
+        providers: { fallback: providers?.fallback ?? [], exhaustedForMs: (providers?.exhausted_for ? parseDuration(providers.exhausted_for) : null) ?? DEFAULT_EXHAUSTED_FOR_MS, usageCheck: providers?.usage?.check ?? true, usageThreshold: providers?.usage?.threshold ?? 100 },
+        ...((loadedDefaults.defaults.agentRules ?? []).length > 0 ? { agentRules: loadedDefaults.defaults.agentRules! } : {}),
+      };
     }
     let instructions: string | null = null;
     const text = await readText(path.join(dir, "instructions.md"));
@@ -933,9 +1503,8 @@ export async function loadSidekick(workspaceDir: string): Promise<SidekickLoad> 
       if (text.trim() === "") errors.push(`${rel}/instructions.md: empty`);
       else instructions = text.trim();
     }
-    return { configured: true, dir: rel, config: errors.length > 0 ? null : config, instructions, errors, warnings };
+    return { configured: true, dir: rel, profile, config: errors.length > 0 ? null : config, instructions, errors, warnings };
   }
-  return NO_SIDEKICK;
 }
 
 /** True when the workspace has at least one playbook file in any playbook folder. */
@@ -950,6 +1519,38 @@ export async function reloadStaleSessionsSetting(workspaceDir: string): Promise<
     return parsed.success ? (parsed.data.reload_stale_sessions ?? true) : true;
   }
   return true;
+}
+
+/** The warden settings of the workspace's `defaults/main.yaml` for the PR checks: null unless `warden.enabled` and a `pr_checks` check is set (or when the file is invalid). */
+export async function wardenPrSetting(workspaceDir: string): Promise<{ intervalMs: number; cooldownMs: number; checks: WardenPrConfig; closedHours: ClosedHours | null | undefined } | null> {
+  for (const relDir of PLAYBOOKS_DIRS) {
+    const file = path.join(workspaceDir, relDir, "defaults", "main.yaml");
+    if ((await readText(file)) === null) continue;
+    const raw = await readYaml(file, `${relDir}/defaults/main.yaml`);
+    if ("error" in raw) return null;
+    const parsed = RawDefaultsSchema.safeParse(raw.value);
+    if (!parsed.success || !parsed.data.warden) return null;
+    let failed = false;
+    const fail = () => void (failed = true);
+    const warden = resolveWarden(parsed.data.warden, DEFAULT_WARDEN, "warden", fail);
+    const checks = resolveWardenPr(parsed.data.warden.pr_checks, "warden.pr_checks", fail);
+    const closedHours = quotaLimitsLayerOf({ quota_limits: parsed.data.quota_limits, rate_limits: parsed.data.rate_limits, closed_hours: parsed.data.closed_hours })?.quota?.closedHours;
+    return warden.enabled && checks && !failed ? { intervalMs: warden.intervalMs, cooldownMs: warden.cooldownMs, checks, closedHours } : null;
+  }
+  return null;
+}
+
+/** `gates.on_behalf` of the workspace's `defaults/main.yaml` (the first playbooks folder that has one); `allow` when unset. */
+export async function gatesOnBehalfSetting(workspaceDir: string): Promise<"allow" | "deny"> {
+  for (const relDir of PLAYBOOKS_DIRS) {
+    const file = path.join(workspaceDir, relDir, "defaults", "main.yaml");
+    if ((await readText(file)) === null) continue;
+    const raw = await readYaml(file, `${relDir}/defaults/main.yaml`);
+    if ("error" in raw) return "allow";
+    const parsed = RawDefaultsSchema.safeParse(raw.value);
+    return parsed.success ? (parsed.data.gates?.on_behalf ?? "allow") : "allow";
+  }
+  return "allow";
 }
 
 export async function hasPlaybooks(workspaceDir: string): Promise<boolean> {
@@ -1122,7 +1723,7 @@ export async function loadPlaybooks(workspaceDir: string, options: LoadOptions =
     const repos = new Set(group.map((entry) => entry.repo));
     if (repos.size > 1) diagnostics.push(`playbook id "${id}" exists in ${[...repos].map((repo) => `\`${repo}\``).join(" and ")}: refer to it as ${group.map((entry) => `\`${qualified(entry)}\``).join(" or ")} (a bare "${id}" is ambiguous)`);
   }
-  return { roots, exists: roots.length > 0 || profiles.length > 0, entries, sidekick: await loadSidekick(workspaceDir), profiles, defaultActive, diagnostics };
+  return { roots, exists: roots.length > 0 || profiles.length > 0, entries, sidekick: await loadSidekick(workspaceDir, { ...(options.projectId ? { projectId: options.projectId } : {}), ...(options.activeProfiles ? { activeProfiles: options.activeProfiles } : {}) }), profiles, defaultActive, diagnostics };
 }
 
 /**
@@ -1174,6 +1775,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   const parsed = RawPlaybookSchema.safeParse(raw.value);
   if (!parsed.success) return fail(formatZodError(file, parsed.error));
   const pb = parsed.data;
+  if (pb.rate_limit !== undefined) noteDeprecatedKey("rate_limit", "quota_limit");
   entry.title = pb.title ?? id;
   entry.hidden = pb.hidden;
   const errors: string[] = [];
@@ -1284,6 +1886,13 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
   }
 
   /** A gate's `decider`: `role` goes with `by: role` only, and names a readonly role. */
+  /** A goto's `delay` in ms: a duration such as 30s, 2m or 1h, or an error. */
+  const gotoDelay = (at: string, raw: string | undefined): number | undefined => {
+    if (raw === undefined) return undefined;
+    const ms = parseDuration(raw);
+    if (ms === null) err(`${at}: expected a duration such as 30s, 2m or 1h`);
+    return ms ?? undefined;
+  };
   const parseDecider = (at: string, raw: RawDecider | undefined): GateDecider | undefined => {
     if (raw === undefined) return undefined;
     if (raw.by !== "role") {
@@ -1523,6 +2132,7 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       }
       let pool: NonNullable<Step["fanout"]>["pool"];
       const refill = fan.pool?.refill;
+      const idleRaw = fan.pool?.idle;
       if (refill) {
         const poolId = refill.playbook;
         let passTarget: Playbook | null = null;
@@ -1556,7 +2166,14 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         }
         const debounceMs = refill.debounce === undefined ? 0 : parseDuration(refill.debounce);
         if (debounceMs === null) err(`${where}: fanout.pool.refill.debounce: expected a duration such as 30s or 5m`);
-        pool = { playbook: qualifyId(folder.repo, poolId), inputs: passInputs, itemsOutput: refill.items_output, after: refill.after, maxRefills: refill.max_refills, debounceMs: debounceMs ?? 0 };
+        let idle: { output: string; pollMs: number } | undefined;
+        if (idleRaw) {
+          const pollMs = idleRaw.poll === undefined ? 10 * 60_000 : parseDuration(idleRaw.poll);
+          if (pollMs === null || pollMs <= 0) err(`${where}: fanout.pool.idle.poll: expected a duration such as 30s or 10m`);
+          if (passTarget && !passTarget.outputs[idleRaw.output]) err(`${where}: fanout.pool.idle.output: playbook "${poolId}" has no output "${idleRaw.output}" (it has: ${Object.keys(passTarget.outputs).join(", ") || "none"}); the pass must output whether blocked items remain`);
+          idle = { output: idleRaw.output, pollMs: pollMs ?? 10 * 60_000 };
+        }
+        pool = { playbook: qualifyId(folder.repo, poolId), inputs: passInputs, itemsOutput: refill.items_output, after: refill.after, maxRefills: refill.max_refills, debounceMs: debounceMs ?? 0, ...(idle ? { idle } : {}) };
       }
       const outcomeNames = pool ? POOL_OUTCOMES : FANOUT_OUTCOMES;
       const on: Record<string, Transition> = {};
@@ -1565,7 +2182,10 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         if (typeof transition === "string") on[outcome] = { kind: transition };
         else if ("ask" in transition) err(`${where}: on.${outcome}: \`ask\` does not apply to a fan-out step`);
         else if ("end" in transition) on[outcome] = endTransition(`${where}: on.${outcome}`, transition.end);
-        else on[outcome] = transition.max_loops !== undefined ? { kind: "goto", target: transition.goto, maxLoops: transition.max_loops } : { kind: "goto", target: transition.goto };
+        else {
+          const delayMs = gotoDelay(`${where}: on.${outcome}.delay`, transition.delay);
+          on[outcome] = { kind: "goto", target: transition.goto, ...(transition.max_loops !== undefined ? { maxLoops: transition.max_loops } : {}), ...(delayMs !== undefined ? { delayMs } : {}) };
+        }
       }
       let timeoutMs = defaultTimeout;
       const timeoutTemplate = rawStep.timeout !== undefined && templateRefs(rawStep.timeout).length > 0 ? rawStep.timeout : undefined;
@@ -1634,7 +2254,10 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
       return choice;
     });
     if (gateStep?.choices !== undefined && choices.length === 0) err(`${where}: gate.choices: declare at least one choice`);
-    const outcomes = isGate ? (choices.length > 0 ? choices.map((choice) => choice.id) : GATE_OUTCOMES) : rawStep.outcomes ?? AGENT_OUTCOMES;
+    // A script step's non-zero exit is the outcome `failure` whether it declares it or not, so it is always allowed
+    // (retries, `on.failure`); agent steps already default to success/failure and hand-offs and fan-outs fix theirs.
+    const declared = rawStep.outcomes ?? AGENT_OUTCOMES;
+    const outcomes = isGate ? (choices.length > 0 ? choices.map((choice) => choice.id) : GATE_OUTCOMES) : isScript && !declared.includes("failure") ? [...declared, "failure"] : declared;
     const on: Record<string, Transition> = {};
     for (const [outcome, transition] of Object.entries(rawStep.on ?? {})) {
       if (!outcomes.includes(outcome)) err(`${where}: on.${outcome}: not an outcome of this step (${outcomes.join(", ")})`);
@@ -1690,11 +2313,13 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
         err(`${where}: on.${outcome}.decider: a \`goto\` opens a gate only with \`max_loops\` (its loop-limit gate); add \`max_loops\` or remove \`decider\``);
       }
       const gotoDecider = parseDecider(`${where}: on.${outcome}.decider`, transition.decider);
+      const gotoDelayMs = gotoDelay(`${where}: on.${outcome}.delay`, transition.delay);
       on[outcome] = {
         kind: "goto",
         target: transition.goto,
         ...(transition.max_loops !== undefined ? { maxLoops: transition.max_loops } : {}),
         ...(gotoDecider && transition.max_loops !== undefined ? { decider: gotoDecider } : {}),
+        ...(gotoDelayMs !== undefined ? { delayMs: gotoDelayMs } : {}),
       };
     }
     // One rule for agent steps and gates: the first outcome completes by default, `failure`
@@ -1986,7 +2611,19 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (resolveIsolation(pb.isolation, undefined).mode === "worktree") err("`isolation: worktree` does not apply to a singleton: its batches share one pipeline workspace");
     isolation = { ...isolation, mode: "none" };
   }
+  // A template of its own may name only declared inputs (a repository default is checked when a run starts: an unknown name keeps the default title).
+  for (const name of workspaceTitleRefs(pb.workspace?.title ?? "")) {
+    if (!(name in inputs)) err(`workspace.title uses "{${name}}" but the playbook declares no such input (declared: ${Object.keys(inputs).join(", ") || "none"})`);
+  }
   if (errors.length > 0) return fail(errors);
+  const nudgeOwn = resolveManagerNudge(pb.manager?.nudge, "manager.nudge", err);
+  const managerNudge: ManagerNudge = { ...DEFAULT_MANAGER_NUDGE, ...defaults.managerNudge, ...nudgeOwn };
+  if (managerNudge.maxIntervalMs < managerNudge.afterMs) {
+    if (nudgeOwn.maxIntervalMs !== undefined || nudgeOwn.afterMs !== undefined) err("manager.nudge.max_interval must not be shorter than manager.nudge.after");
+    else managerNudge.maxIntervalMs = managerNudge.afterMs;
+  }
+  if (pb.warden?.pr_checks !== undefined) err("`warden.pr_checks` only applies in defaults/main.yaml: it looks at the project's pull requests, not at one run");
+  const warden = resolveWarden(pb.warden, defaults.wardenConfig ?? DEFAULT_WARDEN, "warden", err);
   let managerMode: ManagerMode = defaults.managerMode ?? DEFAULT_MANAGER_MODE;
   if (pb.manager?.mode !== undefined) {
     const parsedMode = parseManagerMode(pb.manager.mode);
@@ -1997,6 +2634,8 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     if (pb.manager?.mode !== undefined) err("`manager: { mode: none }` does not apply to a singleton: a pipeline's batches each have a manager");
     managerMode = "always_on";
   }
+  const ownRules = parseAgentRules(pb.agent_rules);
+  for (const message of ownRules.errors) err(message);
   if (errors.length > 0) return fail(errors);
   const manager = mergeAgent(defaults.agent?.provider ? { provider: defaults.agent.provider, model: defaults.agent.model } : undefined, defaults.manager);
   entry.playbook = {
@@ -2010,6 +2649,10 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     roles,
     manager,
     managerCompact: pb.manager?.compact ?? defaults.managerCompact ?? DEFAULT_MANAGER_COMPACT,
+    managerNudge,
+    warden,
+    rateLimit: { priority: pb.quota_limit?.priority ?? pb.rate_limit?.priority ?? defaults.quota_limit?.priority ?? defaults.rate_limit?.priority ?? 0 },
+    quotaLimits: defaults.quotaLimits ?? {},
     managerMode,
     exhaustedForMs: (defaults.providers?.exhausted_for ? parseDuration(defaults.providers.exhausted_for) : null) ?? DEFAULT_EXHAUSTED_FOR_MS,
     onExhausted: defaults.providers?.on_exhausted ?? "fail",
@@ -2017,14 +2660,24 @@ async function loadPlaybook(folder: Folder, name: string, file: string, id: stri
     fallback: defaults.providers?.fallback ?? [],
     usageCheck: defaults.providers?.usage?.check ?? true,
     usageThreshold: defaults.providers?.usage?.threshold ?? 100,
+    managerRecovery: {
+      retry: pb.manager_recovery?.retry ?? defaults.manager_recovery?.retry ?? null,
+      fallback: pb.manager_recovery?.fallback ?? defaults.manager_recovery?.fallback ?? null,
+    },
     slowWarning: { runs: pb.slow_warning?.runs ?? defaults.slow_warning?.runs ?? DEFAULT_SLOW_WARNING.runs, factor: pb.slow_warning?.factor ?? defaults.slow_warning?.factor ?? DEFAULT_SLOW_WARNING.factor },
+    agentRules: mergeAgentRules(defaults.agentRules ?? [], ownRules.rules, [...blocks.values()]),
     managerInstructions: managerInstructions(folder.managerText, qid, pb.manager?.prompt, [...blocks.values()]),
     outcomes: playbookOutcomes,
+    autoArchive: { enabled: pb.auto_archive?.enabled ?? defaults.auto_archive?.enabled ?? false, afterMs: parseDuration(pb.auto_archive?.after ?? defaults.auto_archive?.after ?? "") ?? DEFAULT_AUTO_ARCHIVE_AFTER_MS, keepFailedWorkspaceMs: parseDuration(pb.auto_archive?.keep_failed_workspace ?? defaults.auto_archive?.keep_failed_workspace ?? "") ?? DEFAULT_KEEP_FAILED_WORKSPACE_MS },
     workspace: {
       archive: pb.workspace?.archive ?? defaults.workspace?.archive ?? "never",
       keepFailed: pb.workspace?.keep_failed ?? defaults.workspace?.keep_failed ?? true,
+      archiveWithRun: pb.workspace?.archive_with_run ?? defaults.workspace?.archive_with_run ?? true,
+      archiveAfterMs: archiveAfterMs(pb.workspace?.archive_after ?? defaults.workspace?.archive_after),
+      title: pb.workspace?.title ?? defaults.workspace?.title ?? null,
     },
     isolation,
+    permissions: { onRequest: pb.permissions?.on_request ?? defaults.permissions?.on_request ?? DEFAULT_PERMISSION_POLICY },
     blocks: blockInfo,
     after: (pb.after ?? []).map((raw) => ({
       id: raw.id,

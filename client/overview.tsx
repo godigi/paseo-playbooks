@@ -1,19 +1,26 @@
-import { openExternalUrl, usePaseo, useRpc, useSettings, type PluginIconProps, type PluginScreenProps, type PluginSidebarItemProps } from "@getpaseo/plugin/client";
-import { Icon, ScrollView, SidebarRow, useToast } from "@getpaseo/plugin/client/ui";
+import { openExternalUrl, usePaseo, useRpc, useSettings, useTranslation, type PluginIconProps, type PluginScreenProps, type PluginSidebarItemProps } from "@getpaseo/plugin/client";
+import { copyText, Icon, ScrollView, SidebarRow, useToast } from "@getpaseo/plugin/client/ui";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Animated, Easing, Pressable, Text, View } from "react-native";
 import { archiveRunRpc, listPlaybooks, markRunSeenRpc } from "../shared/contracts";
-import { gateText, waitsForHuman } from "../shared/gates";
+import { gateText, isWaiting, needsReview, waitsForHuman } from "../shared/gates";
+import { BringBack, DeferForm, WaitingInfo } from "./defer";
 import { overviewSettings } from "../shared/overview-settings";
+import { closedTabs, closeTab, effectiveTab, normalizeOpenTabs, openTab, visibleTabs, type PanelTab } from "../shared/panel-tabs";
 import { DEFAULT_PLAYBOOK_SORT, PLAYBOOK_SORTS, sortPlaybooks, type PlaybookSort } from "../shared/sort";
 import { isActive, isPaused, isPipeline, isTerminal, type Gate, type RunSummary, type StepSummary } from "../shared/types";
 import { slowDetail, slowView } from "../shared/slow";
 import { useSlowSteps } from "./slow";
 import { laneTone } from "./lane-tone";
+import { TONE_RANK } from "./tone-color";
 import { AnalyticsView } from "./analytics";
+import { OffHoursView } from "./off-hours";
+import { QuotaView } from "./quota";
+import { RunExemptTag, RunPriorityMenu } from "./run-priority-menu";
 import { useReduceMotion } from "./graph";
 import { LABEL_WIDTH, labelLayout, ROW_HEIGHT } from "./layout";
+import { needsYouRowKey } from "./overview-row-key";
 import { useOverview, type OverviewStore } from "./overview-store";
 import { GETTING_STARTED_URL } from "./panel";
 import { PreReleaseFlag } from "./pre-release";
@@ -22,9 +29,15 @@ import { SidekickPane } from "./sidekick/pane";
 import { sidekickUi, useSidekickUi } from "./sidekick/ui-state";
 import { defaultProject, projectsOf, runButtonState, runnablePlaybooks } from "./run-form";
 import { Button, GateActions } from "./sheet";
+import { messages } from "./i18n";
 import { OverviewRunForm, RunPlaybookButton } from "./start-form";
 import { openJobsLabel, Stages, batchName } from "./stages";
 import { stepShortTitle, stepTitle, stepTitleOf, withAlpha, type Theme } from "./theme";
+import { semanticColor } from "./semantic-colors";
+
+/** The panel's translator, for the helpers that build text outside a component. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type T = (key: any, params?: any) => string;
 
 /** Id of the Playbooks screen, opened from the sidebar row. */
 export const SCREEN_ID = "playbooks";
@@ -47,11 +60,12 @@ function useStoreRefresh(): () => void {
 export function PlaybooksSidebarItem(props: PluginSidebarItemProps & { store: OverviewStore }) {
   const { theme } = props;
   const { count } = useOverview(props.store);
-  const icon = useMemo(() => (count > 0 ? badgedIcon(theme, count) : "Workflow"), [theme, count]);
+  const { t } = useTranslation(messages);
+  const icon = useMemo(() => (count > 0 ? badgedIcon(theme, count, t("needsYou", { count })) : "Workflow"), [theme, count, t]);
   return (
     <SidebarRow
       icon={icon}
-      label="Playbooks"
+      label={t("title")}
       active={props.currentScreen?.screenId === SCREEN_ID}
       onPress={() => props.openScreen({ screenId: SCREEN_ID })}
     />
@@ -59,14 +73,14 @@ export function PlaybooksSidebarItem(props: PluginSidebarItemProps & { store: Ov
 }
 
 /** The Playbooks icon with the waiting count in an accent bubble on its corner. */
-function badgedIcon(theme: Theme, count: number) {
+function badgedIcon(theme: Theme, count: number, description: string) {
   return function BadgedIcon(props: PluginIconProps) {
     const bubble = Math.max(12, Math.round(props.size * 0.8));
     return (
       <View style={{ width: props.size, height: props.size }}>
         <Icon name="Workflow" size={props.size} color={props.color} />
         <View
-          accessibilityLabel={`${count} ${count === 1 ? "needs" : "need"} you`}
+          accessibilityLabel={description}
           style={{
             position: "absolute",
             top: -bubble / 2,
@@ -112,6 +126,19 @@ interface WorkspaceInfo {
 }
 
 /** The host's workspaces, kept current by an owned list subscription. */
+/** The definitions of the projects are listed this long after the screen opens, so the Sidekick column's own request is served first. */
+const DEFINITIONS_DELAY_MS = 1_200;
+
+/** True once `ms` have passed since the component mounted. */
+function useAfter(ms: number): boolean {
+  const [passed, setPassed] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setPassed(true), ms);
+    return () => clearTimeout(timer);
+  }, [ms]);
+  return passed;
+}
+
 function useWorkspaces(): WorkspaceInfo[] {
   const paseo = usePaseo();
   const [workspaces, setWorkspaces] = useState<Map<string, WorkspaceInfo>>(new Map());
@@ -166,8 +193,8 @@ function pendingGates(run: RunSummary): Gate[] {
 }
 
 /** A run's name in lists: its first text input (the request), else its id; a batch's stage and jobs. */
-function runTitle(run: RunSummary): string {
-  if (run.batch) return `${batchName(run)} · ${run.jobs.length} ${run.jobs.length === 1 ? "job" : "jobs"}`;
+function runTitle(t: T, run: RunSummary): string {
+  if (run.batch) return `${batchName(run, t)} · ${t("cards.group.jobs", { count: run.jobs.length })}`;
   return run.title ?? run.id;
 }
 
@@ -175,34 +202,36 @@ function shortId(run: RunSummary): string {
   return run.id.replace(/^run_/, "");
 }
 
-function ago(iso: string): string {
+function ago(t: T, iso: string): string {
   const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-  if (seconds < 60) return "just now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86_400)}d ago`;
+  if (seconds < 60) return t("cards.ago.now");
+  if (seconds < 3600) return t("cards.ago.minutes", { n: Math.floor(seconds / 60) });
+  if (seconds < 86_400) return t("cards.ago.hours", { n: Math.floor(seconds / 3600) });
+  return t("cards.ago.days", { n: Math.floor(seconds / 86_400) });
 }
 
-function gateKindLabel(gate: Gate): string {
-  return gate.kind === "ask" ? "Answer" : gate.kind === "loop_limit" ? "Loop limit" : gate.kind === "admission" ? "Admission" : "Decide";
+function gateKindLabel(t: T, gate: Gate): string {
+  return gate.kind === "ask" ? t("cards.gate.answer") : gate.kind === "loop_limit" ? t("cards.gate.loopLimit") : gate.kind === "admission" ? t("cards.gate.admission") : gate.kind === "permission" ? t("cards.gate.permission") : gate.kind === "manager_question" ? t("cards.gate.question") : t("cards.gate.decide");
 }
 
 /**
- * What a run is doing, as a colour: blue working, yellow waiting (a decision or a free slot),
- * green done and not opened yet, grey done and opened (or paused), red failed or canceled.
+ * What a run is doing, as a colour: blue working, orange waiting (a decision or a free slot),
+ * green done and not opened yet, violet paused, grey done and opened, red failed or canceled.
  */
 type Tone = "running" | "waiting" | "paused" | "done" | "seen" | "failed";
 
 function toneColor(theme: Theme, tone: Tone): string {
   switch (tone) {
     case "waiting":
-      return theme.colors.statusWarning;
+      return semanticColor(theme, "waiting");
     case "running":
-      return theme.colors.accent;
+      return semanticColor(theme, "running");
     case "done":
-      return theme.colors.statusSuccess;
+      return semanticColor(theme, "done");
     case "failed":
-      return theme.colors.statusDanger;
+      return semanticColor(theme, "failed");
+    case "paused":
+      return semanticColor(theme, "paused");
     default:
       return theme.colors.foregroundMuted;
   }
@@ -230,33 +259,41 @@ function isMoving(tone: Tone): boolean {
 
 const LIVE = new Set(["running", "waiting", "reported", "queued", "ready", "failed"]);
 
+/** "On hold: <why>, retries 14:05": what the panel says of a run rate limiting holds (new steps only; running ones finish). */
+export function holdText(t: T, locale: string, hold: { reason: string; retryAt: string | null }): string {
+  const retry = hold.retryAt ? new Date(hold.retryAt) : null;
+  return retry && Number.isFinite(retry.getTime()) ? t("cards.hold.retry", { reason: hold.reason, time: retry.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }) : t("cards.hold.text", { reason: hold.reason });
+}
+
 /**
  * Where a run stands on its line: the column of its furthest live step (Done once completed),
  * the columns of every live step, and its tone.
  */
-function progress(run: RunSummary): { position: number; marks: number[]; tone: Tone; status: string } {
+function progress(t: T, locale: string, run: RunSummary): { position: number; marks: number[]; tone: Tone; status: string } {
   const steps = mainSteps(run);
   const done = steps.length;
 
   if (run.status === "completed") {
-    if (isActive(run)) return { position: done, marks: [done], tone: "running", status: "Done, wrapping up" };
-    return { position: done, marks: [done], tone: run.seenAt ? "seen" : "done", status: "Done" };
+    if (isActive(run)) return { position: done, marks: [done], tone: "running", status: t("cards.status.doneWrapping") };
+    return { position: done, marks: [done], tone: run.seenAt ? "seen" : "done", status: t("cards.status.done") };
   }
   const live = steps.flatMap((step, index) => (LIVE.has(run.steps[step.id]?.status ?? "pending") ? [index] : []));
   const completed = steps.flatMap((step, index) => (run.steps[step.id]?.status === "completed" ? [index] : []));
   const marks = live.length > 0 ? live : [Math.min(done, (completed.at(-1) ?? -1) + 1)];
   const position = Math.max(...marks);
-  const at = steps[position] ? stepTitle(steps[position]!) : "Done";
-  if (run.status === "failed" || run.status === "canceled") return { position, marks, tone: "failed", status: `${run.status === "failed" ? "Failed" : "Canceled"} at ${at}` };
-  if (isPaused(run)) return { position, marks, tone: "paused", status: `Paused at ${at}` };
+  const at = steps[position] ? stepTitle(steps[position]!) : t("cards.status.done");
+  if (run.status === "failed" || run.status === "canceled") return { position, marks, tone: "failed", status: t(run.status === "failed" ? "cards.status.failedAt" : "cards.status.canceledAt", { step: at }) };
+  if (isPaused(run)) return { position, marks, tone: "paused", status: t("cards.status.pausedAt", { step: at }) };
   const gates = pendingGates(run);
-  if (gates.length > 0) return { position, marks, tone: "waiting", status: `Ready for you: ${gates.map((gate) => stepTitleOf(run.playbook, gate.stepId)).join(", ")}` };
+  if (gates.length > 0) return { position, marks, tone: "waiting", status: t("cards.status.readyForYou", { steps: gates.map((gate) => stepTitleOf(run.playbook, gate.stepId)).join(", ") }) };
   const named = (status: string) => steps.filter((step) => run.steps[step.id]?.status === status).map(stepTitle);
   const running = named("running");
-  if (running.length > 0) return { position, marks, tone: "running", status: `Working: ${running.join(", ")}` };
+  // Rate limiting holds only new steps: running ones finish. A human gate (above) is never hidden by a hold.
+  if (run.rateHold) return { position, marks, tone: running.length > 0 ? "running" : "paused", status: running.length > 0 ? t("cards.status.workingHold", { steps: running.join(", "), hold: holdText(t, locale, run.rateHold) }) : holdText(t, locale, run.rateHold) };
+  if (running.length > 0) return { position, marks, tone: "running", status: t("cards.status.working", { steps: running.join(", ") }) };
   const queued = named("queued");
-  if (queued.length > 0) return { position, marks, tone: "waiting", status: `Waiting for a free slot: ${queued.join(", ")}` };
-  return { position, marks, tone: "running", status: "Manager is working" };
+  if (queued.length > 0) return { position, marks, tone: "waiting", status: t("cards.status.waitingSlot", { steps: queued.join(", ") }) };
+  return { position, marks, tone: "running", status: t("cards.status.managerWorking") };
 }
 
 /** 1 → 0.3 → 1, forever, while `active` (and motion is allowed); 1 otherwise. */
@@ -311,6 +348,7 @@ function ToneIcon(props: { tone: Tone; color: string; size?: number }) {
 // ---------------------------------------------------------------- screen
 
 export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStore }) {
+  const { t, locale } = useTranslation(messages);
   const { theme, layout, navigation, store } = props;
   const workspaces = useWorkspaces();
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
@@ -320,7 +358,19 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   const settings = useSettings(overviewSettings);
   const [picked, setPicked] = useState<PlaybookSort | null>(null);
   const playbookSort: PlaybookSort = picked ?? (settings.status === "ready" ? settings.values.sort : DEFAULT_PLAYBOOK_SORT);
-  const [tab, setTab] = useState<"runs" | "analytics" | "profiles">("runs");
+  // The tabs added next to Runs: kept by the host with the sort (empty by default); a change shows at once, before the save lands.
+  const [selectedTab, setSelectedTab] = useState<PanelTab>("runs");
+  const [pickedTabs, setPickedTabs] = useState<PanelTab[] | null>(null);
+  const openTabs = pickedTabs ?? (settings.status === "ready" ? normalizeOpenTabs(settings.values.openTabs) : []);
+  const tab = effectiveTab({ open: openTabs, selected: selectedTab });
+  const applyTabs = (next: { open: PanelTab[]; selected: PanelTab }) => {
+    setSelectedTab(next.selected);
+    setPickedTabs(next.open);
+    if (settings.status === "ready") void settings.save({ ...settings.values, openTabs: next.open }, settings.revision);
+  };
+  // Every way of selecting a tab goes through here, so a link to a tab that is not open opens it instead of showing nothing.
+  const selectTab = (target: PanelTab) => applyTabs(openTab({ open: openTabs, selected: tab }, target));
+  const dismissTab = (target: PanelTab) => applyTabs(closeTab({ open: openTabs, selected: tab }, target));
   // The sidebar badge and this screen share one store: one agent subscription, one request per change.
   const overview = useOverview(store);
   const toast = useToast();
@@ -332,8 +382,13 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   // Run Playbook: each project's playbooks are listed from its first workspace (the panel's query, same cache key).
   const listDefinitions = useRpc(listPlaybooks);
   const runProjects = useMemo(() => projectsOf(workspaces), [workspaces]);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const quotaWorkspaces = useMemo(() => runProjects.map(({ projectId, workspaceId }) => ({ projectId, workspaceId })), [runProjects]);
+  // The Sidekick column and the runs go first: the definitions of every project (a read of each project's files) start after a short head start.
+  const definitionsReady = useAfter(DEFINITIONS_DELAY_MS);
   const definitions = useQueries({
     queries: runProjects.map((candidate) => ({
+      enabled: definitionsReady,
       queryKey: ["playbooks", "definitions", candidate.workspaceId],
       queryFn: () => listDefinitions({ workspaceId: candidate.workspaceId }),
       refetchInterval: 30_000,
@@ -341,7 +396,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
   });
   const runnableOf = new Map(runProjects.map((candidate, index) => [candidate.projectId, runnablePlaybooks(definitions[index]?.data?.entries ?? [])]));
   const runnableProjects = runProjects.filter((candidate) => (runnableOf.get(candidate.projectId)?.length ?? 0) > 0);
-  const runState = runButtonState(runnableProjects.length, definitions.some((query) => query.isLoading));
+  const runState = runButtonState(runnableProjects.length, !definitionsReady || definitions.some((query) => query.isLoading));
   const [runForm, setRunForm] = useState(false);
 
   const byId = useMemo(() => new Map(workspaces.map((workspace) => [workspace.id, workspace])), [workspaces]);
@@ -372,14 +427,17 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
       title: group.playbook.title,
       updatedAt: group.runs.reduce((latest, run) => (run.updatedAt > latest ? run.updatedAt : latest), ""),
       createdAt: group.runs.reduce((latest, run) => (run.createdAt > latest ? run.createdAt : latest), ""),
-      statusRank: Math.min(...group.runs.map((run) => TONE_RANK[progress(run).tone])),
+      statusRank: Math.min(...group.runs.map((run) => TONE_RANK[progress(t, locale, run).tone])),
     }));
-  }, [runs, playbookSort]);
+  }, [runs, playbookSort, t, locale]);
   // Same order as the groups below, so "Needs you" does not jump either.
-  const needs = groups.flatMap((group) => group.runs.flatMap((run) => pendingGates(run).map((gate) => ({ run, gate }))));
+  const needs = groups.flatMap((group) => group.runs.flatMap((run) => run.gates.filter(needsReview).map((gate) => ({ run, gate }))));
+  // Deferred after a review: still open and decidable, but not asked for now.
+  const waiting = groups.flatMap((group) => group.runs.flatMap((run) => run.gates.filter(isWaiting).map((gate) => ({ run, gate }))));
 
   const counts = {
     needsYou: needs.length,
+    waiting: waiting.length,
     // A live pipeline stays running while it exists, idle or not: only its batches count.
     working: runs.filter((run) => !isPipeline(run) && isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length,
     paused: runs.filter((run) => isPaused(run)).length,
@@ -388,6 +446,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
     failed: runs.filter((run) => run.status === "failed" || run.status === "canceled").length,
   };
 
+  const playbookSortOptions = PLAYBOOK_SORTS.map((sort) => ({ key: sort.key, label: t(`cards.playbookSort.${sort.key}.label`), hint: t(`cards.playbookSort.${sort.key}.hint`) }));
   const pad = layout.compact ? 12 : 22;
   const onOpenWorkspace = navigation ? (workspaceId: string) => navigation.openWorkspace({ workspaceId }) : undefined;
   const onOpenAgent = navigation ? (agentId: string) => navigation.openAgent({ agentId }) : undefined;
@@ -397,28 +456,29 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: pad, gap: 18 }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 10, flexWrap: "wrap", zIndex: 50 }}>
           <PreReleaseFlag theme={theme} />
-          <Text style={{ flex: 1, color: theme.colors.foregroundMuted, fontSize: 13 }}>
-            <Text style={{ color: theme.colors.statusWarning }}>{counts.needsYou}</Text> {counts.needsYou === 1 ? "needs" : "need"} you ·{" "}
-            <Text style={{ color: theme.colors.accent }}>{counts.working}</Text> working
-            {counts.paused > 0 ? ` · ${counts.paused} paused` : ""}
+          <Text style={{ flex: 1, minWidth: 140, color: theme.colors.foregroundMuted, fontSize: 13 }}>
+            <Text style={{ color: semanticColor(theme, "waiting") }}>{counts.needsYou}</Text> {t("cards.summary.needsYou", { count: counts.needsYou })} ·{" "}
+            <Text style={{ color: semanticColor(theme, "running") }}>{counts.working}</Text> {t("cards.summary.working")}
+            {counts.waiting > 0 ? ` · ${t("cards.summary.waiting", { count: counts.waiting })}` : ""}
+            {counts.paused > 0 ? ` · ${t("cards.summary.paused", { count: counts.paused })}` : ""}
             {counts.failed > 0 ? (
               <>
                 {" · "}
-                <Text style={{ color: theme.colors.statusDanger }}>{counts.failed}</Text> failed
+                <Text style={{ color: semanticColor(theme, "failed") }}>{counts.failed}</Text> {t("cards.summary.failed")}
               </>
             ) : null}
             {counts.done > 0 ? (
               <>
                 {" · "}
-                <Text style={{ color: theme.colors.statusSuccess }}>{counts.done}</Text> done
+                <Text style={{ color: semanticColor(theme, "done") }}>{counts.done}</Text> {t("cards.summary.done")}
               </>
             ) : null}
           </Text>
-          {runState !== "hidden" ? <RunPlaybookButton theme={theme} loading={runState === "loading"} onPress={() => setRunForm(true)} /> : null}
+          <RunPlaybookButton theme={theme} compact={layout.compact} loading={runState === "loading"} emptyReason={runState === "empty" ? (runProjects.length === 0 ? t("form.noWorkspaces") : t("form.noRunnable")) : undefined} onPress={() => setRunForm(true)} />
           {!layout.compact ? (
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel={`${sidekickOpen ? "Close" : "Open"} the Sidekick: a coordinator agent per project that watches the runs and improves the playbooks`}
+              accessibilityLabel={t(sidekickOpen ? "cards.sidekick.close" : "cards.sidekick.open")}
               accessibilityState={{ expanded: sidekickOpen }}
               hitSlop={8}
               onPress={() => setSidekickOpen(!sidekickOpen)}
@@ -430,10 +490,11 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
           ) : null}
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel="Refresh playbooks"
+            accessibilityLabel={t("panel.refresh")}
             hitSlop={8}
             onPress={() => {
               store.refresh();
+              setRefreshTick((tick) => tick + 1);
               void queryClient.invalidateQueries({ queryKey: ["playbooks"] });
             }}
             style={{ borderRadius: 8, borderWidth: 1, borderColor: theme.colors.border, padding: 7 }}
@@ -442,14 +503,14 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
           </Pressable>
         </View>
 
-        <View accessibilityRole="tablist" style={{ flexDirection: "row", gap: 16, borderBottomWidth: 1, borderBottomColor: theme.colors.border }}>
-          <Tab theme={theme} label="Runs" selected={tab === "runs"} onPress={() => setTab("runs")} />
-          <Tab theme={theme} label="Analytics" selected={tab === "analytics"} onPress={() => setTab("analytics")} />
-          <Tab theme={theme} label="Profiles" selected={tab === "profiles"} onPress={() => setTab("profiles")} />
-        </View>
+        <TabBar theme={theme} compact={layout.compact} open={openTabs} selected={tab} onSelect={selectTab} onClose={dismissTab} />
 
         {tab === "analytics" ? (
           <AnalyticsView theme={theme} />
+        ) : tab === "quota" ? (
+          <QuotaView theme={theme} workspaces={quotaWorkspaces} refreshSignal={refreshTick} />
+        ) : tab === "offHours" ? (
+          <OffHoursView theme={theme} workspaces={quotaWorkspaces} refreshSignal={refreshTick} />
         ) : tab === "profiles" ? (
           <ProfilesView theme={theme} workspaces={workspaces} />
         ) : (
@@ -460,7 +521,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
           <View style={{ flex: 1, minWidth: 0, flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
             <Chip
               theme={theme}
-              label="All projects"
+              label={t("cards.chip.allProjects")}
               selected={!project}
               onPress={() => {
                 setProjectFilter(null);
@@ -480,15 +541,15 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
                 }}
               />
             ))}
-            <Chip theme={theme} label="Show done" icon={showDone ? "Check" : undefined} selected={showDone} onPress={() => setShowDone(!showDone)} />
+            <Chip theme={theme} label={t("cards.chip.showDone")} icon={showDone ? "Check" : undefined} selected={showDone} onPress={() => setShowDone(!showDone)} />
           </View>
           <View style={{ flexShrink: 0 }}>
           <SortMenu
             theme={theme}
             outline
             align="right"
-            noun="playbooks"
-            options={PLAYBOOK_SORTS}
+            ariaLabel={(current) => t("cards.sortLabel.playbooks", { current })}
+            options={playbookSortOptions}
             value={playbookSort}
             onChange={(key) => {
               setPicked(key);
@@ -499,7 +560,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
           </View>
           {project && workspaceChips.length > 0 ? (
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, paddingLeft: 12, borderLeftWidth: 2, borderLeftColor: theme.colors.border }}>
-              <Chip theme={theme} small label="All workspaces" selected={!scope} onPress={() => setWorkspaceFilter(null)} />
+              <Chip theme={theme} small label={t("cards.chip.allWorkspaces")} selected={!scope} onPress={() => setWorkspaceFilter(null)} />
               {workspaceChips.map((chip) => (
                 <Chip
                   key={chip.id}
@@ -515,15 +576,26 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
           ) : null}
         </View>
 
-        {overview.error ? <Text style={{ color: theme.colors.statusDanger }}>{overview.error}</Text> : null}
-        {overview.runs === null && !overview.error ? <Text style={{ color: theme.colors.foregroundMuted }}>Loading…</Text> : null}
+        {overview.error ? <Text style={{ color: semanticColor(theme, "failed") }}>{overview.error}</Text> : null}
+        {overview.runs === null && !overview.error ? <Text style={{ color: theme.colors.foregroundMuted }}>{t("common.loading")}</Text> : null}
 
         {needs.length > 0 ? (
           <View style={{ gap: 8 }}>
-            <SectionTitle theme={theme} icon="CircleDot" iconColor={theme.colors.statusWarning} title="Needs you" count={needs.length} />
+            <SectionTitle theme={theme} icon="CircleDot" iconColor={semanticColor(theme, "waiting")} title={t("cards.section.needsYou")} count={needs.length} />
             <View style={{ borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1, overflow: "hidden" }}>
               {needs.map(({ run, gate }, index) => (
-                <NeedsYouRow key={gate.id} theme={theme} run={run} gate={gate} first={index === 0} workspace={names.get(run.workspaceId) ?? run.workspaceId} hostLabel={props.host.label} compact={layout.compact} onOpenWorkspace={onOpenWorkspace} onOpenAgent={onOpenAgent} />
+                <NeedsYouRow key={needsYouRowKey(run.id, gate.id)} allRuns={runs} theme={theme} run={run} gate={gate} first={index === 0} workspace={names.get(run.workspaceId) ?? run.workspaceId} hostLabel={props.host.label} compact={layout.compact} onOpenWorkspace={onOpenWorkspace} onOpenAgent={onOpenAgent} />
+              ))}
+            </View>
+          </View>
+        ) : null}
+
+        {waiting.length > 0 ? (
+          <View style={{ gap: 8 }}>
+            <SectionTitle theme={theme} icon="Clock" iconColor={theme.colors.foregroundMuted} title={t("cards.section.waiting")} count={waiting.length} description={t("cards.section.waitingHint")} />
+            <View style={{ borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1, overflow: "hidden" }}>
+              {waiting.map(({ run, gate }, index) => (
+                <WaitingRow key={needsYouRowKey(run.id, gate.id)} theme={theme} run={run} gate={gate} first={index === 0} workspace={names.get(run.workspaceId) ?? run.workspaceId} hostLabel={props.host.label} compact={layout.compact} onOpenWorkspace={onOpenWorkspace} onOpenAgent={onOpenAgent} />
               ))}
             </View>
           </View>
@@ -550,14 +622,14 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
             <Icon name="Workflow" size={28} color={theme.colors.foregroundMuted} />
             {overview.runs.length === 0 ? (
               <>
-                <Text style={{ color: theme.colors.foreground, fontSize: 15, fontWeight: "600", textAlign: "center" }}>No runs yet</Text>
+                <Text style={{ color: theme.colors.foreground, fontSize: 15, fontWeight: "600", textAlign: "center" }}>{t("cards.empty.noRuns")}</Text>
                 <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13, textAlign: "center", maxWidth: 340 }}>
-                  Open a workspace, then its Playbooks panel: if it has no playbook, one button creates a small example you can start.
+                  {t("cards.empty.noRunsHint")}
                 </Text>
                 <Button
                   theme={theme}
-                  label="Read the guide ↗"
-                  accessibilityLabel="Open the getting started guide in your browser"
+                  label={t("empty.readGuide")}
+                  accessibilityLabel={t("empty.readGuideLabel")}
                   onPress={() =>
                     void openExternalUrl(GETTING_STARTED_URL).catch((error: unknown) =>
                       toast.error(error instanceof Error ? error.message : String(error)),
@@ -567,7 +639,7 @@ export function PlaybooksScreen(props: PluginScreenProps & { store: OverviewStor
               </>
             ) : (
               <Text style={{ color: theme.colors.foregroundMuted, fontSize: 13, textAlign: "center" }}>
-                {showDone ? "No runs yet." : "Nothing running. Show done lists the finished runs."}
+                {showDone ? t("cards.empty.noRunsShort") : t("cards.empty.nothingRunning")}
               </Text>
             )}
           </View>
@@ -614,33 +686,102 @@ function chipsOf(runs: RunSummary[], key: (run: RunSummary) => string, label: (r
   for (const run of runs) {
     const id = key(run);
     const chip = chips.get(id) ?? { id, label: label(run), needsYou: 0 };
-    chip.needsYou += pendingGates(run).length;
+    chip.needsYou += run.gates.filter(needsReview).length;
     chips.set(id, chip);
   }
   return [...chips.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
 
-function Tab(props: { theme: Theme; label: string; selected: boolean; onPress(): void }) {
-  const { theme, selected } = props;
+function tabLabel(t: (key: "cards.tabs.runs" | "cards.tabs.analytics" | "quota.tab" | "offHours.tab" | "cards.tabs.profiles") => string, tab: PanelTab): string {
+  switch (tab) {
+    case "runs": return t("cards.tabs.runs");
+    case "analytics": return t("cards.tabs.analytics");
+    case "quota": return t("quota.tab");
+    case "offHours": return t("offHours.tab");
+    default: return t("cards.tabs.profiles");
+  }
+}
+
+/** Runs, the tabs added with "+", and the "+" menu of the others (hidden once all are open). A tab's x shows on the selected or hovered tab, always on a compact layout. */
+function TabBar(props: { theme: Theme; compact: boolean; open: PanelTab[]; selected: PanelTab; onSelect(tab: PanelTab): void; onClose(tab: PanelTab): void }) {
+  const { theme, compact, selected } = props;
+  const { t } = useTranslation(messages);
+  const [menu, setMenu] = useState(false);
+  const closed = closedTabs(props.open);
   return (
-    <Pressable
-      accessibilityRole="tab"
-      accessibilityState={{ selected }}
-      onPress={props.onPress}
-      style={{ paddingVertical: 8, marginBottom: -1, borderBottomWidth: 2, borderBottomColor: selected ? theme.colors.foreground : "transparent" }}
+    <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap", columnGap: compact ? 12 : 16, borderBottomWidth: 1, borderBottomColor: theme.colors.border, zIndex: 40 }}>
+      <View accessibilityRole="tablist" style={{ flexDirection: "row", flexWrap: "wrap", columnGap: compact ? 12 : 16 }}>
+        {visibleTabs(props.open).map((id) => (
+          <Tab key={id} theme={theme} label={tabLabel(t, id)} selected={selected === id} alwaysCloseable={compact} onPress={() => props.onSelect(id)} onClose={id === "runs" ? undefined : () => props.onClose(id)} closeLabel={t("cards.tabs.close", { tab: tabLabel(t, id) })} />
+        ))}
+      </View>
+      {closed.length > 0 ? (
+        <View style={{ position: "relative", marginBottom: -1 }}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={t("cards.tabs.add")}
+            accessibilityState={{ expanded: menu }}
+            hitSlop={8}
+            onPress={() => setMenu(!menu)}
+            style={{ paddingVertical: 6, paddingHorizontal: 4 }}
+          >
+            <Icon name="Plus" size={16} color={theme.colors.foregroundMuted} />
+          </Pressable>
+          {menu ? (
+            <View accessibilityRole="menu" style={{ position: "absolute", top: 32, left: 0, zIndex: 100, minWidth: 180, padding: 4, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface2, elevation: 6 }}>
+              {closed.map((id) => (
+                <Pressable
+                  key={id}
+                  accessibilityRole="menuitem"
+                  onPress={() => {
+                    setMenu(false);
+                    props.onSelect(id);
+                  }}
+                  style={{ paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}
+                >
+                  <Text style={{ color: theme.colors.foreground, fontSize: 13 }}>{tabLabel(t, id)}</Text>
+                </Pressable>
+              ))}
+            </View>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function Tab(props: { theme: Theme; label: string; selected: boolean; alwaysCloseable: boolean; onPress(): void; onClose?(): void; closeLabel: string }) {
+  const { theme, selected } = props;
+  const [hover, setHover] = useState(false);
+  const [focus, setFocus] = useState(false);
+  const showClose = props.onClose && (selected || hover || focus || props.alwaysCloseable);
+  return (
+    <View
+      // Pointer events: fired by a mouse only, hence alwaysCloseable on compact layouts.
+      onPointerEnter={() => setHover(true)}
+      onPointerLeave={() => setHover(false)}
+      style={{ flexDirection: "row", alignItems: "center", gap: 6, marginBottom: -1, borderBottomWidth: 2, borderBottomColor: selected ? theme.colors.foreground : "transparent" }}
     >
-      <Text style={{ color: selected ? theme.colors.foreground : theme.colors.foregroundMuted, fontSize: 13, fontWeight: selected ? "700" : "500" }}>{props.label}</Text>
-    </Pressable>
+      <Pressable accessibilityRole="tab" accessibilityState={{ selected }} onPress={props.onPress} onFocus={() => setFocus(true)} onBlur={() => setFocus(false)} style={{ paddingVertical: 8 }}>
+        <Text style={{ color: selected ? theme.colors.foreground : theme.colors.foregroundMuted, fontSize: 13, fontWeight: selected ? "700" : "500" }}>{props.label}</Text>
+      </Pressable>
+      {props.onClose ? (
+        <Pressable accessibilityRole="button" accessibilityLabel={props.closeLabel} hitSlop={8} onPress={props.onClose} onFocus={() => setFocus(true)} onBlur={() => setFocus(false)} style={{ opacity: showClose ? 1 : 0, padding: 2 }}>
+          <Icon name="X" size={13} color={theme.colors.foregroundMuted} />
+        </Pressable>
+      ) : null}
+    </View>
   );
 }
 
 function Chip(props: { theme: Theme; label: string; selected: boolean; onPress(): void; count?: number; icon?: string; small?: boolean }) {
   const { theme, selected } = props;
+  const { t } = useTranslation(messages);
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ selected }}
-      accessibilityLabel={props.count ? `${props.label}, ${props.count} ${props.count === 1 ? "needs" : "need"} you` : props.label}
+      accessibilityLabel={props.count ? t("cards.chip.needsYou", { label: props.label, count: props.count }) : props.label}
       onPress={props.onPress}
       style={{
         flexDirection: "row",
@@ -683,6 +824,7 @@ function SectionTitle(props: { theme: Theme; title: string; count?: number; icon
 /** A pending gate: what it asks, where it is, and Review, which opens the gate's choices in place. */
 function NeedsYouRow(props: {
   theme: Theme;
+  allRuns: RunSummary[];
   run: RunSummary;
   gate: Gate;
   first: boolean;
@@ -693,17 +835,19 @@ function NeedsYouRow(props: {
   onOpenAgent?: (agentId: string) => void;
 }) {
   const { theme, run, gate } = props;
+  const { t } = useTranslation(messages);
   const [open, setOpen] = useState(false);
+  const [deferring, setDeferring] = useState(false);
   const refresh = useStoreRefresh();
-  const warning = theme.colors.statusWarning;
-  const summary = gateText(gate).summary.split("\n")[0] || `${stepTitleOf(run.playbook, gate.stepId)} is waiting`;
+  const warning = semanticColor(theme, "waiting");
+  const summary = gateText(gate).summary.split("\n")[0] || t("cards.gate.isWaiting", { step: stepTitleOf(run.playbook, gate.stepId) });
   return (
     <View style={{ borderTopWidth: props.first ? 0 : 1, borderTopColor: theme.colors.border }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 10 }}>
         {props.compact ? null : (
           <View style={{ width: 92, flexDirection: "row", alignItems: "center", gap: 6 }}>
             <ToneIcon tone="waiting" color={warning} />
-            <Text style={{ color: warning, fontSize: 12, fontWeight: "600" }}>{gateKindLabel(gate)}</Text>
+            <Text style={{ color: warning, fontSize: 12, fontWeight: "600" }}>{gateKindLabel(t, gate)}</Text>
           </View>
         )}
         <View style={{ flex: 1, gap: 2 }}>
@@ -711,23 +855,75 @@ function NeedsYouRow(props: {
             {summary} <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{shortId(run)}</Text>
           </Text>
           <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
-            {run.playbook.title} › {stepTitleOf(run.playbook, gate.stepId)} · {props.workspace} · {runTitle(run)}
+            {run.playbook.title} › {stepTitleOf(run.playbook, gate.stepId)} · {props.workspace} · {runTitle(t, run)}
           </Text>
         </View>
-        {props.compact ? null : <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{ago(gate.requestedAt)}</Text>}
+        {props.compact ? null : <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{ago(t, gate.requestedAt)}</Text>}
         <Pressable
           accessibilityRole="button"
           accessibilityState={{ expanded: open }}
-          accessibilityLabel={`${open ? "Close" : "Review"} ${summary}`}
+          accessibilityLabel={t(open ? "cards.row.closeLabel" : "cards.row.reviewLabel", { summary })}
           onPress={() => setOpen(!open)}
           style={{ borderRadius: 7, paddingHorizontal: 12, paddingVertical: 6, backgroundColor: open ? theme.colors.surface2 : theme.colors.accent }}
         >
-          <Text style={{ color: open ? theme.colors.foreground : theme.colors.accentForeground, fontSize: 12, fontWeight: "600" }}>{open ? "Close" : "Review"}</Text>
+          <Text style={{ color: open ? theme.colors.foreground : theme.colors.accentForeground, fontSize: 12, fontWeight: "600" }}>{t(open ? "cards.row.close" : "cards.row.review")}</Text>
         </Pressable>
         <RunActions theme={theme} run={run} workspace={props.workspace} compact={props.compact} onOpenAgent={props.onOpenAgent} onOpenWorkspace={props.onOpenWorkspace} />
       </View>
       {open ? (
         <View style={{ paddingHorizontal: 12, paddingBottom: 12, paddingLeft: props.compact ? 12 : 116, maxWidth: 760 }}>
+          <GateActions theme={theme} run={run} gate={gate} hostLabel={props.hostLabel} onDecided={refresh} />
+          {gate.kind === "permission" ? null : (
+            <View style={{ gap: 8, marginTop: 10 }}>
+              <Pressable accessibilityRole="button" accessibilityState={{ expanded: deferring }} accessibilityLabel={t("cards.row.deferLabel")} onPress={() => setDeferring(!deferring)} style={{ alignSelf: "flex-start", borderRadius: 7, borderWidth: 1, borderColor: theme.colors.border, paddingHorizontal: 12, paddingVertical: 6 }}>
+                <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, fontWeight: "600" }}>{deferring ? t("cards.row.cancelDefer") : t("cards.row.defer")}</Text>
+              </Pressable>
+              {deferring ? <DeferForm theme={theme} run={run} gate={gate} hostLabel={props.hostLabel} others={props.allRuns} onDone={() => { setDeferring(false); setOpen(false); refresh(); }} /> : null}
+            </View>
+          )}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+/** A deferred gate: why it waits and for what (tracked by the plugin, or by hand), Bring back, and Decide (the gate can still be decided). */
+function WaitingRow(props: {
+  theme: Theme;
+  run: RunSummary;
+  gate: Gate;
+  first: boolean;
+  workspace: string;
+  hostLabel: string;
+  compact: boolean;
+  onOpenWorkspace?: (workspaceId: string) => void;
+  onOpenAgent?: (agentId: string) => void;
+}) {
+  const { theme, run, gate } = props;
+  const { t } = useTranslation(messages);
+  const [open, setOpen] = useState(false);
+  const refresh = useStoreRefresh();
+  const summary = gateText(gate).summary.split("\n")[0] || t("cards.gate.isWaiting", { step: stepTitleOf(run.playbook, gate.stepId) });
+  return (
+    <View style={{ borderTopWidth: props.first ? 0 : 1, borderTopColor: theme.colors.border }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 10 }}>
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text numberOfLines={open ? undefined : 1} style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "500" }}>
+            {summary} <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{shortId(run)}</Text>
+          </Text>
+          <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
+            {run.playbook.title} › {stepTitleOf(run.playbook, gate.stepId)} · {props.workspace} · {runTitle(t, run)}
+          </Text>
+          <WaitingInfo theme={theme} gate={gate} />
+        </View>
+        <BringBack theme={theme} run={run} gate={gate} hostLabel={props.hostLabel} />
+        <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={t(open ? "cards.row.closeLabel" : "cards.row.decideLabel", { summary })} onPress={() => setOpen(!open)} style={{ borderRadius: 7, paddingHorizontal: 12, paddingVertical: 6, backgroundColor: theme.colors.surface2 }}>
+          <Text style={{ color: theme.colors.foreground, fontSize: 12, fontWeight: "600" }}>{t(open ? "cards.row.close" : "cards.row.decide")}</Text>
+        </Pressable>
+        <RunActions theme={theme} run={run} workspace={props.workspace} compact={props.compact} onOpenAgent={props.onOpenAgent} onOpenWorkspace={props.onOpenWorkspace} />
+      </View>
+      {open ? (
+        <View style={{ paddingHorizontal: 12, paddingBottom: 12, maxWidth: 760 }}>
           <GateActions theme={theme} run={run} gate={gate} hostLabel={props.hostLabel} onDecided={refresh} />
         </View>
       ) : null}
@@ -739,20 +935,13 @@ const TITLE_WIDTH = "38%";
 
 type SortKey = "updated" | "started" | "status" | "progress";
 
-const SORTS: ReadonlyArray<{ key: SortKey; label: string; hint: string }> = [
-  { key: "updated", label: "Last update", hint: "Most recent activity first" },
-  { key: "started", label: "Started", hint: "Newest run first" },
-  { key: "status", label: "Status", hint: "Waiting, working, failed, done, paused, seen" },
-  { key: "progress", label: "Progress", hint: "Furthest along first" },
-];
+const SORT_KEYS: readonly SortKey[] = ["updated", "started", "status", "progress"];
 
-/** Order of tones under "Status": what needs a look first. */
-const TONE_RANK: Record<Tone, number> = { waiting: 0, running: 1, failed: 2, done: 3, paused: 4, seen: 5 };
 
 /** Runs in the chosen order; ties go to the most recent activity. */
-function sortRuns(runs: RunSummary[], key: SortKey): RunSummary[] {
+function sortRuns(t: T, locale: string, runs: RunSummary[], key: SortKey): RunSummary[] {
   const byUpdate = (a: RunSummary, b: RunSummary) => b.updatedAt.localeCompare(a.updatedAt);
-  const facts = new Map(runs.map((run) => [run.id, progress(run)]));
+  const facts = new Map(runs.map((run) => [run.id, progress(t, locale, run)]));
   const compare = (a: RunSummary, b: RunSummary): number => {
     switch (key) {
       case "started":
@@ -773,10 +962,12 @@ function sortRuns(runs: RunSummary[], key: SortKey): RunSummary[] {
 
 /** "Runs" with the sort of this playbook's rows: a button that opens the choices below it. */
 function SortHeading(props: { theme: Theme; label?: string; value: SortKey; onChange(key: SortKey): void }) {
+  const { t } = useTranslation(messages);
+  const options = SORT_KEYS.map((key) => ({ key, label: t(`cards.runSort.${key}.label`), hint: t(`cards.runSort.${key}.hint`) }));
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 8, zIndex: 10 }}>
-      <Text style={{ color: props.theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>{props.label ?? "Runs"}</Text>
-      <SortMenu theme={props.theme} noun="runs" options={SORTS} value={props.value} onChange={props.onChange} />
+      <Text style={{ color: props.theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.4 }}>{props.label ?? t("cards.group.runs")}</Text>
+      <SortMenu theme={props.theme} ariaLabel={(current) => t("cards.sortLabel.runs", { current })} options={options} value={props.value} onChange={props.onChange} />
     </View>
   );
 }
@@ -784,7 +975,7 @@ function SortHeading(props: { theme: Theme; label?: string; value: SortKey; onCh
 /** A button naming the current sort that opens the choices below it (`outline`: the bordered header style, menu to the right edge). */
 function SortMenu<K extends string>(props: {
   theme: Theme;
-  noun: string;
+  ariaLabel: (current: string) => string;
   options: ReadonlyArray<{ key: K; label: string; hint: string }>;
   value: K;
   outline?: boolean;
@@ -801,7 +992,7 @@ function SortMenu<K extends string>(props: {
       <View>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Sort ${props.noun}: ${current.label}`}
+          accessibilityLabel={props.ariaLabel(current.label)}
           accessibilityState={{ expanded: open }}
           hitSlop={outline ? 8 : undefined}
           onPress={() => setOpen(!open)}
@@ -872,6 +1063,7 @@ function PlaybookGroup(props: {
   onOpenWorkspace?: (workspaceId: string) => void;
   onOpenAgent?: (agentId: string) => void;
 }) {
+  const { t, locale } = useTranslation(messages);
   const [sort, setSort] = useState<SortKey>("updated");
   // Batches of different stages have different steps: each row shows its own columns.
   const compact = props.compact || Boolean(props.pipeline);
@@ -880,8 +1072,8 @@ function PlaybookGroup(props: {
   // older runs of an edited playbook keep their own steps.
   const playbook = props.pipeline?.playbook ?? props.runs[0]!.playbook;
   const rows = useMemo(() => props.runs.filter((run) => !isPipeline(run)), [props.runs]);
-  const columns = rows[0] ? [...mainSteps(rows[0]).map(stepShortTitle), "Done"] : ["Done"];
-  const runs = useMemo(() => sortRuns(rows, sort), [rows, sort]);
+  const columns = rows[0] ? [...mainSteps(rows[0]).map(stepShortTitle), t("cards.status.done")] : [t("cards.status.done")];
+  const runs = useMemo(() => sortRuns(t, locale, rows, sort), [t, locale, rows, sort]);
   const runsById = useMemo(() => new Map(props.allRuns.map((run) => [run.id, run])), [props.allRuns]);
   const working = runs.filter((run) => isActive(run) && !isPaused(run) && pendingGates(run).length === 0).length;
   return (
@@ -893,12 +1085,12 @@ function PlaybookGroup(props: {
         description={compact ? undefined : playbook.description}
         extra={
           props.pipeline
-            ? `${openJobsLabel(props.pipeline)} · ${working} ${working === 1 ? "batch" : "batches"} running`
+            ? `${openJobsLabel(props.pipeline, t)} · ${t("cards.group.batchesRunning", { count: working })}`
             : working > 0
-              ? `${working} working`
+              ? t("cards.group.working", { count: working })
               : undefined
         }
-        extraColor={theme.colors.accent}
+        extraColor={semanticColor(theme, "running")}
       />
       {props.pipeline ? <Stages theme={theme} pipeline={props.pipeline} runs={props.allRuns} /> : null}
       {/* No overflow clipping: the sort menu opens over the rows below. */}
@@ -906,7 +1098,7 @@ function PlaybookGroup(props: {
       <View style={{ borderRadius: 10, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
         <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: theme.colors.border, zIndex: 10 }}>
           <View style={{ width: compact ? undefined : TITLE_WIDTH, flex: compact ? 1 : undefined }}>
-            <SortHeading theme={theme} label={props.pipeline ? "Batches" : undefined} value={sort} onChange={setSort} />
+            <SortHeading theme={theme} label={props.pipeline ? t("cards.group.batches") : undefined} value={sort} onChange={setSort} />
           </View>
           {compact ? null : (
             <>
@@ -985,12 +1177,14 @@ function RunRow(props: {
   onOpenAgent?: (agentId: string) => void;
 }) {
   const { theme, run, compact } = props;
-  const state = progress(run);
+  const toast = useToast();
+  const { t, locale } = useTranslation(messages);
+  const state = progress(t, locale, run);
   const color = toneColor(theme, state.tone);
   const history = useMemo(() => [...props.runs.values()].map(slowView), [props.runs]);
   const slow = useSlowSteps(slowView(run), history);
   const slowIds = Object.keys(slow);
-  const columns = [...mainSteps(run).map(stepShortTitle), "Done"];
+  const columns = [...mainSteps(run).map(stepShortTitle), t("cards.status.done")];
   const markSeen = useRpc(markRunSeenRpc);
   const refresh = useStoreRefresh();
   /** Opening a finished run from here marks it seen: a green done run turns grey. */
@@ -1010,8 +1204,8 @@ function RunRow(props: {
   const title = (
     <Pressable
       accessibilityRole={openWorkspace ? "button" : undefined}
-      accessibilityLabel={`${runTitle(run)}, ${state.status}${state.tone === "done" ? ", not opened yet" : ""}`}
-      accessibilityHint={openWorkspace ? `Opens workspace ${props.workspace}` : undefined}
+      accessibilityLabel={t(state.tone === "done" ? "cards.run.labelNotOpened" : "cards.run.label", { title: runTitle(t, run), status: state.status })}
+      accessibilityHint={openWorkspace ? t("cards.run.opensWorkspace", { name: props.workspace }) : undefined}
       disabled={!openWorkspace}
       onPress={openWorkspace}
       style={{ width: compact ? undefined : TITLE_WIDTH, flex: compact ? 1 : undefined, flexDirection: "row", gap: 8, paddingRight: 12 }}
@@ -1021,21 +1215,35 @@ function RunRow(props: {
       </View>
       <View style={{ flex: 1, gap: 2 }}>
         <Text numberOfLines={1} style={{ color: theme.colors.foreground, fontSize: 13, fontWeight: "500" }}>
-          {runTitle(run)}
+          {runTitle(t, run)}
         </Text>
         {slowIds.length > 0 ? (
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }} accessible accessibilityLabel={`Slow step ${slowIds[0]}: ${slowDetail(slow[slowIds[0]!]!)}`}>
-            <Icon name="TriangleAlert" size={11} color={theme.colors.statusWarning} />
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }} accessible accessibilityLabel={t("cards.run.slowStep", { id: slowIds[0]!, detail: slowDetail(slow[slowIds[0]!]!) })}>
+            <Icon name="TriangleAlert" size={11} color={semanticColor(theme, "waiting")} />
             <Text numberOfLines={1} style={{ flex: 1, color: theme.colors.foregroundMuted, fontSize: 11 }}>
               {slowIds[0]}: {slowDetail(slow[slowIds[0]!]!)}
             </Text>
           </View>
         ) : null}
         <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>
-          {shortId(run)} · <Text style={{ color: state.tone === "seen" || state.tone === "paused" ? theme.colors.foregroundMuted : color }}>{state.status}</Text> ·{" "}
-          {ago(run.updatedAt)}
+          <Text
+            accessibilityRole="button"
+            accessibilityLabel={t("cards.run.copyId")}
+            onPress={(event) => {
+              event?.stopPropagation?.();
+              copyText(run.id).then(
+                () => toast.show(t("cards.run.copied", { id: run.id }), { variant: "success" }),
+                (error: unknown) => toast.error(error instanceof Error ? error.message : t("cards.run.copyFailed")),
+              );
+            }}
+            style={{ textDecorationLine: "underline", textDecorationStyle: "dotted" }}
+          >
+            {shortId(run)}
+          </Text>{" "}
+          · <Text style={{ color: state.tone === "seen" ? theme.colors.foregroundMuted : color }}>{state.status}</Text> ·{" "}
+          {ago(t, run.updatedAt)}
           {props.workspace ? ` · ${props.workspace}` : ""}
-          {run.parent ? ` · item ${run.parent.key} of ${run.parent.runId.replace(/^run_/, "")}` : ""}
+          {run.parent ? ` · ${t("cards.run.item", { key: run.parent.key, parent: run.parent.runId.replace(/^run_/, "") })}` : ""}
         </Text>
       </View>
     </Pressable>
@@ -1102,30 +1310,31 @@ function fanoutCounts(children: FanoutChildInfo[]) {
   return { started: children.filter((child) => child.runId !== null).length, running: count("starting", "running"), waiting: count("pending"), done: count("completed"), failed: count("failed", "canceled", "not_started") };
 }
 
-function countsText(children: FanoutChildInfo[], pool?: RunSummary["fanouts"][string]["pool"]): string {
+function countsText(t: T, children: FanoutChildInfo[], pool?: RunSummary["fanouts"][string]["pool"]): string {
   const counts = fanoutCounts(children);
   if (pool) {
     // A work pool grows: "started of total" would keep moving, so the counts are by state.
-    return [`${counts.running} running`, `${counts.done} done`, counts.waiting ? `${counts.waiting} queued` : "", counts.failed ? `${counts.failed} failed` : "", `refills ${pool.refills}`, pool.status === "stopped" ? "refilling stopped" : ""].filter(Boolean).join(" · ");
+    return [t("cards.counts.running", { count: counts.running }), t("cards.counts.done", { count: counts.done }), counts.waiting ? t("cards.counts.queued", { count: counts.waiting }) : "", counts.failed ? t("cards.counts.failed", { count: counts.failed }) : "", t("cards.counts.refills", { count: pool.refills }), pool.status === "stopped" ? t("cards.counts.refillStopped") : ""].filter(Boolean).join(" · ");
   }
-  return [`${counts.started}/${children.length} started`, counts.running ? `${counts.running} running` : "", counts.waiting ? `${counts.waiting} waiting` : "", `${counts.done} done`, counts.failed ? `${counts.failed} failed` : ""].filter(Boolean).join(" · ");
+  return [t("cards.counts.started", { started: counts.started, total: children.length }), counts.running ? t("cards.counts.running", { count: counts.running }) : "", counts.waiting ? t("cards.counts.waiting", { count: counts.waiting }) : "", t("cards.counts.done", { count: counts.done }), counts.failed ? t("cards.counts.failed", { count: counts.failed }) : ""].filter(Boolean).join(" · ");
 }
 
 /** The refill passes of a work pool, oldest first and never removed: what each was given and which items it added. */
 function RefillEntries(props: { theme: Theme; pool: NonNullable<RunSummary["fanouts"][string]["pool"]> }) {
   const { theme, pool } = props;
+  const { t } = useTranslation(messages);
   const [open, setOpen] = useState(false);
   if (pool.passes.length === 0) return null;
   return (
     <View style={{ gap: 4 }}>
       <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => setOpen(!open)} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
         <Icon name={open ? "ChevronDown" : "ChevronRight"} size={13} color={theme.colors.foregroundMuted} />
-        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Refills ({pool.refills}) · {pool.added} item(s) added</Text>
+        <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{t("cards.refill.summary", { refills: pool.refills, count: pool.added })}</Text>
       </Pressable>
       {open
         ? pool.passes.map((pass) => (
             <Text key={pass.n} style={{ color: theme.colors.foregroundMuted, fontSize: 11, paddingLeft: 19 }}>
-              Refill #{pass.n} · {pass.status === "completed" ? `${pass.added.length ? `added ${pass.added.slice(0, 6).join(", ")}${pass.added.length > 6 ? ` +${pass.added.length - 6}` : ""}` : "added nothing"}` : pass.status}
+              {t("cards.refill.entry", { n: pass.n, detail: pass.status === "completed" ? (pass.added.length ? t("cards.refill.added", { items: `${pass.added.slice(0, 6).join(", ")}${pass.added.length > 6 ? ` +${pass.added.length - 6}` : ""}` }) : t("cards.refill.addedNothing")) : pass.status })}
               {pass.error ? ` · ${pass.error.slice(0, 120)}` : ""}
             </Text>
           ))
@@ -1150,15 +1359,16 @@ function FanoutLanes(props: {
   onOpenWorkspace?: ((workspaceId: string) => void) | undefined;
 }) {
   const { theme, fanout } = props;
+  const { t } = useTranslation(messages);
   const [open, setOpen] = useState(true);
   const [past, setPast] = useState(false);
   const title = stepTitleOf(props.run.playbook, props.stepId);
   return (
     <View style={{ gap: 6, paddingLeft: 12, borderLeftWidth: 2, borderLeftColor: theme.colors.border }}>
-      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={`${title}, pass ${fanout.loop + 1}: ${countsText(fanout.children, fanout.pool)}`} onPress={() => setOpen(!open)} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={t("cards.fanout.passLabel", { title, n: fanout.loop + 1, counts: countsText(t, fanout.children, fanout.pool) })} onPress={() => setOpen(!open)} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
         <Icon name={open ? "ChevronDown" : "ChevronRight"} size={13} color={theme.colors.foregroundMuted} />
         <Text numberOfLines={2} style={{ flex: 1, color: theme.colors.foreground, fontSize: 12, fontWeight: "600" }}>
-          {title} <Text style={{ color: theme.colors.foregroundMuted, fontWeight: "400" }}>· pass {fanout.loop + 1} · {countsText(fanout.children, fanout.pool)}</Text>
+          {title} <Text style={{ color: theme.colors.foregroundMuted, fontWeight: "400" }}>{t("cards.fanout.passInline", { n: fanout.loop + 1, counts: countsText(t, fanout.children, fanout.pool) })}</Text>
         </Text>
       </Pressable>
       {open && fanout.pool ? <RefillEntries theme={theme} pool={fanout.pool} /> : null}
@@ -1167,7 +1377,7 @@ function FanoutLanes(props: {
         <View style={{ gap: 6 }}>
           <Pressable accessibilityRole="button" accessibilityState={{ expanded: past }} onPress={() => setPast(!past)} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
             <Icon name={past ? "ChevronDown" : "ChevronRight"} size={13} color={theme.colors.foregroundMuted} />
-            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>Earlier passes ({fanout.past.length})</Text>
+            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{t("cards.fanout.earlier", { count: fanout.past.length })}</Text>
           </Pressable>
           {past
             ? [...fanout.past].reverse().map((pass, index) => <PastPass key={`${pass.loop}-${index}`} theme={theme} pass={pass} compact={props.compact} runs={props.runs} onOpenWorkspace={props.onOpenWorkspace} />)
@@ -1179,12 +1389,13 @@ function FanoutLanes(props: {
 }
 
 function PastPass(props: { theme: Theme; pass: RunSummary["fanouts"][string]["past"][number]; compact: boolean; runs: Map<string, RunSummary>; onOpenWorkspace?: ((workspaceId: string) => void) | undefined }) {
+  const { t } = useTranslation(messages);
   const [open, setOpen] = useState(false);
   return (
     <View style={{ gap: 6, paddingLeft: 8 }}>
       <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => setOpen(!open)} style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
         <Icon name={open ? "ChevronDown" : "ChevronRight"} size={12} color={props.theme.colors.foregroundMuted} />
-        <Text style={{ flex: 1, color: props.theme.colors.foregroundMuted, fontSize: 11 }}>Pass {props.pass.loop + 1} · {countsText(props.pass.children)}</Text>
+        <Text style={{ flex: 1, color: props.theme.colors.foregroundMuted, fontSize: 11 }}>{t("cards.fanout.pass", { n: props.pass.loop + 1, counts: countsText(t, props.pass.children) })}</Text>
       </Pressable>
       {open ? <Lanes theme={props.theme} children={props.pass.children} compact={props.compact} runs={props.runs} onOpenWorkspace={props.onOpenWorkspace} /> : null}
     </View>
@@ -1192,6 +1403,7 @@ function PastPass(props: { theme: Theme; pass: RunSummary["fanouts"][string]["pa
 }
 
 function Lanes(props: { theme: Theme; children: FanoutChildInfo[]; compact: boolean; runs: Map<string, RunSummary>; onOpenWorkspace?: ((workspaceId: string) => void) | undefined }) {
+  const { t } = useTranslation(messages);
   const [all, setAll] = useState(false);
   const needsYou = (child: FanoutChildInfo) => (child.runId ? (props.runs.get(child.runId)?.gates.filter(waitsForHuman).length ?? 0) > 0 : false);
   const ordered = useMemo(
@@ -1206,42 +1418,43 @@ function Lanes(props: { theme: Theme; children: FanoutChildInfo[]; compact: bool
       {all && ordered.length > 12 ? <ScrollView style={{ maxHeight: 360 }} nestedScrollEnabled><View style={{ gap: 6 }}>{lanes}</View></ScrollView> : lanes}
       {ordered.length > LANES_SHOWN ? (
         <Pressable accessibilityRole="button" onPress={() => setAll(!all)}>
-          <Text style={{ color: props.theme.colors.accent, fontSize: 11 }}>{all ? "Show fewer" : `Show all ${ordered.length}`}</Text>
+          <Text style={{ color: props.theme.colors.accent, fontSize: 11 }}>{all ? t("cards.lane.showFewer") : t("cards.lane.showAll", { count: ordered.length })}</Text>
         </Pressable>
       ) : null}
     </View>
   );
 }
 
-const LANE_STATUS: Record<FanoutChildInfo["status"], string> = { pending: "Waiting for a free slot", starting: "Starting", running: "Running", completed: "Done", failed: "Failed", canceled: "Canceled", not_started: "Not started" };
-
 /** One child run: key, its own progress line, status, and a marker when a human is needed. */
 function Lane(props: { theme: Theme; child: FanoutChildInfo; compact: boolean; run: RunSummary | undefined; onOpenWorkspace?: ((workspaceId: string) => void) | undefined }) {
   const { theme, child, run } = props;
-  const runState = run ? progress(run) : null;
+  const { t, locale } = useTranslation(messages);
+  const runState = run ? progress(t, locale, run) : null;
   const tone = laneTone(child.status, runState?.tone ?? null);
   const state = runState && tone ? { ...runState, tone } : null;
   const color = tone ? toneColor(theme, tone) : theme.colors.foregroundMuted;
   const gates = run?.gates.filter(waitsForHuman).length ?? 0;
   const recordFinal = child.status === "completed" || child.status === "failed" || child.status === "canceled" || child.status === "not_started";
-  const status = runState && !recordFinal ? runState.status : child.error && child.status === "not_started" ? `Not started: ${child.error}` : LANE_STATUS[child.status];
+  const status = runState && !recordFinal ? runState.status : child.error && child.status === "not_started" ? t("cards.lane.notStarted", { error: child.error }) : t(`cards.lane.status.${child.status}`);
   const open = run && props.onOpenWorkspace ? () => props.onOpenWorkspace!(run.workspaceId) : undefined;
   const columns = run ? mainSteps(run).length + 1 : 0;
   const line = state && run ? <ProgressLine theme={theme} total={columns} position={state.position} marks={state.marks} color={color} moving={isMoving(state.tone)} /> : null;
   const marker = gates > 0 ? (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
-      <Icon name="CircleDot" size={12} color={theme.colors.statusWarning} />
-      <Text style={{ color: theme.colors.statusWarning, fontSize: 11, fontWeight: "600" }}>Needs you</Text>
+      <Icon name="CircleDot" size={12} color={semanticColor(theme, "waiting")} />
+      <Text style={{ color: semanticColor(theme, "waiting"), fontSize: 11, fontWeight: "600" }}>{t("cards.lane.needsYou")}</Text>
     </View>
   ) : null;
   const [history, setHistory] = useState(false);
+  const refresh = useStoreRefresh();
   const restarts = child.previous.length;
+  const priority = run?.quotaPriority && isActive(run) ? <RunPriorityMenu theme={theme} runId={run.id} view={run.quotaPriority} onChanged={refresh} /> : run?.quotaExempt && isActive(run) ? <RunExemptTag theme={theme} /> : null;
   return (
     <View style={{ gap: 2 }}>
     <Pressable
       accessibilityRole={open ? "button" : undefined}
-      accessibilityLabel={`${child.key}: ${status}${restarts > 0 ? `, restarted ${restarts} time${restarts === 1 ? "" : "s"}` : ""}${gates > 0 ? ", needs you" : ""}`}
-      accessibilityHint={open ? "Opens the child run's workspace" : undefined}
+      accessibilityLabel={`${child.key}: ${status}${restarts > 0 ? `, ${t("cards.lane.restarted", { count: restarts })}` : ""}${gates > 0 ? `, ${t("cards.lane.needsYouLabel")}` : ""}`}
+      accessibilityHint={open ? t("cards.lane.opensWorkspace") : undefined}
       disabled={!open}
       onPress={open}
       style={{ flexDirection: props.compact ? "column" : "row", alignItems: props.compact ? "stretch" : "center", gap: props.compact ? 2 : 8 }}
@@ -1250,15 +1463,17 @@ function Lane(props: { theme: Theme; child: FanoutChildInfo; compact: boolean; r
         {state ? <ToneIcon tone={state.tone} color={color} size={11} /> : <Icon name="Circle" size={11} color={color} />}
         <Text numberOfLines={1} style={{ flex: 1, color: theme.colors.foreground, fontSize: 12, fontWeight: "500" }}>{child.key}</Text>
         {props.compact ? marker : null}
+        {props.compact ? priority : null}
       </View>
       {line ? <View style={{ flex: props.compact ? undefined : 1, minWidth: 80, flexDirection: "row" }}>{line}</View> : <View style={{ flex: props.compact ? undefined : 1 }} />}
       <Text numberOfLines={1} style={{ color: theme.colors.foregroundMuted, fontSize: 11, width: props.compact ? undefined : 190 }}>{status}</Text>
       {props.compact ? null : marker}
+      {props.compact ? null : priority}
     </Pressable>
     {restarts > 0 ? (
       <View style={{ gap: 2, paddingLeft: props.compact ? 0 : 156 }}>
-        <Pressable accessibilityRole="button" accessibilityState={{ expanded: history }} accessibilityLabel={`${child.key}: earlier runs (${restarts})`} onPress={() => setHistory(!history)}>
-          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>restarted ×{restarts} {history ? "▾" : "▸"}</Text>
+        <Pressable accessibilityRole="button" accessibilityState={{ expanded: history }} accessibilityLabel={t("cards.lane.earlierRuns", { key: child.key, n: restarts })} onPress={() => setHistory(!history)}>
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11 }}>{t("cards.lane.restartedBadge", { n: restarts })} {history ? "▾" : "▸"}</Text>
         </Pressable>
         {history
           ? child.previous.map((entry, index) => (
@@ -1274,8 +1489,8 @@ function Lane(props: { theme: Theme; child: FanoutChildInfo; compact: boolean; r
   );
 }
 
-/** Room for the right-hand buttons of a row: manager, workspace and archive. */
-const ACTIONS_WIDTH = 90;
+/** Room for the right-hand buttons of a row: priority, manager, workspace and archive. */
+const ACTIONS_WIDTH = 130;
 
 /** Open the run's Playbook Manager and its workspace, or archive a finished run: the right-hand buttons of a run or Needs you row. */
 function RunActions(props: {
@@ -1288,24 +1503,26 @@ function RunActions(props: {
 }) {
   const { theme, run } = props;
   const archive = useRpc(archiveRunRpc);
+  const { t } = useTranslation(messages);
   const refresh = useStoreRefresh();
   const toast = useToast();
   // Only a finished run whose after-tasks are done can be archived.
   const archivable = isTerminal(run.status) && !isActive(run);
   return (
-    <View style={{ width: props.compact ? undefined : ACTIONS_WIDTH, flexDirection: "row", justifyContent: "flex-end", gap: 10 }}>
+    <View style={{ width: props.compact ? undefined : ACTIONS_WIDTH, flexDirection: "row", justifyContent: "flex-end", alignItems: "center", gap: 10 }}>
+      {run.quotaPriority && isActive(run) ? <RunPriorityMenu theme={theme} runId={run.id} view={run.quotaPriority} onChanged={refresh} /> : run.quotaExempt && isActive(run) ? <RunExemptTag theme={theme} /> : null}
       {props.onOpenAgent && run.managerAgentId ? (
-        <IconButton theme={theme} icon="Bot" label={`Open the Playbook Manager of run ${shortId(run)}`} onPress={() => props.onOpenAgent!(run.managerAgentId)} />
+        <IconButton theme={theme} icon="Bot" label={t("cards.actions.openManager", { id: shortId(run) })} onPress={() => props.onOpenAgent!(run.managerAgentId)} />
       ) : null}
       {props.onOpenWorkspace ? (
-        <IconButton theme={theme} icon="SquareArrowOutUpRight" label={`Open workspace ${props.workspace}`} onPress={() => props.onOpenWorkspace!(run.workspaceId)} />
+        <IconButton theme={theme} icon="SquareArrowOutUpRight" label={t("cards.actions.openWorkspace", { name: props.workspace })} onPress={() => props.onOpenWorkspace!(run.workspaceId)} />
       ) : null}
       {archivable ? (
         <IconButton
           theme={theme}
           icon="Archive"
-          label={`Archive run ${shortId(run)}`}
-          hint="Hides the run from this screen and its panel. Its agents and saved state are kept."
+          label={t("cards.actions.archive", { id: shortId(run) })}
+          hint={t("cards.actions.archiveHint")}
           onPress={() =>
             void archive({ runId: run.id })
               .then(refresh)

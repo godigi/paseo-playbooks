@@ -110,7 +110,7 @@ export function checkTypes(defs: EventTypeDef[], types: string[], filter: Record
 }
 
 const SCOPE_KEYS = ["runId", "projectId", "workspaceDir", "playbook"];
-const RARE_TYPES = ["gate.escalated", "run.failed", "run.manager_lost"];
+const RARE_TYPES = ["gate.escalated", "run.failed", "run.manager_lost", "step.waiting_manager_stuck", "manager.question_pending", "provider.usage_unavailable", "provider.usage_restored"];
 
 /**
  * A new `subscribe_events` call must be scoped to a run, project, workspace or playbook, unless every type it asks
@@ -120,7 +120,7 @@ export function checkSubscriptionScope(types: string[], filter: Record<string, s
   if (SCOPE_KEYS.some((key) => filter[key] !== undefined && filter[key] !== "")) return;
   if (types.every((type) => RARE_TYPES.includes(type))) return;
   throw new BusError(
-    `subscribe_events needs a scope: pass filter { runId } for the run you watch (or { workspaceDir } for runs you drive; projectId or playbook also work). An unscoped subscription wakes you for every run on the daemon. Only gate.escalated, run.failed and run.manager_lost may be unscoped. Avoid step.completed unless you need it: it fires on every step.`,
+    `subscribe_events needs a scope: pass filter { runId } for the run you watch (or { workspaceDir } for runs you drive; projectId or playbook also work). An unscoped subscription wakes you for every run on the daemon. Only gate.escalated, run.failed, run.manager_lost, step.waiting_manager_stuck, manager.question_pending, provider.usage_unavailable and provider.usage_restored may be unscoped. Avoid step.completed unless you need it: it fires on every step.`,
   );
 }
 
@@ -389,6 +389,20 @@ export class EventBus {
   async list(owner: string): Promise<Subscription[]> {
     await this.ready();
     return this.subscriptions.filter((subscription) => subscription.owner === owner);
+  }
+
+  /** Transfers a manager's subscriptions without changing IDs or dropping pending events. Idempotent after a crash. */
+  async rebindOwner(previous: string, replacement: string): Promise<void> {
+    await this.ready();
+    let changed = false;
+    for (const subscription of this.subscriptions) {
+      if (subscription.owner === previous) { subscription.owner = replacement; changed = true; }
+      if (subscription.sink.kind === "agent" && subscription.sink.target === previous) {
+        subscription.sink.target = replacement;
+        changed = true;
+      }
+    }
+    if (changed) await this.write(this.files.subscriptions, this.subscriptions);
   }
 
   /** Drops every subscription owned by, or delivered to, this target (an archived or lost agent). */

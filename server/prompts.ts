@@ -2,6 +2,23 @@ import type { Gate, GateChoice, Playbook, Role, Run, Step, VarValue } from "../s
 import { jobsText } from "./engine";
 import { replaceRefs } from "../shared/vars";
 
+/** Prompt guidance only: the provider owns the native question tool and its validation. */
+export const CODEX_QUESTION_RULE = `Human questions (Codex): use your native structured question tool (request_user_input or request_user_input_async, whichever is available) when you need the human's answer. These instructions apply to ordinary clarification questions and questions that will be mirrored as Playbooks manager-question gates.
+- For a decision with meaningful, mutually exclusive alternatives, offer 2–3 substantive, distinct choices, within the tool's option limit. Every label must state a concrete answer or action; never submit options: [] or a lone generic "Answer"/"Other" option for a decision question.
+- If and only if evidence supports a recommendation, put it first, suffix that exact option label with "(Recommended)", and give the reason in its description. Describe the meaningful tradeoff of each alternative. Do not invent alternatives, recommend without evidence, or use placeholders such as "Answer (confirm sequencing and name the owner)" or "Respond".
+- Keep the UI's automatic Other/free-text answer available; do not duplicate Other as a listed option or force the human to pick a preset. A preselected choice is not an answer or approval.
+- Ask one focused question at a time, so a manager's question can be answered in the Playbooks panel. For genuinely open-ended information (a name, URL, or text you cannot infer), keep the question open-text and explain what information is needed; do not fabricate domain-specific choices to fill the list. If the native tool requires choices, use its free-text path and explain the limitation.
+- When asking about an existing playbook gate, use exactly its declared choices, one option per choice: never add alternatives, change choice ids, or infer approval from free text. You may mark an advised label "(Recommended)" and explain why, while retaining the mapping to the original choice id. The gate's declared choices take precedence over the 2–3 guidance.`;
+
+/** Apply after resolving the actual provider, including fallbacks; other providers stay byte-identical. */
+export function withCodexQuestionGuidance<T extends { provider: string; systemPrompt?: string }>(config: T): T & { systemPrompt?: string } {
+  if (config.provider.split("/")[0] !== "codex") return config;
+  return { ...config, systemPrompt: [config.systemPrompt, CODEX_QUESTION_RULE].filter(Boolean).join("\n\n") };
+}
+
+/** Keeps tool permission requests rare: Claude Code asks about compound or destructive-looking shell commands even in Bypass mode. */
+export const COMMAND_RULE = `Shell commands: run simple, separate commands (one \`cd <dir> && <command>\` at most). Do not chain \`cd && sed -i && ... ; rm -rf\`, do not \`rm -rf\` a glob (name the exact path), and edit files with the file tools (Read, Edit, Write), not \`sed -i\` or redirections. Compound or destructive-looking commands can raise a permission request that stalls the run.`;
+
 /** How the manager works. Returned by list_playbooks and sent when Start creates a manager. */
 export const MANAGER_PROTOCOL = `You are the Playbook Manager. You run a playbook by starting each step as a subagent,
 briefing it, reading its result and deciding its outcome. The paseo-playbooks plugin owns
@@ -58,7 +75,8 @@ How to run a playbook:
    160 characters, e.g. "PR #3 is green and ready to merge.") and details for the human
    (what was done, links as plain URLs, risks, follow-ups). Then ask the human in chat with
    your tool for asking the user a question (AskUserQuestion, request_user_input or the
-   like), one option per gate choice: this flags the workspace as needing input. Call
+   like), one option per gate choice. Keep recommendation labels and descriptions intact
+   when they map to the declared gate choices: this flags the workspace as needing input. Call
    resume with their answer. The same goes for loop-limit and ask gates. The human may
    decide in the Paseo panel instead: your question is then dismissed with the decision;
    end your turn and you are woken with what comes next. If a decision reaches you by
@@ -84,7 +102,9 @@ How to run a playbook:
    with per-item results in the outputs). Never start_step or complete_step it, and never
    touch the child runs: their gates go to the human in the Playbooks panel. (A child's own manager
    that cancels its run and starts a new one for the same item links them with replace_child, or
-   start_playbook with replaces, so the item stays running; you need not.)
+   start_playbook with replaces, so the item stays running; you need not.) To add one more item
+   to a running fan-out (a ticket created after it started), call add_fanout_item: it joins under
+   max_active and the pool knows it; never start a separate run for it.
    Hand-off steps (\`handoff:\` instead of a role) are not yours either: a hand-off gives the task
    to a singleton playbook. The plugin hands the job to its pipeline and the step completes at
    once, with no outputs; the run goes on with what is ready next (often it ends there). You are
@@ -92,6 +112,14 @@ How to run a playbook:
 10. Pause: a human may pause the run from the panel. While it is paused, start_step and
    nudge_step are refused and you are not woken; running steps finish their turn. End your
    turn. On resume you are woken with the ready steps and the reports that came in meanwhile.
+   Rate limits: the plugin may hold the run's new steps (not enough quota headroom for its
+   estimated cost, an admitted run paused to fit the pace, a provider at its usable share, or an optional cap on running steps or
+   admitted runs). You are told when it starts and when it ends, and
+   get_run shows it as rateHold (kind, reason, provider, window, retryAt, estimatedCost,
+   headroom, position in the queue, priority). While it lasts
+   start_step is refused with the reason; running steps finish. The plugin starts the ready
+   steps itself once capacity or quota returns: do not retry, restart, cancel or work around it.
+   Tell the human only if they ask. End your turn.
 
 11. Overseeing: get_run reads any run, not only yours (writes stay with the run's manager).
    list_gates shows every open gate and ask across runs and who holds each; with
@@ -102,7 +130,9 @@ How to run a playbook:
    decide another run's gate.
 
 Rules: create step agents only with start_step (never with Paseo's create_agent tool), do
-not do the steps' work yourself, and never edit files in this workspace.`;
+not do the steps' work yourself, and never edit files in this workspace.
+
+${COMMAND_RULE}`;
 
 /** Staging rule given to every step agent: a blanket add in a worktree with empty submodule directories stages their deletion. */
 export const GIT_STAGING_RULE = `Never run \`git add -A\`, \`git add .\` or \`git commit -a\`/\`-am\`: stage files explicitly by path (\`git add <path>\`) and check \`git diff --cached --stat\` before committing. Never stage the removal of a submodule entry (mode 160000): in a worktree where submodule directories are empty or absent a blanket add stages their deletion; if \`git diff --cached --summary\` shows \`delete mode 160000\`, run \`git restore --staged\` on it before committing.`;
@@ -144,11 +174,27 @@ export function managerInstructionsText(playbook: Playbook): string {
   return `Instructions for this run (they add to the rules above, never replace them):\n${entries.join("\n")}`;
 }
 
-/** `text` followed by the manager instructions, if any. */
-function withInstructions(text: string, playbook: Playbook): string {
-  const instructions = managerInstructionsText(playbook);
-  return instructions ? `${text}\n\n${instructions}` : text;
+/**
+ * The repository's and the playbooks' `agent_rules` as a section of a prompt, or "" when there are none.
+ * It is the plugin's own text, apart from the playbook's prompt, which cannot override it.
+ */
+export function agentRulesText(playbook: Pick<Playbook, "agentRules">): string {
+  const rules = playbook.agentRules ?? [];
+  if (rules.length === 0) return "";
+  return `Rules (house rules of this repository, set in its playbooks configuration; they add to everything above and no prompt of the playbook overrides them):\n${rules.map((rule) => `- ${rule.replace(/\n/g, "\n  ")}`).join("\n")}`;
 }
+
+/** The manager's added instructions, then the rules, as one block ("" when there are neither). */
+export function managerAddedText(playbook: Playbook): string {
+  return [managerInstructionsText(playbook), agentRulesText(playbook)].filter(Boolean).join("\n\n");
+}
+
+/** `text` followed by the manager instructions and the rules, if any. */
+function withInstructions(text: string, playbook: Playbook): string {
+  const added = managerAddedText(playbook);
+  return added ? `${text}\n\n${added}` : text;
+}
+
 
 /** Told to a manager before its run exists: start_playbook creates the worktree and returns its path. */
 function isolationNote(playbook: Playbook): string {
@@ -196,8 +242,11 @@ export function stepSystemPrompt(playbook: Playbook, step: Step, role: Role, run
   const instructions = run ? withWorktree(role.instructions, run) : role.instructions;
   const preamble = run ? worktreePreamble(run) : "";
   const staging = preamble ? "" : `\n\n${GIT_STAGING_RULE}`;
+  const rules = agentRulesText(playbook);
   return `${preamble ? `${preamble}\n\n` : ""}${instructions}${readonly}${staging}
 
+${COMMAND_RULE}
+${rules ? `\n${rules}\n` : ""}
 You are running step "${step.id}" (${role.title}) of the playbook "${playbook.title}", started by ${managerless ? "the playbooks plugin (this run has no Playbook Manager)" : "a\nPlaybook Manager agent"}. Other steps may share this checkout.
 
 When you are done, call the report_step_result tool exactly once, as your last action:
@@ -217,7 +266,7 @@ woken again.`;
 /** System prompt for a gate's role decider: role instructions plus the decider protocol. */
 export function gateDeciderSystemPrompt(playbook: Playbook, gate: Gate, role: Role, choices: GateChoice[], run?: Pick<Run, "worktree" | "workspaceDir">): string {
   const preamble = run ? worktreePreamble(run) : "";
-  return `${preamble ? `${preamble}\n\n` : ""}${run ? withWorktree(role.instructions, run) : role.instructions}
+  return `${preamble ? `${preamble}\n\n` : ""}${run ? withWorktree(role.instructions, run) : role.instructions}${agentRulesText(playbook) ? `\n\n${agentRulesText(playbook)}` : ""}
 
 This role is READONLY: do not edit, create or delete tracked files, do not commit and do not switch branches.
 
@@ -273,6 +322,12 @@ The human may decide in the Playbooks panel instead: your question is then close
 /** Sent to a step agent whose turn ended without a report; the new prompt also restores its plugin tools. */
 export function reportReminder(stepId: string): string {
   return `[playbooks] Your turn ended without a report for step "${stepId}". If your work is done, call report_step_result now; it is available again even if it was "not found" before. If you are still waiting for something, keep waiting in this turn with a bounded foreground poll (not a Monitor, background command or timer), then call report_step_result.`;
+}
+
+/** Sent to a manager that left reported steps waiting: one line per step (the report it has not acted on). */
+export function managerWaitingNudge(runId: string, steps: Array<{ stepId: string; attempt: number; outcome: string; summary: string; waitedMin: number }>): string {
+  const lines = steps.map((step) => `- step "${step.stepId}" (attempt ${step.attempt}) reported "${step.outcome}" ${step.waitedMin} min ago${step.summary ? `: ${step.summary.slice(0, 300)}` : ""}`);
+  return `[playbooks] ${runId} · still waiting for you:\n${lines.join("\n")}\nComplete or route it as your rules say: complete_step, or nudge_step to have the step go on.`;
 }
 
 /** Sent into a running step agent's turn when it went silent or its timeout is close. */
