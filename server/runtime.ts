@@ -5097,7 +5097,7 @@ export class Runtime {
       if (this.store.get(runId)!.managerAgentId) await this.dismissQuestions(this.store.get(runId)!.managerAgentId, `The run was canceled ${by}. End your turn.`);
       await this.enqueue(runId, [
         status === "canceled"
-          ? `The run was canceled ${by}: ${reason}. Tell the human and stop.`
+          ? `The run was canceled ${by}: ${reason}. Tell the human${runningAfterTasks(this.store.get(runId)!).length > 0 ? ", then run its after-tasks (they do not change the run's status)" : " and stop"}.`
           : `The after-tasks were canceled ${by}: ${reason}. The run stays ${status}. Tell the human and stop.`,
       ]);
       await this.deliver(runId);
