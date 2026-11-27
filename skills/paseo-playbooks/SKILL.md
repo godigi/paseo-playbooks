@@ -1072,7 +1072,8 @@ the answer in the panel (required). The step then runs again, with the answer as
 outputs (those it gives are kept). `ask` is not available on gate steps.
 
 The ask text may read `{{ report.summary }}`: the first non-blank line of the step's summary (the
-`complete_step` summary, else the agent's report), cut to 300 characters with "…". Write
+`complete_step` summary, else the agent's report summary or final message), cut to 300
+characters with "…". Write
 `ask: "{{ report.summary }}"` (or `"Needs input: {{ report.summary }}"`) so the gate's title in
 `list_gates` and the panel is the agent's actual question rather than a fixed sentence; the
 full report stays in the gate's details. An empty summary renders as "(none)". It is not
